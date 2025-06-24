@@ -1,0 +1,3 @@
+When testing, avoid running uvicorn directly. Instead, test indirectly in a way that allows for graceful exit, or use a timeout command prefix to ensure termination.
+
+To run the MCP server: `uv run uvicorn main:app --reload`
