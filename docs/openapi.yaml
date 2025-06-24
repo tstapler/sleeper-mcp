@@ -1,0 +1,259 @@
+openapi: 3.0.0
+info:
+  title: Sleeper API
+  description: A read-only HTTP API that provides access to Sleeper fantasy sports data
+  version: '1.0'
+  contact:
+    url: https://sleeper.app
+servers:
+  - url: https://api.sleeper.app/v1
+    description: Sleeper API v1
+
+paths:
+  /user/{identifier}:
+    get:
+      summary: Get user information
+      description: Retrieve user information by username or user_id
+      parameters:
+        - name: identifier
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Username or user_id of the user
+      responses:
+        '200':
+          description: User object
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+
+  /user/{user_id}/leagues/nfl/{season}:
+    get:
+      summary: Get all leagues for user
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: season
+          in: path
+          required: true
+          schema:
+            type: string
+            example: "2023"
+      responses:
+        '200':
+          description: Array of league objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/League'
+
+  /league/{league_id}:
+    get:
+      summary: Get specific league
+      parameters:
+        - name: league_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: League object
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/League'
+
+  /league/{league_id}/rosters:
+    get:
+      summary: Get rosters in a league
+      parameters:
+        - name: league_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Array of roster objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Roster'
+
+  /league/{league_id}/users:
+    get:
+      summary: Get users in a league
+      parameters:
+        - name: league_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Array of user objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/User'
+
+  /players/nfl:
+    get:
+      summary: Get all NFL players
+      responses:
+        '200':
+          description: Map of player IDs to player objects
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/Player'
+
+  /state/nfl:
+    get:
+      summary: Get NFL season state
+      responses:
+        '200':
+          description: NFL season state information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NFLState'
+
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        username:
+          type: string
+        user_id:
+          type: string
+        display_name:
+          type: string
+        avatar:
+          type: string
+
+    League:
+      type: object
+      properties:
+        total_rosters:
+          type: integer
+        status:
+          type: string
+          enum: [pre_draft, drafting, in_season, complete]
+        sport:
+          type: string
+        settings:
+          type: object
+        season_type:
+          type: string
+        season:
+          type: string
+        scoring_settings:
+          type: object
+        roster_positions:
+          type: array
+          items:
+            type: string
+        name:
+          type: string
+        league_id:
+          type: string
+        draft_id:
+          type: string
+        avatar:
+          type: string
+
+    Roster:
+      type: object
+      properties:
+        starters:
+          type: array
+          items:
+            type: string
+        settings:
+          type: object
+          properties:
+            wins:
+              type: integer
+            waiver_position:
+              type: integer
+            waiver_budget_used:
+              type: integer
+            total_moves:
+              type: integer
+            ties:
+              type: integer
+            losses:
+              type: integer
+            fpts:
+              type: number
+            fpts_decimal:
+              type: integer
+            fpts_against:
+              type: number
+            fpts_against_decimal:
+              type: integer
+        roster_id:
+          type: integer
+        players:
+          type: array
+          items:
+            type: string
+        owner_id:
+          type: string
+        league_id:
+          type: string
+
+    Player:
+      type: object
+      properties:
+        player_id:
+          type: string
+        full_name:
+          type: string
+        position:
+          type: string
+        team:
+          type: string
+        number:
+          type: integer
+        status:
+          type: string
+
+    NFLState:
+      type: object
+      properties:
+        week:
+          type: integer
+        season_type:
+          type: string
+        season_start_date:
+          type: string
+          format: date
+        season:
+          type: string
+        previous_season:
+          type: string
+        leg:
+          type: integer
+        league_season:
+          type: string
+        league_create_season:
+          type: string
+        display_week:
+          type: integer

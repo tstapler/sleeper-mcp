@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sleeper API Documentation</title>
+</head>
+<body>
+<h1>Sleeper API Documentation</h1>
+
+<h2>Base URL</h2>
+<p>https://api.sleeper.app/v1</p>
+
+<h2>Introduction</h2>
+<p>The Sleeper API is a read-only HTTP API that is free to use and allows access to a user's leagues, drafts, and rosters.</p>
+<p>No API Token is necessary, as you cannot modify contents via this API.</p>
+<p>Rate limit: Stay under 1000 API calls per minute to avoid IP blocking.</p>
+
+<h2>Endpoints</h2>
+
+<h3>User</h3>
+<pre>
+GET /user/{username}
+GET /user/{user_id}
+
+Response:
+{
+  "username": "sleeperuser",
+  "user_id": "12345678",
+  "display_name": "SleeperUser",
+  "avatar": "cc12ec49965eb7856f84d71cf85306af"
+}
+</pre>
+
+<h3>Leagues</h3>
+<pre>
+GET /user/{user_id}/leagues/nfl/{season}
+GET /league/{league_id}
+GET /league/{league_id}/rosters
+GET /league/{league_id}/users
+GET /league/{league_id}/matchups/{week}
+GET /league/{league_id}/winners_bracket
+GET /league/{league_id}/losers_bracket
+GET /league/{league_id}/transactions/{round}
+GET /league/{league_id}/traded_picks
+</pre>
+
+<h3>Drafts</h3>
+<pre>
+GET /user/{user_id}/drafts/nfl/{season}
+GET /league/{league_id}/drafts
+GET /draft/{draft_id}
+GET /draft/{draft_id}/picks
+GET /draft/{draft_id}/traded_picks
+</pre>
+
+<h3>Players</h3>
+<pre>
+GET /players/nfl
+GET /players/nfl/trending/{type}?lookback_hours={hours}&limit={limit}
+</pre>
+
+<h3>NFL State</h3>
+<pre>
+GET /state/nfl
+</pre>
+</body>
+</html>
