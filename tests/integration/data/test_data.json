@@ -1,0 +1,56 @@
+{
+    "users": {
+        "testuser": {
+            "username": "testuser",
+            "user_id": "123456789",
+            "display_name": "Test User",
+            "avatar": "abc123"
+        }
+    },
+    "leagues": {
+        "123456789": {
+            "league_id": "123456789",
+            "name": "Test League",
+            "season": "2023",
+            "status": "in_season",
+            "sport": "nfl",
+            "settings": {
+                "draft_type": "snake",
+                "num_teams": 12,
+                "scoring_type": "ppr"
+            },
+            "scoring_settings": {
+                "reception": 1.0,
+                "passing_td": 4
+            },
+            "roster_positions": ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"],
+            "total_rosters": 12
+        }
+    },
+    "rosters": {
+        "123456789": [
+            {
+                "roster_id": 1,
+                "owner_id": "123456789",
+                "league_id": "123456789",
+                "players": ["1234", "5678"],
+                "starters": ["1234"],
+                "settings": {
+                    "wins": 5,
+                    "losses": 3,
+                    "ties": 0,
+                    "fpts": 750.5
+                }
+            }
+        ]
+    },
+    "nfl_state": {
+        "week": 10,
+        "season_type": "regular",
+        "season": "2023",
+        "previous_season": "2022",
+        "league_season": "2023",
+        "league_create_season": "2023",
+        "display_week": 10
+    }
+}
