@@ -7,15 +7,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from structlog import get_logger
 
-from .config import get_config
-from .mcp import (
+from src.config import get_config
+from src.mcp import (
     MCPCapabilities,
     MCPHandler,
     MCPInvocation,
     MCPResponse,
     get_enhanced_functions,
 )
-from .services import SleeperAPIClient
+from src.services import SleeperAPIClient
 
 logger = get_logger(__name__)
 
