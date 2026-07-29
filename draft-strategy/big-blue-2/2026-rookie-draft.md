@@ -34,6 +34,7 @@ something seems off.
 | 3.02 (#26) | Kaytron Allen | RB | Best remaining by search_rank (157) once WR/TE tiers were exhausted |
 | 3.03 (#27) | Rueben Bain | DL | Best true-rookie-eligible player left (152) after Abdul Carter turned out ineligible |
 | 3.09 (#33) | Caleb Downs | DB | Best true-rookie IDP left (163); RB/WR pools dry — pivoted to trade-capital accumulation |
+| 4.03 (#39) | Josiah Trotter | LB | Final pick; matched board (rank 181, best remaining true-rookie IDP) — draft complete for this roster |
 
 ## Team composition check-in (after pick #33)
 
@@ -50,9 +51,14 @@ team, not to force more skill picks late.
 flag "aging WR corps" as a weakness since we're tier-full everywhere. This is a known blind spot:
 manual roster scanning is still required to actually find a WR-needy trade partner.
 
-## Open items
+## Final haul
 
-- [ ] Pick #39 (round 4, own slot 3) — still pending as of last update
-- [ ] Post-draft: scan other rosters manually for a WR-needy trade partner, shop Fields
-- [ ] Post-draft: revisit the 5-6 dead-roster free agents ([[Big Blue 2 Dynasty League]] in the
-      personal wiki) — drop only when there's an actual add queued, not proactively
+Concepcion (WR), Emmett Johnson (RB), Jonah Coleman (RB), Kaytron Allen (RB), Rueben Bain (DL),
+Caleb Downs (DB), Josiah Trotter (LB). Draft complete for roster 5 as of 2026-07-29.
+
+## Open items (post-draft)
+
+- [ ] Scan other rosters manually for a WR-needy trade partner, shop Fields + RB/IDP surplus
+- [ ] Revisit the 5-6 dead-roster free agents ([[Big Blue 2 Dynasty League]] in the personal wiki)
+      — drop only when there's an actual add queued, not proactively
+- [ ] Decide keeper/taxi assignments for the new rookie class before roster lock
