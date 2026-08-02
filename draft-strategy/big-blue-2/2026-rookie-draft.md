@@ -3,6 +3,8 @@
 League ID `1352883872131481600` · Draft ID `1352883872144039936` · Roster ID `5` (tstapler)
 12-team Superflex, Half-PPR, TE premium (+0.5/rec), IDP (1 flex), linear (non-snake) 4-round draft.
 
+See the [league wiki index](README.md) for team pages and the trade log.
+
 ## Team strategy going in
 
 - **Real need:** young RB (only RJ Harvey, Will Shipley pre-draft). WR looked deep but aging
