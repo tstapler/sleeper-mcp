@@ -8,9 +8,16 @@
 pre-draft priority need — WR youth — unfilled. See [roster 11](../teams/roster-11-dehnfranklincj.md)
 for full reasoning.
 
-**Proposed package:**
-- **We send:** Kaytron Allen (RB) — or Tony Pollard if a proven vet lands better than a rookie
-- **We receive:** Quentin Johnston (WR, search_rank 103) or Jerry Jeudy (WR, search_rank 160)
+**Value check (FantasyCalc, `get_trade_value`, superflex/half-PPR-adjusted, 2026-08-02):**
+
+| We send | Value | We receive | Value | Net |
+|---|---|---|---|---|
+| Tony Pollard | 1437 | Quentin Johnston | 1983 | **+546 for us** |
+| Kaytron Allen | 800 | Jerry Jeudy | 1230 | **+430 for us** |
+
+**Recommended package: Tony Pollard for Quentin Johnston.** Best-balanced of the two (favors us
+without being so lopsided it reads as an insult), and sells an aging/decaying asset instead of
+touching our rookie RB depth. Allen-for-Jeudy is the fallback if they'd rather deal in youth.
 
 Don't offer for London, Collins, or Garrett Wilson — those are their untouchable studs.
 

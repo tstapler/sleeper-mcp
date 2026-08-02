@@ -28,13 +28,22 @@ new team page or trade file is added.
 | Date | Counterparty | Status | Summary |
 |---|---|---|---|
 | 2026-07-20 | [BlakeMoen](trades/2026-07-20-blakemoen-offer-declined.md) | Declined | 3 picks for our 1.03 — kept 1.03, took Concepcion |
-| 2026-08-01 | [dehnfranklincj](trades/2026-08-01-proposed-dehnfranklincj-rb-for-wr.md) | Proposed, not sent | RB (Allen/Pollard) for WR (Johnston/Jeudy) |
-| 2026-08-01 | [3chainzzz](trades/2026-08-01-proposed-3chainzzz-fields-for-wr.md) | Proposed, not sent | Fields for WR (Sutton/Shakir) — speculative |
+| 2026-08-01 | [dehnfranklincj](trades/2026-08-01-proposed-dehnfranklincj-rb-for-wr.md) | Value-checked, favors us (+546) | Pollard for Quentin Johnston |
+| 2026-08-01 | [3chainzzz](trades/2026-08-01-proposed-3chainzzz-fields-for-wr.md) | Value-checked, doesn't hold up | Fields for WR — no fair 1-for-1 exists, needs a sweetener |
 
 ## Other documents
 
 - [2026 rookie draft log](2026-rookie-draft.md) — full pick-by-pick rationale, team composition
   checkpoints, and the `search_rank` tooling fix from this draft
+
+## Trade value tooling
+
+`get_trade_value(league_id, player_ids)` (MCP tool, `src/analysis.rs::trade_value_check`) pulls
+real market-consensus dynasty values from [FantasyCalc](https://fantasycalc.com)'s public API,
+matched by `sleeperId` — no manual crosswalk needed. It auto-derives `numQbs`/`ppr` from the
+league's actual settings, so values already reflect our superflex/half-PPR format. **Known gap:
+IDP is not covered** (FantasyCalc is offense-only) — those players come back `found: false`;
+keep using `dynasty_tier`/`search_rank` reasoning for IDP-involving trades.
 
 ## Data freshness
 
