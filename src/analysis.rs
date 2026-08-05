@@ -721,6 +721,49 @@ impl AnalysisService {
     }
 
     // -----------------------------------------------------------------------
+    // Player report — current status, aggregated news, and production trend
+    // -----------------------------------------------------------------------
+
+    /// Full report for a specific set of players: Sleeper's own current status/injury/practice
+    /// fields, aggregated news (RotoWire + ESPN, see `fetch_news_for_players`), dynasty tier, and
+    /// season production trend. League-agnostic — resolve player_ids via `search_players` first
+    /// if you only have a name. Defaults to the live NFL season if none is given.
+    pub async fn player_report(
+        &self,
+        player_ids: &[String],
+        season: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let season = match season {
+            Some(s) => s.to_string(),
+            None => self.client.get_nfl_state().await?.season,
+        };
+
+        let all_players_h = {
+            let c = self.client.clone();
+            tokio::spawn(async move { c.get_all_players("nfl").await })
+        };
+        let stats_ctx_h = {
+            let svc = self.clone();
+            let s = season.clone();
+            tokio::spawn(async move { svc.build_stats_context(&s).await })
+        };
+
+        let all_players = all_players_h.await??;
+        let stats_ctx = stats_ctx_h.await??;
+        let news_map = self.fetch_news_for_players(player_ids, &all_players).await;
+
+        Ok(player_ids
+            .iter()
+            .map(|pid| {
+                let mut p = enrich_player_full(pid, &all_players, &stats_ctx);
+                p["news"] = serde_json::json!(news_map.get(pid).cloned().unwrap_or_default());
+                p["season"] = serde_json::json!(season);
+                p
+            })
+            .collect())
+    }
+
+    // -----------------------------------------------------------------------
     // Player search
     // -----------------------------------------------------------------------
 

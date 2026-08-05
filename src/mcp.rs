@@ -189,6 +189,14 @@ struct TradeValueParams {
     player_ids: Vec<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct PlayerReportParams {
+    /// Sleeper player IDs — use search_players first if you only have a name
+    player_ids: Vec<String>,
+    /// NFL season, e.g. "2026". Defaults to the live season if omitted.
+    season: Option<String>,
+}
+
 fn default_nfl() -> String { "nfl".to_string() }
 fn default_add() -> String { "add".to_string() }
 fn default_48() -> i32 { 48 }
@@ -394,6 +402,14 @@ impl SleeperMcpServer {
         #[tool(aggr)] p: TradeValueParams,
     ) -> Result<CallToolResult, McpError> {
         ok(self.svc.trade_value_check(&p.league_id, &p.player_ids).await.map_err(err)?)
+    }
+
+    #[tool(description = "Full report for specific players: current Sleeper status/injury/practice-participation fields, aggregated recent news (RotoWire + ESPN), dynasty tier, and season production trend (PPG, games played, trend arrow). League-agnostic. Use search_players first if you only have a name, not a player_id.")]
+    async fn get_player_report(
+        &self,
+        #[tool(aggr)] p: PlayerReportParams,
+    ) -> Result<CallToolResult, McpError> {
+        ok(self.svc.player_report(&p.player_ids, p.season.as_deref()).await.map_err(err)?)
     }
 
     #[tool(description = "Scan all rosters and return win-win trade proposals: situations where you have what another team needs AND they have what you need. Returns proposals ranked by mutual benefit score.")]
