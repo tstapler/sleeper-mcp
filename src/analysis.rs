@@ -1316,18 +1316,27 @@ impl AnalysisService {
             })
             .collect();
 
-        // Fetch both sources concurrently, ignoring errors gracefully.
-        let c1 = self.client.clone();
-        let c2 = self.client.clone();
-        let rw_h = tokio::spawn(async move { c1.get_rotowire_news().await });
-        let espn_h = tokio::spawn(async move { c2.get_espn_rss_news().await });
+        // RotoWire has an explicit player_name per item; ESPN/CBS/PFT/Yahoo are RSS feeds with
+        // no per-item player field, matched by scanning the headline instead. Fetch all five
+        // concurrently, ignoring individual source failures gracefully.
+        let c = self.client.clone();
+        let rw_h = tokio::spawn({ let c = c.clone(); async move { c.get_rotowire_news().await } });
+        let espn_h = tokio::spawn({ let c = c.clone(); async move { c.get_espn_rss_news().await } });
+        let cbs_h = tokio::spawn({ let c = c.clone(); async move { c.get_cbssports_news().await } });
+        let pft_h = tokio::spawn({ let c = c.clone(); async move { c.get_pft_news().await } });
+        let yahoo_h = tokio::spawn(async move { c.get_yahoo_news().await });
 
         let rw_news = rw_h.await.ok().and_then(|r| r.ok()).unwrap_or_default();
-        let espn_news = espn_h.await.ok().and_then(|r| r.ok()).unwrap_or_default();
+        let title_scan_sources = [
+            espn_h.await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+            cbs_h.await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+            pft_h.await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+            yahoo_h.await.ok().and_then(|r| r.ok()).unwrap_or_default(),
+        ];
 
         let mut result: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
-        // RotowWire items have an explicit player_name.
+        // RotoWire items have an explicit player_name.
         for item in &rw_news {
             let key = normalize_name(&item.player_name);
             if let Some(pid) = name_to_id.get(&key) {
@@ -1340,18 +1349,20 @@ impl AnalysisService {
             }
         }
 
-        // ESPN items: scan the title for any matching player name.
-        for item in &espn_news {
-            let title_lower = item.headline.to_lowercase();
-            for (norm_name, pid) in &name_to_id {
-                if title_lower.contains(norm_name.as_str()) {
-                    result.entry(pid.clone()).or_default().push(serde_json::json!({
-                        "source": item.source,
-                        "headline": item.headline,
-                        "body": item.body,
-                        "date": item.date,
-                    }));
-                    break;
+        // RSS-shaped sources: scan the title for any matching player name.
+        for source_items in &title_scan_sources {
+            for item in source_items {
+                let title_lower = item.headline.to_lowercase();
+                for (norm_name, pid) in &name_to_id {
+                    if title_lower.contains(norm_name.as_str()) {
+                        result.entry(pid.clone()).or_default().push(serde_json::json!({
+                            "source": item.source,
+                            "headline": item.headline,
+                            "body": item.body,
+                            "date": item.date,
+                        }));
+                        break;
+                    }
                 }
             }
         }

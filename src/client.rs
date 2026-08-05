@@ -13,6 +13,7 @@ use crate::rate_limit::RateLimiter;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_MS: u64 = 2000;
+const USER_AGENT: &str = "Mozilla/5.0 (compatible; sleeper-mcp/1.0)";
 
 #[derive(Clone)]
 pub struct SleeperClient {
@@ -48,23 +49,36 @@ impl SleeperClient {
 
     async fn get_json(&self, path: &str) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
+        let body = self.get_cached_text(&url, self.cache_ttl).await?;
+        Ok(serde_json::from_str(&body)?)
+    }
 
-        // Check cache first
-        if let Some((cached, is_fresh)) = self.cache.get("GET", &url).await? {
+    /// Read-through HTTP cache: serves a fresh cached body directly, revalidates a stale one
+    /// with ETag/If-None-Match + Last-Modified/If-Modified-Since (cheap 304 on no change,
+    /// which also extends the cache's freshness window without a full re-download), and only
+    /// does a full fetch when there's nothing cached at all.
+    ///
+    /// Freshness comes from the response's own `Cache-Control: max-age`, falling back to
+    /// `default_ttl_secs` only when the server doesn't send one — this is what makes it a real
+    /// read-through cache rather than one that just ignores the site's own caching metadata.
+    async fn get_cached_text(&self, url: &str, default_ttl_secs: i64) -> Result<String> {
+        if let Some((cached, is_fresh)) = self.cache.get("GET", url).await? {
             if is_fresh {
-                tracing::debug!(path, "cache_hit");
-                return Ok(serde_json::from_str(&cached.body)?);
+                tracing::debug!(url, "cache_hit");
+                return Ok(cached.body);
             }
-            // Stale — try conditional request
             return self
-                .do_request_with_validators(&url, cached.etag, cached.last_modified)
+                .revalidate(url, cached.etag, cached.last_modified, default_ttl_secs)
                 .await;
         }
+        self.fetch_fresh(url, default_ttl_secs).await
+    }
 
+    async fn fetch_fresh(&self, url: &str, default_ttl_secs: i64) -> Result<String> {
         self.rate_limiter.acquire().await;
 
         for attempt in 0..MAX_RETRIES {
-            match self.http.get(&url).send().await {
+            match self.http.get(url).header("User-Agent", USER_AGENT).send().await {
                 Ok(resp) if resp.status().as_u16() == 429 => {
                     let retry_after = resp
                         .headers()
@@ -73,7 +87,7 @@ impl SleeperClient {
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(RETRY_BASE_MS * 2u64.pow(attempt) / 1000)
                         * 1000;
-                    tracing::warn!(path, attempt, "server_rate_limited");
+                    tracing::warn!(url, attempt, "server_rate_limited");
                     tokio::time::sleep(Duration::from_millis(retry_after)).await;
                     self.rate_limiter.acquire().await;
                 }
@@ -81,7 +95,7 @@ impl SleeperClient {
                     let status = resp.status().as_u16();
                     if status >= 500 && attempt < MAX_RETRIES - 1 {
                         let delay = RETRY_BASE_MS * 2u64.pow(attempt);
-                        tracing::warn!(path, status, attempt, "server_error_retry");
+                        tracing::warn!(url, status, attempt, "server_error_retry");
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                         continue;
                     }
@@ -96,13 +110,13 @@ impl SleeperClient {
                     let last_modified = header_str(resp.headers(), "last-modified");
                     let cache_control = header_str(resp.headers(), "cache-control");
                     let ttl = HttpCache::parse_max_age(cache_control.as_deref())
-                        .unwrap_or(self.cache_ttl);
+                        .unwrap_or(default_ttl_secs);
 
                     let body = resp.text().await?;
                     self.cache
                         .set(
                             "GET",
-                            &url,
+                            url,
                             status,
                             &body,
                             etag.as_deref(),
@@ -110,11 +124,11 @@ impl SleeperClient {
                             Some(ttl),
                         )
                         .await?;
-                    return Ok(serde_json::from_str(&body)?);
+                    return Ok(body);
                 }
                 Err(e) if attempt < MAX_RETRIES - 1 => {
                     let delay = RETRY_BASE_MS * 2u64.pow(attempt);
-                    tracing::warn!(path, attempt, error=%e, "request_error_retry");
+                    tracing::warn!(url, attempt, error=%e, "request_error_retry");
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 Err(e) => return Err(e.into()),
@@ -124,15 +138,16 @@ impl SleeperClient {
     }
 
     /// Conditional GET using ETag / Last-Modified validators.
-    async fn do_request_with_validators(
+    async fn revalidate(
         &self,
         url: &str,
         etag: Option<String>,
         last_modified: Option<String>,
-    ) -> Result<Value> {
+        default_ttl_secs: i64,
+    ) -> Result<String> {
         self.rate_limiter.acquire().await;
 
-        let mut req = self.http.get(url);
+        let mut req = self.http.get(url).header("User-Agent", USER_AGENT);
         if let Some(etag) = &etag {
             req = req.header("If-None-Match", etag);
         }
@@ -144,11 +159,13 @@ impl SleeperClient {
         let status = resp.status().as_u16();
 
         if status == 304 {
-            // Server confirmed cached copy is still current
+            // Server confirmed the cached copy is still current. Re-write the same body to
+            // bump cached_at, extending the freshness window instead of revalidating again on
+            // every single call — a 304 is a signal to trust the cache longer, not just once.
             tracing::debug!(url, "cache_revalidated");
-            let cached = self.cache.get("GET", url).await?.map(|(c, _)| c);
-            if let Some(c) = cached {
-                return Ok(serde_json::from_str(&c.body)?);
+            if let Some((cached, _)) = self.cache.get("GET", url).await? {
+                self.cache.update_body("GET", url, &cached.body).await?;
+                return Ok(cached.body);
             }
         }
 
@@ -159,9 +176,16 @@ impl SleeperClient {
             });
         }
 
+        let etag = header_str(resp.headers(), "etag");
+        let last_modified = header_str(resp.headers(), "last-modified");
+        let cache_control = header_str(resp.headers(), "cache-control");
+        let ttl = HttpCache::parse_max_age(cache_control.as_deref()).unwrap_or(default_ttl_secs);
+
         let body = resp.text().await?;
-        self.cache.update_body("GET", url, &body).await?;
-        Ok(serde_json::from_str(&body)?)
+        self.cache
+            .set("GET", url, status, &body, etag.as_deref(), last_modified.as_deref(), Some(ttl))
+            .await?;
+        Ok(body)
     }
 
     // -----------------------------------------------------------------------
@@ -292,27 +316,16 @@ impl SleeperClient {
     }
 
     /// Fetch raw HTML/XML from any URL, going through the shared HTTP cache.
+    /// Fetch a non-Sleeper URL (news pages, RSS feeds, third-party APIs) through the same
+    /// read-through cache as `get_json` — `ttl_secs` is only the fallback used when the site
+    /// doesn't send its own `Cache-Control`.
     async fn get_raw_html(&self, url: &str, ttl_secs: i64) -> Result<String> {
-        if let Some((cached, is_fresh)) = self.cache.get("GET", url).await? {
-            if is_fresh {
-                return Ok(cached.body);
-            }
-        }
-        self.rate_limiter.acquire().await;
-        let resp = self.http.get(url)
-            .header("User-Agent", "Mozilla/5.0 (compatible; sleeper-mcp/1.0)")
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            return Err(Error::Api { status, message: resp.text().await.unwrap_or_default() });
-        }
-        let body = resp.text().await?;
-        self.cache.set("GET", url, status, &body, None, None, Some(ttl_secs)).await?;
-        Ok(body)
+        self.get_cached_text(url, ttl_secs).await
     }
 
-    /// RotowWire NFL player news page (25 most recent items, 10-min cache).
+    /// RotowWire NFL player news page (25 most recent items). RotoWire sends
+    /// `Cache-Control: no-store, no-cache, must-revalidate` — this is injury/beat news where
+    /// staleness has a real cost, so the 10-min default stays short rather than being extended.
     pub async fn get_rotowire_news(&self) -> Result<Vec<NewsItem>> {
         let html = self.get_raw_html(
             "https://www.rotowire.com/football/news.php",
@@ -321,13 +334,44 @@ impl SleeperClient {
         Ok(parse_rotowire_news(&html))
     }
 
-    /// ESPN NFL RSS feed (~25 items, 30-min cache).
+    /// ESPN NFL RSS feed (~25 items). ESPN actually advertises `max-age=184` (~3 min) via
+    /// Cache-Control, which now governs real freshness — the 30-min value here is only the
+    /// fallback for if that header ever goes missing.
     pub async fn get_espn_rss_news(&self) -> Result<Vec<NewsItem>> {
         let xml = self.get_raw_html(
             "https://www.espn.com/espn/rss/nfl/news",
             1800,
         ).await?;
-        Ok(parse_espn_rss(&xml))
+        Ok(parse_rss_feed(&xml, "ESPN"))
+    }
+
+    /// CBS Sports NFL RSS feed. Sends an ETag, so a stale cache revalidates cheaply (304) most
+    /// of the time instead of a full re-download.
+    pub async fn get_cbssports_news(&self) -> Result<Vec<NewsItem>> {
+        let xml = self.get_raw_html(
+            "https://www.cbssports.com/rss/headlines/nfl/",
+            900,
+        ).await?;
+        Ok(parse_rss_feed(&xml, "CBS Sports"))
+    }
+
+    /// ProFootballTalk (NBC Sports) RSS feed. No Cache-Control/ETag observed from this host, so
+    /// the 30-min default fully governs freshness — general beat news, not injury-critical.
+    pub async fn get_pft_news(&self) -> Result<Vec<NewsItem>> {
+        let xml = self.get_raw_html(
+            "https://www.nbcsports.com/profootballtalk.rss",
+            1800,
+        ).await?;
+        Ok(parse_rss_feed(&xml, "ProFootballTalk"))
+    }
+
+    /// Yahoo Sports NFL RSS feed. No Cache-Control/ETag observed from this host either.
+    pub async fn get_yahoo_news(&self) -> Result<Vec<NewsItem>> {
+        let xml = self.get_raw_html(
+            "https://sports.yahoo.com/nfl/rss/",
+            1800,
+        ).await?;
+        Ok(parse_rss_feed(&xml, "Yahoo Sports"))
     }
 
     /// FantasyCalc dynasty trade values, keyed by `sleeperId` in the response — no crosswalk
@@ -404,20 +448,25 @@ fn parse_rotowire_news(html: &str) -> Vec<NewsItem> {
     items
 }
 
-fn parse_espn_rss(xml: &str) -> Vec<NewsItem> {
+/// Generic RSS 2.0 `<item>` parser shared by every RSS-shaped source (ESPN, CBS Sports,
+/// ProFootballTalk, Yahoo Sports). None of these feeds name a specific player in a dedicated
+/// field, so items carry an empty `player_name` — `fetch_news_for_players` matches them by
+/// scanning the headline for a known player name instead.
+fn parse_rss_feed(xml: &str, source: &str) -> Vec<NewsItem> {
     let mut items = Vec::new();
     for chunk in xml.split("<item>").skip(1) {
         let title = cdata_or_text(chunk, "title").unwrap_or_default();
         let desc = cdata_or_text(chunk, "description").unwrap_or_default();
-        let date = between(chunk, "<pubDate>", "</pubDate>").unwrap_or_default();
+        let date = between(chunk, "<pubDate>", "</pubDate>")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         if !title.is_empty() {
             items.push(NewsItem {
-                // ESPN articles name players in the title; we match later by name scan.
                 player_name: String::new(),
                 headline: title,
                 body: desc,
                 date,
-                source: "ESPN".to_string(),
+                source: source.to_string(),
             });
         }
     }
