@@ -409,28 +409,37 @@ async fn cmd_lineup(
 ) -> Result<()> {
     let data = svc.start_sit(league_id, roster_id, week).await?;
     println!("{}", style(format!("Start/Sit — Week {week}")).bold().underlined());
-    println!("\n{}", style("Recommended Starters").green().bold());
-    for pid in data["recommended_starters"].as_array().unwrap_or(&vec![]) {
-        // Look up the ranked entry for projected points
-        let pts = data["all_players_ranked"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .find(|p| p["player_id"] == *pid)
-            .and_then(|p| p["projected_points"].as_f64())
-            .unwrap_or(0.0);
-        println!("  {} — proj {:.1}", pid.as_str().unwrap_or("?"), pts);
+    println!("\n{}", style("Recommended Lineup").green().bold());
+    for slot in data["recommended_lineup"].as_array().unwrap_or(&vec![]) {
+        let slot_name = slot["slot"].as_str().unwrap_or("?");
+        match slot["player_id"].as_str() {
+            Some(pid) => {
+                let pts = slot["projected_points"].as_f64().unwrap_or(0.0);
+                println!("  {slot_name:<11} {pid} — proj {pts:.1}");
+            }
+            None => println!("  {slot_name:<11} (no eligible player)"),
+        }
     }
     println!("\n{}", style("Bench").dim());
-    for pid in data["recommended_bench"].as_array().unwrap_or(&vec![]) {
-        let pts = data["all_players_ranked"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .find(|p| p["player_id"] == *pid)
-            .and_then(|p| p["projected_points"].as_f64())
-            .unwrap_or(0.0);
-        println!("  {} — proj {:.1}", pid.as_str().unwrap_or("?"), pts);
+    for p in data["recommended_bench"].as_array().unwrap_or(&vec![]) {
+        println!(
+            "  {} ({}) — proj {:.1}",
+            p["player_id"].as_str().unwrap_or("?"),
+            p["position"].as_str().unwrap_or("?"),
+            p["projected_points"].as_f64().unwrap_or(0.0),
+        );
+    }
+    let excluded = data["excluded_unavailable"].as_array().cloned().unwrap_or_default();
+    if !excluded.is_empty() {
+        println!("\n{}", style("Excluded (Out/IR/PUP/inactive)").red());
+        for p in &excluded {
+            println!(
+                "  {} ({}) — {}",
+                p["player_id"].as_str().unwrap_or("?"),
+                p["position"].as_str().unwrap_or("?"),
+                p["injury_status"].as_str().unwrap_or(p["status"].as_str().unwrap_or("?")),
+            );
+        }
     }
     println!("\n(Use `sleeper search <player_id>` to resolve IDs to names)");
     Ok(())

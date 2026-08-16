@@ -2,7 +2,7 @@
 ///
 /// All parallel API calls use `tokio::spawn` explicitly (goroutine semantics).
 /// Each spawned task gets its own `Arc`-clone of the client.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -234,6 +234,7 @@ impl AnalysisService {
             "players": players,
             "starters": roster.starters.iter().map(|p| enrich(p)).collect::<Vec<_>>(),
             "reserve": roster.reserve.iter().map(|p| enrich(p)).collect::<Vec<_>>(),
+            "taxi": roster.taxi.iter().flatten().map(|p| enrich(p)).collect::<Vec<_>>(),
             "record": {
                 "wins": roster.settings.wins,
                 "losses": roster.settings.losses,
@@ -252,7 +253,13 @@ impl AnalysisService {
         league_id: &str,
         roster_id: i32,
     ) -> Result<serde_json::Value> {
+        let league_h = {
+            let c = self.client.clone();
+            let l = league_id.to_string();
+            tokio::spawn(async move { c.get_league(&l).await })
+        };
         let data = self.roster_with_names(league_id, roster_id).await?;
+        let league = league_h.await??;
 
         let mut pos_counts: HashMap<String, usize> = HashMap::new();
         let mut injured: Vec<&Value> = Vec::new();
@@ -301,7 +308,26 @@ impl AnalysisService {
             })
             .collect();
 
+        // Active-roster capacity: taxi/reserve squads are separate pools (per taxi_slots/
+        // reserve_slots) that don't count against roster_positions' starter+bench slots.
+        let taxi_used = data["taxi"].as_array().map(Vec::len).unwrap_or(0);
+        let reserve_used = data["reserve"].as_array().map(Vec::len).unwrap_or(0);
+        let active_count = players.len().saturating_sub(taxi_used).saturating_sub(reserve_used);
+        let active_cap = league.roster_positions.len();
+        let over_by = active_count.saturating_sub(active_cap);
+        let taxi_slots = league.settings.extra.get("taxi_slots").and_then(Value::as_u64).unwrap_or(0);
+        let reserve_slots = league.settings.extra.get("reserve_slots").and_then(Value::as_u64).unwrap_or(0);
+
         let mut priorities = weaknesses.clone();
+        if over_by > 0 {
+            priorities.insert(
+                0,
+                format!(
+                    "Over the active-roster limit by {over_by} ({active_count}/{active_cap}, \
+                     excluding taxi/reserve) — cut or move players to taxi/reserve"
+                ),
+            );
+        }
         priorities.extend(drop_recs);
 
         Ok(serde_json::json!({
@@ -311,6 +337,15 @@ impl AnalysisService {
             "weaknesses": weaknesses,
             "injured_or_out": injured,
             "no_team_free_agents": no_team,
+            "roster_capacity": {
+                "active_count": active_count,
+                "active_cap": active_cap,
+                "over_by": over_by,
+                "taxi_used": taxi_used,
+                "taxi_slots": taxi_slots,
+                "reserve_used": reserve_used,
+                "reserve_slots": reserve_slots,
+            },
             "suggested_priorities": priorities,
         }))
     }
@@ -626,9 +661,20 @@ impl AnalysisService {
             let l = lid.clone();
             tokio::spawn(async move { c.get_league_rosters(&l).await })
         };
+        let league_h = {
+            let c = client.clone();
+            let l = lid.clone();
+            tokio::spawn(async move { c.get_league(&l).await })
+        };
+        let players_h = {
+            let c = client.clone();
+            tokio::spawn(async move { c.get_all_players("nfl").await })
+        };
 
         let state = state_h.await??;
         let rosters = rosters_h.await??;
+        let league = league_h.await??;
+        let all_players = players_h.await??;
 
         let roster = rosters
             .iter()
@@ -654,38 +700,130 @@ impl AnalysisService {
                 .unwrap_or(0.0)
         };
 
-        let mut ranked: Vec<_> = roster
-            .players
-            .iter()
-            .map(|pid| {
-                serde_json::json!({
+        // Split the roster into players eligible to be started (Active, and not
+        // Out/IR/PUP) vs. players who can't play this week regardless of projection.
+        struct Candidate {
+            pid: String,
+            position: String,
+            points: f64,
+        }
+        let mut available: Vec<Candidate> = Vec::new();
+        let mut unavailable: Vec<serde_json::Value> = Vec::new();
+
+        for pid in &roster.players {
+            let obj = all_players.get(pid).and_then(Value::as_object);
+            let position = obj
+                .and_then(|m| m.get("position"))
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let status = obj
+                .and_then(|m| m.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("Active");
+            let injury_status = obj.and_then(|m| m.get("injury_status")).and_then(Value::as_str);
+            let points = proj_pts(pid);
+
+            if status != "Active" || matches!(injury_status, Some("Out") | Some("IR") | Some("PUP")) {
+                unavailable.push(serde_json::json!({
                     "player_id": pid,
-                    "projected_points": proj_pts(pid),
-                })
-            })
+                    "position": position,
+                    "status": status,
+                    "injury_status": injury_status,
+                    "projected_points": points,
+                    "reason": "excluded — not active/eligible to play this week",
+                }));
+            } else {
+                available.push(Candidate { pid: pid.clone(), position, points });
+            }
+        }
+
+        // Slots in most-restrictive-first order so a dedicated QB/RB/WR/TE/IDP slot
+        // never loses its best fit to a wider FLEX/SUPER_FLEX/IDP_FLEX slot filled first.
+        let mut slots: Vec<&str> = league
+            .roster_positions
+            .iter()
+            .map(String::as_str)
+            .filter(|s| *s != "BN")
             .collect();
-        ranked.sort_by(|a, b| {
+        slots.sort_by_key(|s| slot_eligible_positions(s).len());
+
+        let mut used: HashSet<usize> = HashSet::new();
+        let mut lineup: Vec<serde_json::Value> = Vec::new();
+
+        for slot in &slots {
+            let eligible = slot_eligible_positions(slot);
+            let pick = available
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| !used.contains(i) && eligible.contains(&c.position.as_str()))
+                .max_by(|(_, a), (_, b)| a.points.partial_cmp(&b.points).unwrap_or(std::cmp::Ordering::Equal));
+
+            match pick {
+                Some((i, c)) => {
+                    used.insert(i);
+                    lineup.push(serde_json::json!({
+                        "slot": slot,
+                        "player_id": c.pid.clone(),
+                        "position": c.position.clone(),
+                        "projected_points": c.points,
+                    }));
+                }
+                None => {
+                    lineup.push(serde_json::json!({
+                        "slot": slot,
+                        "player_id": null,
+                        "position": null,
+                        "projected_points": 0.0,
+                        "note": "no eligible rostered player available for this slot",
+                    }));
+                }
+            }
+        }
+
+        let mut bench: Vec<_> = available
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !used.contains(i))
+            .map(|(_, c)| serde_json::json!({
+                "player_id": c.pid.clone(),
+                "position": c.position.clone(),
+                "projected_points": c.points,
+            }))
+            .collect();
+        bench.sort_by(|a, b| {
             b["projected_points"]
                 .as_f64()
                 .partial_cmp(&a["projected_points"].as_f64())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let starter_count = if roster.starters.is_empty() {
-            9.min(ranked.len())
-        } else {
-            roster.starters.len()
-        };
+        let mut all_ranked: Vec<_> = roster
+            .players
+            .iter()
+            .map(|pid| serde_json::json!({
+                "player_id": pid,
+                "projected_points": proj_pts(pid),
+            }))
+            .collect();
+        all_ranked.sort_by(|a, b| {
+            b["projected_points"]
+                .as_f64()
+                .partial_cmp(&a["projected_points"].as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(serde_json::json!({
             "roster_id": roster_id,
             "week": week,
             "current_starters": roster.starters,
-            "recommended_starters": ranked[..starter_count.min(ranked.len())]
-                .iter().map(|p| &p["player_id"]).collect::<Vec<_>>(),
-            "recommended_bench": ranked[starter_count.min(ranked.len())..]
-                .iter().map(|p| &p["player_id"]).collect::<Vec<_>>(),
-            "all_players_ranked": ranked,
+            "recommended_lineup": lineup,
+            "recommended_starters": lineup.iter()
+                .filter_map(|s| s["player_id"].as_str())
+                .collect::<Vec<_>>(),
+            "recommended_bench": bench,
+            "excluded_unavailable": unavailable,
+            "all_players_ranked": all_ranked,
         }))
     }
 
@@ -1130,43 +1268,52 @@ impl AnalysisService {
             .map(|u| (u.user_id.clone(), u.display_name.clone()))
             .collect();
 
-        // Minimum keeper depth per position to be considered "satisfied".
-        // QB is 2 because of the SUPER_FLEX slot.
-        let min_keepers: HashMap<&str, usize> =
-            [("QB", 2), ("RB", 3), ("WR", 4), ("TE", 1)]
-                .into_iter()
-                .collect();
-
-        // For each roster, build:
-        //   needs:    positions where keeper count < min_keepers
-        //   offerables: tier 3/4 players at positions they have depth (or just any tier 3/4)
-        let profile_roster = |roster: &Roster| -> (Vec<String>, Vec<serde_json::Value>) {
+        let count_keepers = |roster: &Roster| -> HashMap<String, usize> {
             let mut keepers_by_pos: HashMap<String, usize> = HashMap::new();
-            let mut offerables: Vec<serde_json::Value> = Vec::new();
-
             for pid in &roster.players {
                 let p = enrich_player_full(pid, &all_players, &stats_ctx);
-                let pos = p["position"].as_str().unwrap_or("?").to_string();
-                let tier = p["dynasty_tier"].as_i64().unwrap_or(4);
-
-                if tier <= 2 {
-                    *keepers_by_pos.entry(pos.clone()).or_default() += 1;
-                }
-                if tier >= 3 {
-                    offerables.push(p);
+                if p["dynasty_tier"].as_i64().unwrap_or(4) <= 2 {
+                    *keepers_by_pos.entry(p["position"].as_str().unwrap_or("?").to_string()).or_default() += 1;
                 }
             }
+            keepers_by_pos
+        };
 
-            let needs: Vec<String> = min_keepers
+        // League-average tier-1/2 depth per position, used as the "need" baseline instead
+        // of a fixed constant — a 36-player dynasty roster with a taxi squad and a lean
+        // 18-player redraft roster have very different notions of "enough" depth at a
+        // position, so a hardcoded QB:2/RB:3/WR:4/TE:1 floor either never triggers (deep
+        // leagues) or always triggers (shallow ones).
+        const NEED_POSITIONS: &[&str] = &["QB", "RB", "WR", "TE"];
+        let all_keeper_counts: Vec<HashMap<String, usize>> =
+            rosters.iter().map(&count_keepers).collect();
+        let league_avg: HashMap<&str, f64> = NEED_POSITIONS
+            .iter()
+            .map(|pos| {
+                let total: usize = all_keeper_counts.iter().map(|m| m.get(*pos).copied().unwrap_or(0)).sum();
+                (*pos, total as f64 / rosters.len().max(1) as f64)
+            })
+            .collect();
+
+        // For each roster, build:
+        //   needs:    positions meaningfully below the league-average keeper depth
+        //   offerables: tier 3/4 players (this roster's own trade bait)
+        let profile_roster = |roster: &Roster| -> (Vec<String>, Vec<serde_json::Value>) {
+            let keepers_by_pos = count_keepers(roster);
+            let needs: Vec<String> = NEED_POSITIONS
                 .iter()
-                .filter_map(|(pos, min)| {
+                .filter_map(|pos| {
                     let have = keepers_by_pos.get(*pos).copied().unwrap_or(0);
-                    if have < *min {
-                        Some(pos.to_string())
-                    } else {
-                        None
-                    }
+                    let threshold = (league_avg[pos] * 0.75).floor().max(1.0) as usize;
+                    if have < threshold { Some(pos.to_string()) } else { None }
                 })
+                .collect();
+
+            let offerables: Vec<serde_json::Value> = roster
+                .players
+                .iter()
+                .map(|pid| enrich_player_full(pid, &all_players, &stats_ctx))
+                .filter(|p| p["dynasty_tier"].as_i64().unwrap_or(4) >= 3)
                 .collect();
 
             (needs, offerables)
@@ -1208,6 +1355,75 @@ impl AnalysisService {
                 })
                 .collect();
 
+            let partner_name = other
+                .owner_id
+                .as_deref()
+                .and_then(|id| user_map.get(id))
+                .cloned()
+                .unwrap_or_else(|| format!("Roster {}", other.roster_id));
+
+            // I have no positional need, but they do and I have surplus (tier 3/4) value
+            // there — a sell-high candidate even with no need-for-need match. Offer my
+            // best expendable piece per needed position for their youngest tier-1/2 asset
+            // at that position (a get-younger swap), speculative if they have none.
+            if they_give_me.is_empty() && my_needs.is_empty() && !i_give_them.is_empty() {
+                let mut best_sell_by_pos: HashMap<&str, &serde_json::Value> = HashMap::new();
+                for &p in &i_give_them {
+                    let pos = p["position"].as_str().unwrap_or("?");
+                    best_sell_by_pos
+                        .entry(pos)
+                        .and_modify(|cur| {
+                            if p["dynasty_tier"].as_i64().unwrap_or(4)
+                                < cur["dynasty_tier"].as_i64().unwrap_or(4)
+                            {
+                                *cur = p;
+                            }
+                        })
+                        .or_insert(p);
+                }
+
+                for (pos, sell_piece) in best_sell_by_pos {
+                    let ret = other
+                        .players
+                        .iter()
+                        .map(|pid| enrich_player_full(pid, &all_players, &stats_ctx))
+                        .filter(|p| {
+                            p["position"].as_str() == Some(pos)
+                                && p["dynasty_tier"].as_i64().unwrap_or(4) <= 2
+                        })
+                        .min_by_key(|p| p["age"].as_i64().unwrap_or(99));
+
+                    let their_gain = sell_piece["dynasty_tier"].as_i64().unwrap_or(4) - 1;
+                    let summary = match &ret {
+                        Some(r) => format!(
+                            "Sell {} {} (expendable, they need {pos}) for {} {pos}, \
+                             their younger option at the position — not a strict need match for you.",
+                            sell_piece["name"].as_str().unwrap_or("?"),
+                            pos,
+                            r["name"].as_str().unwrap_or("?"),
+                        ),
+                        None => format!(
+                            "Sell {} {} to {partner_name} — they need {pos} and have no \
+                             tier 1/2 depth there; ask for picks/futures instead of a like-for-like swap.",
+                            sell_piece["name"].as_str().unwrap_or("?"),
+                            pos,
+                        ),
+                    };
+
+                    proposals.push(serde_json::json!({
+                        "kind": "sell_high",
+                        "partner": partner_name,
+                        "partner_roster_id": other.roster_id,
+                        "win_win_score": their_gain,
+                        "my_needs": my_needs,
+                        "their_needs": their_needs,
+                        "you_give": [sell_piece],
+                        "you_receive": ret.map(|r| vec![r]).unwrap_or_default(),
+                        "summary": summary,
+                    }));
+                }
+            }
+
             if they_give_me.is_empty() || i_give_them.is_empty() {
                 continue;
             }
@@ -1223,13 +1439,6 @@ impl AnalysisService {
                 .map(|p| p["dynasty_tier"].as_i64().unwrap_or(4) - 1)
                 .sum();
             let score = my_gain + their_gain;
-
-            let partner_name = other
-                .owner_id
-                .as_deref()
-                .and_then(|id| user_map.get(id))
-                .cloned()
-                .unwrap_or_else(|| format!("Roster {}", other.roster_id));
 
             // Surface best 3 players from each side.
             let mut they_give_sorted = they_give_me.clone();
@@ -1260,6 +1469,7 @@ impl AnalysisService {
                 .collect();
 
             proposals.push(serde_json::json!({
+                "kind": "need_match",
                 "partner": partner_name,
                 "partner_roster_id": other.roster_id,
                 "win_win_score": score,
@@ -1457,6 +1667,19 @@ async fn best_cached_season(db: &StatsDb, current_season: &str) -> String {
         prev
     } else {
         current_season.to_string()
+    }
+}
+
+/// Which Sleeper roster positions a given lineup slot accepts. `FLEX`/`SUPER_FLEX`
+/// cover offense; `IDP_FLEX` is disjoint (defense only) — Sleeper leagues don't mix them.
+fn slot_eligible_positions(slot: &str) -> Vec<&str> {
+    match slot {
+        "FLEX" => vec!["RB", "WR", "TE"],
+        "WRRB_FLEX" => vec!["RB", "WR"],
+        "WRTE_FLEX" | "REC_FLEX" => vec!["WR", "TE"],
+        "SUPER_FLEX" => vec!["QB", "RB", "WR", "TE"],
+        "IDP_FLEX" => vec!["DB", "DL", "LB"],
+        other => vec![other],
     }
 }
 
