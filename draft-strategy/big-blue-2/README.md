@@ -30,6 +30,7 @@ new team page or trade file is added.
 | 2026-07-20 | [BlakeMoen](trades/2026-07-20-blakemoen-offer-declined.md) | Declined | 3 picks for our 1.03 — kept 1.03, took Concepcion |
 | 2026-08-01 | [dehnfranklincj](trades/2026-08-01-proposed-dehnfranklincj-rb-for-wr.md) | Value-checked, favors us (+546) | Pollard for Quentin Johnston |
 | 2026-08-01 | [3chainzzz](trades/2026-08-01-proposed-3chainzzz-fields-for-wr.md) | Value-checked, doesn't hold up | Fields for WR — no fair 1-for-1 exists, needs a sweetener |
+| 2026-08-15 | [ajtwarog](trades/2026-08-15-proposed-ajtwarog-kamara-for-mclaurin.md) | Value-checked, favors us (+1084) | Kamara for McLaurin — Kamara's role shrinking behind Etienne, McLaurin cleared his preseason toe injury |
 
 ## Other documents
 
@@ -52,3 +53,11 @@ dated at the top of each file. `analyze_roster_needs`'s tier-based need model ha
 spot — it returns `weaknesses: []` for every team in this league regardless of real imbalances
 (see the 2026-08-01 team pages, all built from manual position-count inspection instead). Re-pull
 a team's page before relying on it for a live trade decision if it's more than a couple weeks old.
+
+**Partially fixed 2026-08-15:** `find_win_win_trades`'s need detection had the same class of bug
+— a fixed QB:2/RB:3/WR:4/TE:1 floor that a deep taxi-squad dynasty roster clears trivially, so it
+never found a need (or a trade) for us at all. Needs are now relative to league-average keeper
+depth per position instead of a hardcoded floor (`src/analysis.rs`, commit `ff45d69`) — that's
+what surfaced the ajtwarog trade above. `analyze_roster_needs`'s `weaknesses: []` gap described
+above is a **separate, still-open** instance of the same problem in a different function — not
+fixed by this change.
