@@ -391,3 +391,14 @@ As an operator, I want trade proposals through the same backend.
 1. Live-verify trade selectors; record bundle. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 2. Implement trade flow on seam + CLI. Files: `src/browser/session.rs`, `src/cli.rs`.
 3. Final release check: `cargo build --release`, zero orphans, `SLEEPER_BROWSER_DEBUG` intact. Files: `src/cli.rs`, `src/browser/launch.rs`.
+
+---
+
+## Spike verdict log (Story 1.1 — append-only, newest first)
+
+### 2026-09-08 — chaser-oxide audit (Task 1, main branch, `Cargo.toml` untouched)
+- Canonical repo: `github.com/ccheshirecat/chaser-oxide` (crates.io owner `ccheshirecat` points here); identical-star mirror `0xchasercat/chaser-oxide` confirms the fork-network smell — pin canonical only.
+- License: MIT OR Apache-2.0 (fits repo). Version 0.2.4 (2026-04-20), created 2026-01-01, ~269★/45 forks, ~14.9k total downloads; young (8 mo) + `chaser.sh` commercial halo — watch, no tripwire hit.
+- INTERIM verdict: `stay-on-0.9.1` pending live parity. Main gate holds: `rg chaser Cargo.toml Cargo.lock` empty; baseline `cargo build -q` passes on main (Chrome 146 present, DISPLAY=:1).
+- DEFERRED to live operator (Tasks 2–4): spike-branch swap + `status` WS-delta + ≥3-run parity need a human manual login; dirty tree also blocks a clean spike branch. Per AC3, WS/protocol parity failures on 0.9.1 flip this to `adopt` + Task 5 migration story before Epic 2.
+- GATE: Q-policy sign-off still OPEN — no stealth code (Stories 1.2+) until Tyler signs off fingerprint-removal-only.
