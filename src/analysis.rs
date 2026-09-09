@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::client::SleeperClient;
@@ -310,24 +311,14 @@ impl AnalysisService {
 
         // Active-roster capacity: taxi/reserve squads are separate pools (per taxi_slots/
         // reserve_slots) that don't count against roster_positions' starter+bench slots.
-        let taxi_used = data["taxi"].as_array().map(Vec::len).unwrap_or(0);
+        let taxi = data["taxi"].as_array().cloned().unwrap_or_default();
         let reserve_used = data["reserve"].as_array().map(Vec::len).unwrap_or(0);
-        let active_count = players.len().saturating_sub(taxi_used).saturating_sub(reserve_used);
-        let active_cap = league.roster_positions.len();
-        let over_by = active_count.saturating_sub(active_cap);
-        let taxi_slots = league.settings.extra.get("taxi_slots").and_then(Value::as_u64).unwrap_or(0);
-        let reserve_slots = league.settings.extra.get("reserve_slots").and_then(Value::as_u64).unwrap_or(0);
+        let capacity = roster_capacity(players.len(), taxi.len(), reserve_used, &league);
+        let (taxi_ineligible, taxi_ineligible_msgs) = taxi_ineligibility(&taxi, &league.settings.extra);
 
         let mut priorities = weaknesses.clone();
-        if over_by > 0 {
-            priorities.insert(
-                0,
-                format!(
-                    "Over the active-roster limit by {over_by} ({active_count}/{active_cap}, \
-                     excluding taxi/reserve) — cut or move players to taxi/reserve"
-                ),
-            );
-        }
+        priorities.extend(capacity.warnings());
+        priorities.extend(taxi_ineligible_msgs);
         priorities.extend(drop_recs);
 
         Ok(serde_json::json!({
@@ -337,15 +328,8 @@ impl AnalysisService {
             "weaknesses": weaknesses,
             "injured_or_out": injured,
             "no_team_free_agents": no_team,
-            "roster_capacity": {
-                "active_count": active_count,
-                "active_cap": active_cap,
-                "over_by": over_by,
-                "taxi_used": taxi_used,
-                "taxi_slots": taxi_slots,
-                "reserve_used": reserve_used,
-                "reserve_slots": reserve_slots,
-            },
+            "taxi_ineligible": taxi_ineligible,
+            "roster_capacity": capacity,
             "suggested_priorities": priorities,
         }))
     }
@@ -1681,6 +1665,96 @@ fn slot_eligible_positions(slot: &str) -> Vec<&str> {
         "IDP_FLEX" => vec!["DB", "DL", "LB"],
         other => vec![other],
     }
+}
+
+/// Active-roster/taxi/reserve occupancy vs. the league's configured limits.
+#[derive(Serialize)]
+struct RosterCapacity {
+    active_count: usize,
+    active_cap: usize,
+    over_by: usize,
+    taxi_used: usize,
+    taxi_slots: u64,
+    taxi_over_by: u64,
+    reserve_used: usize,
+    reserve_slots: u64,
+    reserve_over_by: u64,
+}
+
+impl RosterCapacity {
+    /// Human-readable warnings for any limit currently exceeded.
+    fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.over_by > 0 {
+            w.push(format!(
+                "Over the active-roster limit by {} ({}/{}, excluding taxi/reserve) — cut or move players to taxi/reserve",
+                self.over_by, self.active_count, self.active_cap
+            ));
+        }
+        if self.taxi_over_by > 0 {
+            w.push(format!(
+                "Over the taxi-squad limit by {} ({}/{})",
+                self.taxi_over_by, self.taxi_used, self.taxi_slots
+            ));
+        }
+        if self.reserve_over_by > 0 {
+            w.push(format!(
+                "Over the reserve-squad limit by {} ({}/{})",
+                self.reserve_over_by, self.reserve_used, self.reserve_slots
+            ));
+        }
+        w
+    }
+}
+
+/// Active-roster capacity: taxi/reserve squads are separate pools (per taxi_slots/
+/// reserve_slots) that don't count against roster_positions' starter+bench slots.
+fn roster_capacity(total_players: usize, taxi_used: usize, reserve_used: usize, league: &League) -> RosterCapacity {
+    let active_count = total_players.saturating_sub(taxi_used).saturating_sub(reserve_used);
+    let active_cap = league.roster_positions.len();
+    let taxi_slots = league.settings.extra.get("taxi_slots").and_then(Value::as_u64).unwrap_or(0);
+    let reserve_slots = league.settings.extra.get("reserve_slots").and_then(Value::as_u64).unwrap_or(0);
+    RosterCapacity {
+        active_count,
+        active_cap,
+        over_by: active_count.saturating_sub(active_cap),
+        taxi_used,
+        taxi_slots,
+        taxi_over_by: (taxi_used as u64).saturating_sub(taxi_slots),
+        reserve_used,
+        reserve_slots,
+        reserve_over_by: (reserve_used as u64).saturating_sub(reserve_slots),
+    }
+}
+
+/// Taxi eligibility: `taxi_allow_vets=0` restricts the taxi squad to rookies
+/// (years_exp == 0); `taxi_allow_vets=1` raises the cap to `taxi_years` of experience.
+/// Returns the ineligible players alongside one warning message per player.
+fn taxi_ineligibility(taxi: &[Value], settings: &HashMap<String, Value>) -> (Vec<Value>, Vec<String>) {
+    let taxi_allow_vets = settings.get("taxi_allow_vets").and_then(Value::as_u64).unwrap_or(0) != 0;
+    let taxi_years = settings.get("taxi_years").and_then(Value::as_i64).unwrap_or(0);
+
+    let ineligible: Vec<Value> = taxi
+        .iter()
+        .filter(|p| {
+            let years_exp = p["years_exp"].as_i64().unwrap_or(0);
+            if taxi_allow_vets { years_exp > taxi_years } else { years_exp > 0 }
+        })
+        .cloned()
+        .collect();
+
+    let messages = ineligible
+        .iter()
+        .map(|p| {
+            format!(
+                "Taxi-ineligible: {} has {} year(s) exp (limit {taxi_years}) — move to active roster or drop before the taxi deadline",
+                p["name"].as_str().unwrap_or("?"),
+                p["years_exp"].as_i64().unwrap_or(0),
+            )
+        })
+        .collect();
+
+    (ineligible, messages)
 }
 
 fn enrich_player(pid: &str, all_players: &HashMap<String, Value>) -> serde_json::Value {
