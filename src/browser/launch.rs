@@ -172,6 +172,16 @@ pub fn kill_process_group(pid: u32) -> Vec<u32> {
     vec![pid]
 }
 
+/// Async wrapper around [`kill_process_group`] for use on the executor:
+/// the sync SIGTERM→SIGKILL grace loop parks up to ~500ms in
+/// `std::thread::sleep`, so it must run in `spawn_blocking`, never inline
+/// in async code.
+async fn kill_group_async(pid: u32) -> Vec<u32> {
+    tokio::task::spawn_blocking(move || kill_process_group(pid))
+        .await
+        .unwrap_or_default()
+}
+
 /// Orphan sweep helper: runs BEFORE the lock on every launch. Reaps PIDs
 /// recorded by a prior run that never reached `close()` (panic,
 /// SIGKILL-parent) and reports each reaped PID. Never deletes the profile.
@@ -408,7 +418,7 @@ impl StealthLauncher {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                kill_process_group(pid);
+                kill_group_async(pid).await;
                 let _ = child.kill().await;
                 drop(lock);
                 return Err(other(format!(
@@ -429,13 +439,13 @@ impl StealthLauncher {
                     }
                 }
                 Ok(None) => {
-                    kill_process_group(pid);
+                    kill_group_async(pid).await;
                     let _ = child.kill().await;
                     drop(lock);
                     return Err(other("Chrome exited before printing a DevTools endpoint — profile lock released. Re-run `sleeper browser login`."));
                 }
                 Err(_) => {
-                    kill_process_group(pid);
+                    kill_group_async(pid).await;
                     let _ = child.kill().await;
                     drop(lock);
                     return Err(other("failed reading Chrome stderr while waiting for endpoint — profile lock released. Re-run `sleeper browser login`."));
@@ -462,7 +472,7 @@ impl LaunchedBrowser {
         // remove the PID record with async fs. Drop keeps its own sync kill
         // (sync context — never await there).
         let pid = self.pid;
-        tokio::task::spawn_blocking(move || kill_process_group(pid)).await?;
+        kill_group_async(pid).await;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
