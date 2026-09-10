@@ -742,6 +742,11 @@ async fn cmd_browser_login(
     // LoginPoll: indicatif spinner + countdown on stderr only (Surface B);
     // 5s ticks, 600s bound, Ctrl-C → exit 130 with copy.
     const TOTAL_SECS: u64 = 600;
+    // Observability boundary (plan.md Layer 3): one span + start / timeout
+    // events; per-tick progress stays on the spinner/stderr.
+    let poll_span = tracing::info_span!("login.poll", timeout_s = TOTAL_SECS);
+    let _poll_enter = poll_span.enter();
+    tracing::info!("login.poll start");
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -777,6 +782,7 @@ async fn cmd_browser_login(
         }
         if elapsed >= TOTAL_SECS {
             pb.abandon_with_message("still waiting stopped");
+            tracing::info!("login.poll timeout");
             println!("{}", style(login_timeout_copy()).yellow());
             session.close().await?;
             launched.close().await?;
@@ -833,7 +839,23 @@ async fn cmd_browser_status(
             Err(e) => launch_failure_exit(&e),
         };
     if debug || std::env::var("SLEEPER_BROWSER_DEBUG").is_ok() {
-        let dump = session.eval_dump().await?;
+        let dump = match session.eval_dump().await {
+            Ok(dump) => dump,
+            Err(e) => {
+                // Debug-probe failure maps like any transport failure (exit 4,
+                // never exit 1 via `?`); closes are best-effort on this path.
+                let detail = e.to_string();
+                let _ = session.close().await;
+                let _ = launched.close().await;
+                let msg = check_failed_triage(&detail);
+                if json {
+                    println!("{}", status_json(false, &pinned, &runtime, &profile_dir, Some(&msg)));
+                } else {
+                    eprintln!("{}", style(triage_error(&msg, &debug_detail(&detail))).red());
+                }
+                std::process::exit(4);
+            }
+        };
         eprintln!(
             "DEBUG dump: {}",
             crate::browser::session::redact_secrets(&dump)

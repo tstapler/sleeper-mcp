@@ -364,6 +364,15 @@ impl StealthLauncher {
     /// endpoint plus a teardown guard. Order: sweep → lock → spawn.
     /// Fails fast on a missing binary — before any port bind or spawn.
     pub async fn spawn(config: &LaunchConfig) -> Result<LaunchedBrowser> {
+        // Observability boundary (plan.md Layer 3): span covers resolve +
+        // spawn + the async stderr-parse loop below; no behavior change.
+        let _launch_span = tracing::info_span!(
+            "browser.launch",
+            mode = ?config.mode,
+            profile = %config.profile_dir.display(),
+            cft = ?config.chrome_binary
+        )
+        .entered();
         let binary = Self::resolve_binary(config)?;
         let profile_dir = config.profile_dir.clone();
         let flags = config.flags();
@@ -429,6 +438,7 @@ impl StealthLauncher {
             match tokio::time::timeout(remaining, lines.next_line()).await.map_err(other)? {
                 Ok(Some(line)) => {
                     if let Some(endpoint) = parse_ws_endpoint(&line) {
+                        tracing::info!("browser.launch endpoint parsed");
                         return Ok(LaunchedBrowser {
                             endpoint,
                             child: Some(child),
