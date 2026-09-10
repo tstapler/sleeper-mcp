@@ -649,6 +649,13 @@ pub fn build_doctor_report(
             true,
             format!("chrome runtime {runtime} (match, skew-free)"),
         ));
+    } else if runtime == "unknown" {
+        checks.push((
+            false,
+            format!(
+                "Chrome binary missing or unreadable — re-run `sleeper browser login` to resolve the pin (pinned {pinned})"
+            ),
+        ));
     } else {
         checks.push((
             false,
@@ -836,7 +843,20 @@ async fn cmd_browser_status(
     let (mut session, launched) =
         match launch_session(config, headed, system_chrome, chrome_binary).await {
             Ok(pair) => pair,
-            Err(e) => launch_failure_exit(&e),
+            Err(e) => {
+                // --json contract (Surface D / Story 2.4 AC2): transport/check
+                // failure exits non-zero with the failure shape on stdout
+                // (pipeable to jq), never empty. Stderr triage-first line is
+                // unchanged inside launch_failure_exit; exit code preserved.
+                if json {
+                    let err_msg = launch_failure_json_error(&e);
+                    println!(
+                        "{}",
+                        status_json(false, &pinned, &runtime, &profile_dir, Some(&err_msg))
+                    );
+                }
+                launch_failure_exit(&e)
+            }
         };
     if debug || std::env::var("SLEEPER_BROWSER_DEBUG").is_ok() {
         let dump = match session.eval_dump().await {
@@ -996,6 +1016,19 @@ fn launch_failure_exit(e: &crate::error::Error) -> ! {
     let triage = check_failed_triage("browser launch");
     eprintln!("{}", style(triage_error(&triage, &debug_detail(&msg))).red());
     std::process::exit(4);
+}
+
+/// Short JSON-safe error for the launch-failure path under `--json`
+/// (ux.md Surface D + Story 2.4 AC2): skew errors carry their own triage,
+/// everything else carries the `browser launch` triage. Properly escaped
+/// downstream via `status_json` (`serde_json::json!`), never a bare stack.
+pub fn launch_failure_json_error(e: &crate::error::Error) -> String {
+    let msg = e.to_string();
+    if msg.contains("version skew") {
+        msg
+    } else {
+        check_failed_triage("browser launch")
+    }
 }
 
 async fn cmd_browser_doctor(config: &Config) -> Result<()> {
@@ -1977,10 +2010,10 @@ fn textwrap(s: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::{
         already_logged_in_message, build_doctor_report, challenge_loop_copy,
-        check_failed_triage, format_countdown, lock_busy_message, login_cancelled_copy,
-        login_poll_tick, login_timeout_copy, parse_chrome_version, skew_triage_message,
-        status_exit_code, status_json, status_outcome_for_session, triage_error, unknown_triage,
-        StatusOutcome,
+        check_failed_triage, format_countdown, launch_failure_json_error, lock_busy_message,
+        login_cancelled_copy, login_poll_tick, login_timeout_copy, parse_chrome_version,
+        skew_triage_message, status_exit_code, status_json, status_outcome_for_session,
+        triage_error, unknown_triage, StatusOutcome,
     };
     use crate::browser::{BrowserSession, FakeSession};
 
@@ -2230,5 +2263,71 @@ mod tests {
                 "✗ line must name a re-run command, got {line}"
             );
         }
+    }
+
+    #[test]
+    fn status_json_should_emit_failure_shape_when_launch_fails() {
+        use crate::browser::other;
+        let profile = std::path::Path::new("/tmp/chrome-profile");
+        // Transport failure: short triage copy in the failure shape, never empty.
+        let err = other("connect failed: no Chrome installed");
+        let msg = launch_failure_json_error(&err);
+        assert!(msg.contains("Login check failed (browser launch)"), "got {msg}");
+        let raw = status_json(false, "126.0.6478.126", "unknown", profile, Some(&msg));
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("stdout must be pure JSON");
+        assert_eq!(v, serde_json::json!({"logged_in": false, "error": msg}));
+        // Skew-flavoured launch failure passes its own triage through.
+        let skew = other("CfT Chrome runtime v127.0.6533.99 vs pinned v126.0.6478.126 — version skew");
+        let skew_msg = launch_failure_json_error(&skew);
+        assert!(skew_msg.contains("version skew"), "got {skew_msg}");
+        let raw = status_json(false, "126.0.6478.126", "127.0.6533.99", profile, Some(&skew_msg));
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("pure JSON");
+        assert_eq!(v["logged_in"], false);
+    }
+
+    #[test]
+    fn doctor_should_resolve_pin_when_runtime_unknown() {
+        // Undetectable runtime ("unknown" sentinel): must never instruct
+        // updating the pin TO unknown.
+        let report = build_doctor_report(
+            "126.0.6478.126",
+            std::path::Path::new("/tmp/doctor-missing"),
+            "unknown",
+            "a1b2c3d4",
+            std::path::Path::new("/tmp/chrome-profile"),
+            true,
+            "skipped (resolve skew/lock first)",
+            false,
+        );
+        let rendered = report.render();
+        assert!(
+            !rendered.to_lowercase().contains("update the pin to unknown"),
+            "must never instruct pinning to unknown, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Chrome binary missing or unreadable — re-run `sleeper browser login` to resolve the pin (pinned 126.0.6478.126)"
+            ),
+            "got:\n{rendered}"
+        );
+        assert_ne!(report.exit_code(), 0);
+        // Known-vs-known skew wording stays byte-identical.
+        let known = build_doctor_report(
+            "126.0.6478.126",
+            std::path::Path::new("/tmp/doctor-missing"),
+            "127.0.6533.99",
+            "a1b2c3d4",
+            std::path::Path::new("/tmp/chrome-profile"),
+            true,
+            "skipped (resolve skew/lock first)",
+            false,
+        )
+        .render();
+        assert!(
+            known.contains(
+                "chrome runtime 127.0.6533.99 vs pinned 126.0.6478.126 — version skew. Re-run `sleeper browser login` to re-resolve the pin; if it persists, update the pin to 127.0.6533.99"
+            ),
+            "known-vs-known wording must stay byte-identical, got:\n{known}"
+        );
     }
 }
