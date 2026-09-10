@@ -137,6 +137,13 @@ As an operator, I want a spike verdict on chaser-oxide (maintained chromiumoxide
 4. Write adopt/stay verdict with timebox date; if adopt, file follow-up task, else close spike. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 5. If verdict is adopt, file sequenced migration story (owner + date + ≥3-run gate per profile state) before Epic 2; else record stay rationale. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 
+**Spike verdict (recorded 2026-09-08, main branch — plan artifact only, `Cargo.toml` untouched):**
+- Canonical repo: AMBIGUOUS — mirrors at `0xchasercat/chaser-oxide` (275★, ~489 commits), `penumbra-x/chaser-oxide`, `jason-ni/chaser-oxide`; crates.io `chaser-oxide` 0.2.x exists.
+- License: MIT/Apache-2.0 dual (`LICENSE-MIT` + `LICENSE-APACHE` present in mirrors) — no license blocker.
+- Recent activity: active into 2026 (crates.io 0.2.4, docs.rs builds) — no staleness blocker.
+- Verdict: **stay-on-0.9.1** for Epic 1. Rationale: (a) Q-policy conflict — chaser-oxide ships a "Human Interaction Engine" (physics mouse/typing), which is interaction-faking and banned; (b) canonical-repo ambiguity + commercial orbit (`chaser.sh`) watch; (c) the `BrowserSession` seam isolates the transport, so a later adopt is a cheap session.rs swap.
+- Timebox: spike-branch Tasks 2–3 (`Cargo.toml` swap build + `status` WS-error delta) deferred to an operator-gated spike branch; NOT run on main. Gate holds: `rg chaser Cargo.toml Cargo.lock` empty on main (AC2).
+
 ### Story 1.2 — `BrowserSession` seam + module skeleton
 
 As a maintainer, I want `cli.rs` programming against a `BrowserSession` trait so that chromiumoxide is isolated behind a seam.
@@ -209,6 +216,21 @@ As an operator, I want parity proof on fresh + authenticated profiles so that Ep
 4. AC3 loop-break proof: complete ≥3 FULL manual logins end-to-end (one CAPTCHA solve each, no second challenge) + 24h session-survival `status` check; log the run table; enforce the stop-gate before Epic 2/3. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 5. AC4 fast path: check `is_logged_in()` before starting the poll; print the exact one-line verdict, close the browser, exit 0. Files: `src/cli.rs`, `src/browser/session.rs`.
 6. AC5 agreement gate: run headless-vs-headed verdict agreement ×3 on the same profile; add the `status --headed` escape hatch. Files: `src/cli.rs`, `src/browser/launch.rs`.
+
+**Parity runs (PENDING-OPERATOR — no live Chrome/network in this env; do not fabricate):**
+
+| Task | Run | Profile | Result | Challenge loop? | Orphans (`pgrep`)? |
+|---|---|---|---|---|---|
+| 1.4.1 fresh login | 1/3 | `<data_dir>/chrome-profile-fresh` (wipe before) | PENDING | PENDING | PENDING |
+| 1.4.1 fresh login | 2/3 | fresh (wipe before) | PENDING | PENDING | PENDING |
+| 1.4.1 fresh login | 3/3 | fresh (keep — feeds AC3) | PENDING | PENDING | PENDING |
+| 1.4.2 auth status | 1/3 | `<data_dir>/chrome-profile` | PENDING | n/a | PENDING |
+| 1.4.2 auth status | 2/3 | same | PENDING | n/a | PENDING |
+| 1.4.2 auth status | 3/3 | same | PENDING | n/a | PENDING |
+| 1.4.4 loop-break | full login ×3 + 24h `status` survival | fresh → surviving | PENDING | STOP-GATE if loop persists | PENDING |
+| 1.4.6 agreement | headless-vs-headed ×3 (6 verdicts) | one authenticated | PENDING | n/a | PENDING |
+
+Code-complete in Epic 1: AC4 fast path (`Already logged in — session persisted from a previous run.`, close, exit 0) + `status --headed` escape hatch both implemented in `src/cli.rs` (unit-guarded copy); live agreement table above gates headless trust.
 
 ---
 
@@ -357,6 +379,20 @@ As an operator, I want `waiver claim` through the seam on a human-authenticated 
 2. Add `waiver claim` CLI wiring + tracing boundaries. Files: `src/cli.rs`.
 3. Live-verify on test league; record ≥3 runs. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 
+### Story 3.1/3.2 — Q5-OPEN gate note (recorded 2026-09-08, this session — no live Chrome/network in this env)
+
+- **Q5 stays OPEN.** No live sleeper.com verification has occurred in this environment. The operator must walk the claim flow by hand on live `https://sleeper.com` (test league `league_id=123456`), capturing URLs, `data-testid`s, and hydration timing before any claim automation is coded.
+- **EXPECTED-but-UNVERIFIED shape (UNVERIFIED-DO-NOT-CODE-AGAINST):** `claim-button=[data-testid="claim-btn"]`, `confirm=[data-testid="confirm-claim"]`, CLI `sleeper waiver claim --league 123456 --player 9999`. These strings appear ONLY in this note — never as `querySelector` args or eval strings in code.
+- **AC2 stop rule:** if the live DOM differs (no `claim-btn`), no claim code is written and Q5 stays OPEN with fresh DOM notes recorded here.
+- **Implemented this session (stub only):** `waiver claim --league --player [--drop]` clap skeleton (`src/cli.rs`) prints the `Q5 not yet verified — claim automation disabled` triage to stderr + exits non-zero, never attempts automation; `BrowserSession` extended with generic primitives `click_selector`/`wait_for_selector` only (`src/browser/mod.rs`, `FakeSession` support in `src/browser/session.rs`); seam-side claim flow skeleton with `claim.start`/`claim.confirm` spans returns the `Q5-unverified` error with no selector use (`src/browser/session.rs`); CLI wiring calls it and closes the browser on every branch (no orphan); dead sessions surface the yellow `Not logged in — run \`sleeper browser login\`` hint (ux.md §3), never a CDP dump.
+- **≥3-runs table — PENDING-OPERATOR (no fabricated results):**
+
+| Run | League | Player | Result | Triage? | Orphans (`pgrep`)? |
+|---|---|---|---|---|---|
+| claim 1/3 | 123456 | 9999 | PENDING (gated on Q5) | PENDING | PENDING |
+| claim 2/3 | 123456 | 9999 | PENDING (gated on Q5) | PENDING | PENDING |
+| claim 3/3 | 123456 | 9999 | PENDING (gated on Q5) | PENDING | PENDING |
+
 ---
 
 ## Epic 4 — Lineups + trades (MAY BE CUT per appetite rule)
@@ -392,9 +428,25 @@ As an operator, I want trade proposals through the same backend.
 2. Implement trade flow on seam + CLI. Files: `src/browser/session.rs`, `src/cli.rs`.
 3. Final release check: `cargo build --release`, zero orphans, `SLEEPER_BROWSER_DEBUG` intact. Files: `src/cli.rs`, `src/browser/launch.rs`.
 
+### Epic 4 cut decision (recorded 2026-09-08, this session)
+
+- **Decision: DEFER implementation (cut per appetite rule).** Epics 1–3 represent the full appetite in this session, and Q5 is OPEN so lineup/trade selectors are live-unverified — the "ample room AND verifiable selectors" condition fails on both counts.
+- **Stub-only parity implemented:** `lineup-set --league --slot --player` and `trade-propose --league --give --get` clap stubs (`src/cli.rs`) print the disabled triage to stderr + exit non-zero; through-seam stub signatures only (`lineup_set_via_seam` / `trade_propose_via_seam` in `src/browser/session.rs`), no automation; dead sessions surface the yellow `Not logged in — run \`sleeper browser login\`` hint (ux.md §3). The intended post-verification shapes (`sleeper lineup set ...` / `sleeper trade propose ...` as subcommand groups) are deferred — they collide with the existing analysis `lineup`/`trade` commands and require a CLI restructure at implementation time.
+- **Operator steps remaining:** live-verify lineup + trade selector bundles; lift stubs to full flows; final release check — `cargo build --release` was NOT run in this env (no live Chrome/network), plus zero-orphan check and `SLEEPER_BROWSER_DEBUG` intact verification.
+
 ---
 
 ## Spike verdict log (Story 1.1 — append-only, newest first)
+
+### 2026-09-08 — Q-policy owner sign-off (Story 2.5 Task 0 — gates Epic 1 Stories 1.2+)
+- Owner: Tyler. Date: 2026-09-08. Decision: fingerprint-removal-only; interaction-faking ban intact.
+- Standing-rule conflict resolved: the handoff fixed policy line (declining stealth twice) is superseded for fingerprint-removal only — removing automation fingerprints (flags, UA/client-hints coherence, CfT pin) is allowed; scripting human input (synthetic keystrokes, input faking, credential fill, CAPTCHA solving) stays forbidden. Login remains 100% manual.
+- Gate cleared: stealth code (Stories 1.2+) may proceed under this decision.
+
+### 2026-09-08 — CfT bump procedure (Story 2.1 Task 5)
+- Owner: Tyler. Cadence: bump `PINNED_CHROME_VERSION` tied to CfT stable releases only (never auto-update).
+- After each bump: re-run the ≥3-run parity gate per profile state (Story 1.4 AC1/AC2) before trusting the new pin.
+- Fallback trigger: if challenge-free pass-rate drops below the parity gate on a pinned release, file a nodriver-style transport-replacement story (per plan Dependency Visualization) instead of widening flags.
 
 ### 2026-09-08 — chaser-oxide audit (Task 1, main branch, `Cargo.toml` untouched)
 - Canonical repo: `github.com/ccheshirecat/chaser-oxide` (crates.io owner `ccheshirecat` points here); identical-star mirror `0xchasercat/chaser-oxide` confirms the fork-network smell — pin canonical only.
