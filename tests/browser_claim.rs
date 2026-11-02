@@ -1,39 +1,60 @@
-//! Waiver-claim gating tests — OPERATOR-GATED, `#[ignore]` by default.
-//! Gated on Q5 live verification (plan.md Epic 3): while Q5 is OPEN this
-//! test asserts the DISABLED-triage path only (invalid player 0000 → triage
-//! + no orphan). Post-Q5 the operator extends it to the live claim flow on
-//! the test league. Do NOT run in CI:
-//! `cargo test -- --ignored claim_should_surface_triage` only by the operator.
+//! Waiver-claim flow tests, run against `FakeSession` (no live Chrome).
+//! Story 3.2 implemented the real claim flow post-Q5 (plan.md Epic 3); these
+//! tests exercise it through the seam's generic primitives, which `FakeSession`
+//! satisfies unconditionally — proving the flow runs end to end without
+//! depending on a live sleeper.com DOM. They do NOT replace the operator's
+//! live ≥3-run table (plan.md Story 3.2), which still needs a real browser.
 
 use sleeper::browser::session::{claim_player_via_seam, FakeSession};
-use sleeper::browser::BrowserSession;
-use sleeper::cli::claim_disabled_triage;
 
-/// R22 error path: invalid player `0000` surfaces triage + leaves no orphan.
-/// While Q5 is OPEN the seam-side flow returns the Q5-unverified error with
-/// no selector use; the CLI stub prints the disabled triage to stderr and
-/// exits non-zero (never attempts automation).
+const LEAGUE_ID: &str = "123456";
+const PLAYER_NAME: &str = "Some Player";
+
+/// Happy path: a logged-in session drives the full claim flow (search →
+/// detect waiver-vs-add → open modal → optional drop → bid → submit) to
+/// completion with no error.
 #[tokio::test]
-#[ignore]
-async fn claim_should_surface_triage_when_player_invalid() {
-    let mut session = FakeSession::logged_in();
-    let err = claim_player_via_seam(&session, "123456", "0000", None)
+async fn claim_should_succeed_when_session_logged_in() {
+    let session = FakeSession::logged_in();
+    claim_player_via_seam(&session, LEAGUE_ID, PLAYER_NAME, 5, None)
         .await
-        .expect_err("Q5 OPEN: claim flow must stay disabled, never attempt automation");
-    assert!(
-        err.to_string().contains("Q5 not yet verified"),
-        "triage must name the Q5 gate, got {err}"
-    );
-    // Triage contract: stderr-only helper, never a stdout success verdict.
-    let triage = claim_disabled_triage();
-    assert!(
-        triage.contains("Q5 not yet verified — claim automation disabled"),
-        "got {triage}"
-    );
-    assert!(
-        !triage.contains("claim submitted"),
-        "disabled path must never print a success verdict"
-    );
-    // No orphan: the session closes clean exactly once.
-    session.close().await.expect("close leaves profile clean");
+        .expect("claim flow must complete through the seam primitives");
+}
+
+/// Happy path with a drop: same as above but exercising the optional
+/// drop-row click branch.
+#[tokio::test]
+async fn claim_should_succeed_when_dropping_a_player() {
+    let session = FakeSession::logged_in();
+    claim_player_via_seam(&session, LEAGUE_ID, PLAYER_NAME, 5, Some("Bench Player"))
+        .await
+        .expect("claim flow with a drop must complete");
+}
+
+/// R22 error path: a dead/logged-out session surfaces the dead-session
+/// hint instead of attempting any DOM automation.
+#[tokio::test]
+async fn claim_should_surface_dead_session_hint_when_logged_out() {
+    use sleeper::browser::session::DEAD_SESSION_HINT;
+    let session = FakeSession::logged_out();
+    let err = claim_player_via_seam(&session, LEAGUE_ID, PLAYER_NAME, 0, None)
+        .await
+        .expect_err("claim flow must refuse to run without a logged-in session");
+    assert_eq!(err.to_string(), DEAD_SESSION_HINT);
+}
+
+/// A transport error during the initial login check is swallowed by
+/// `is_logged_in().await.unwrap_or(false)` in the flow (same remedial action
+/// either way — re-run `sleeper browser login`), so it surfaces as the
+/// dead-session hint rather than a distinct transport error. Documents the
+/// real behavior rather than asserting an untrue "propagates distinctly"
+/// claim.
+#[tokio::test]
+async fn claim_should_surface_dead_session_hint_when_login_check_transport_errors() {
+    use sleeper::browser::session::DEAD_SESSION_HINT;
+    let session = FakeSession::with_transport_error();
+    let err = claim_player_via_seam(&session, LEAGUE_ID, PLAYER_NAME, 0, None)
+        .await
+        .expect_err("a failed login check must never proceed to automation");
+    assert_eq!(err.to_string(), DEAD_SESSION_HINT);
 }

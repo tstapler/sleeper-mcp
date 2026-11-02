@@ -98,6 +98,29 @@ pub trait BrowserSession: Send + Sync {
     /// timeout. Takes the selector as an argument; never hardcodes one.
     fn wait_for_selector<'a>(&'a self, selector: &'a str, timeout_ms: u64)
         -> BoxFuture<'a, Result<()>>;
+    /// Generic type primitive (Story 3.2): sets the value of the element
+    /// matching `selector` via the native property setter and dispatches
+    /// `input`+`change` so React-controlled inputs (live-verified: the
+    /// player search box and the FAAB bid field) pick up the change. No
+    /// selector or text is hardcoded here.
+    fn type_into_selector<'a>(&'a self, selector: &'a str, text: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Generic scoped-click primitive (Story 3.2/4.1): finds the first
+    /// element matching `row_selector` whose `textContent` contains
+    /// `needle`, then clicks the element matching `target_selector` inside
+    /// it (or the row itself when `target_selector` is empty). Covers every
+    /// live-verified click CSS alone can't express (plan.md Story 3.1/4.1):
+    /// an attribute-less submit button (`row_selector="button"`, empty
+    /// target), a drop-candidate row that is itself the clickable link
+    /// (`row_selector="a.team-roster-item"`, empty target), and a lineup
+    /// row whose name text lives outside its clickable link
+    /// (`row_selector=".team-roster-item"`, `target_selector="a.cell-position"`).
+    /// No row/target selector or needle text is hardcoded here.
+    fn click_in_row<'a>(
+        &'a self,
+        row_selector: &'a str,
+        needle: &'a str,
+        target_selector: &'a str,
+    ) -> BoxFuture<'a, Result<()>>;
     /// Coalesced read: ONE transport call for N scripts (hygiene gate:
     /// `eval_batch_should_coalesce_polls_when_hygiene_enabled`).
     fn eval_batch<'a>(&'a self, scripts: &'a [&'a str]) -> BoxFuture<'a, Result<Vec<bool>>>;
@@ -196,13 +219,29 @@ mod tests {
         // no transport types involved.
         let mut boxed: Box<dyn BrowserSession> = Box::new(FakeSession::logged_in());
         let _ = boxed.as_mut();
-        // Layer gate, compile-coupled: cli.rs must never import the transport.
+        // Layer gate, compile-coupled: no file under cli/ may import the transport.
         // NOTE: this file's own test name contains the bare crate word, so
         // the self-scan targets the import path (with `::`) specifically.
-        let cli = include_str!("../cli.rs");
+        //
+        // `include_str!` needs a literal path per file (no glob), so cli.rs's
+        // split into src/cli/ means every file under it must be listed here by
+        // hand — add new ones to this list, or this gate silently stops
+        // covering them.
+        let cli = [
+            include_str!("../cli/mod.rs"),
+            include_str!("../cli/browser/mod.rs"),
+            include_str!("../cli/browser/login.rs"),
+            include_str!("../cli/browser/status.rs"),
+            include_str!("../cli/browser/doctor.rs"),
+            include_str!("../cli/browser/actions.rs"),
+            include_str!("../cli/sync.rs"),
+            include_str!("../cli/roster_cmds.rs"),
+            include_str!("../cli/dynasty_cmds.rs"),
+        ]
+        .concat();
         assert!(
             !cli.contains("chromiumoxide"),
-            "cli.rs must not reference the transport; program against Box<dyn BrowserSession>"
+            "no file under src/cli/ may reference the transport; program against Box<dyn BrowserSession>"
         );
         let seam = include_str!("mod.rs");
         // Built dynamically so this gate cannot match its own source text.
@@ -215,13 +254,20 @@ mod tests {
 
     #[test]
     fn session_should_expose_primitives_only_when_claim_gated() {
-        // R22 happy path: while Q5 is OPEN the seam exposes only small
-        // generic primitives; flow logic lives in flow modules.
+        // R22 happy path: the seam exposes only small generic primitives;
+        // flow logic (claim/lineup/trade) lives in flow modules, not as
+        // per-page trait methods — this held before Q5 resolved and still
+        // holds now that Story 3.2 is implemented on top of these.
         let seam = include_str!("mod.rs");
-        for primitive in ["click_selector", "wait_for_selector"] {
+        for primitive in [
+            "click_selector",
+            "wait_for_selector",
+            "type_into_selector",
+            "click_in_row",
+        ] {
             assert!(
                 seam.contains(primitive),
-                "seam must expose generic primitive {primitive} (Story 3.1)"
+                "seam must expose generic primitive {primitive} (Story 3.1/3.2)"
             );
         }
         // Banned flow methods, built dynamically so this gate cannot match
@@ -231,7 +277,7 @@ mod tests {
         for method in &banned {
             assert!(
                 !seam.contains(method),
-                "seam must not expose flow method {method} while Q5 OPEN"
+                "seam must not expose flow method {method} as a trait method"
             );
         }
     }

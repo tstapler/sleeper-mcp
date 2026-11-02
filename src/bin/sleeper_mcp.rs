@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let client = SleeperClient::new(&config).await?;
     let db = StatsDb::open(&config.stats_db_path()).await?;
     let svc = AnalysisService::new(client, db);
-    let server = SleeperMcpServer::new(svc);
+    let server = SleeperMcpServer::new(svc, config);
 
     let service = server.serve(rmcp::transport::io::stdio()).await?;
     service.waiting().await?;

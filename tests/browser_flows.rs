@@ -1,39 +1,59 @@
-//! Lineup/trade flow tests — OPERATOR-GATED, `#[ignore]` by default.
-//! Epic 4 is CUT per the appetite rule (see the plan.md cut note): this
-//! stub asserts the DISABLED-triage path only and is marked PENDING-OPERATOR.
-//! Post-cut-lift the operator live-verifies the selector bundles first, then
-//! extends to the `lineup saved` / `trade proposed` assertions. Do NOT run
-//! in CI: `cargo test -- --ignored lineup_should_save` only by the operator.
+//! Lineup-swap and trade-propose flow tests, run against `FakeSession` (no
+//! live Chrome). Story 4.1 implemented the real lineup flow (plan.md Epic 4);
+//! trade-propose is still gated per the Epic 4 cut decision — Q5-equivalent
+//! live-UI verification for trades never happened. These tests do NOT
+//! replace the operator's live ≥3-run table for lineups (plan.md Story 4.1),
+//! which still needs a real browser.
 
 use sleeper::browser::session::{lineup_set_via_seam, trade_propose_via_seam, FakeSession};
-use sleeper::browser::BrowserSession;
-use sleeper::cli::{lineup_disabled_triage, trade_disabled_triage};
 
-/// R23: while Epic 4 is cut, lineup/trade surface the disabled triage.
-/// PENDING-OPERATOR: the `lineup saved` / `trade proposed` assertions below
-/// activate only after the live-verify bundles land (plan.md Epic 4).
+const LEAGUE_ID: &str = "123456";
+
+/// Happy path: a logged-in session drives the lineup-swap flow (enter
+/// select mode → wait for a valid bench target → click it) to completion.
 #[tokio::test]
-#[ignore]
-async fn lineup_should_save_when_selectors_verified() {
-    let mut session = FakeSession::logged_in();
-    let err = lineup_set_via_seam(&session, "123456", "WR", "9999")
+async fn lineup_should_save_when_session_logged_in() {
+    let session = FakeSession::logged_in();
+    lineup_set_via_seam(&session, LEAGUE_ID, "Started Player", "Bench Player")
         .await
-        .expect_err("Epic 4 CUT: lineup flow must stay disabled");
+        .expect("lineup flow must complete through the seam primitives");
+}
+
+/// A dead/logged-out session surfaces the dead-session hint instead of
+/// attempting any DOM automation.
+#[tokio::test]
+async fn lineup_should_surface_dead_session_hint_when_logged_out() {
+    use sleeper::browser::session::DEAD_SESSION_HINT;
+    let session = FakeSession::logged_out();
+    let err = lineup_set_via_seam(&session, LEAGUE_ID, "Started Player", "Bench Player")
+        .await
+        .expect_err("lineup flow must refuse to run without a logged-in session");
+    assert_eq!(err.to_string(), DEAD_SESSION_HINT);
+}
+
+/// R23: trade-propose stays disabled regardless of session state — Epic 4's
+/// cut decision for trades (unlike lineups) was never lifted, so the flow
+/// must keep failing closed rather than attempting unverified automation.
+#[tokio::test]
+async fn trade_should_stay_disabled_when_session_logged_in() {
+    let session = FakeSession::logged_in();
+    let err = trade_propose_via_seam(&session, LEAGUE_ID, "9999", "8888")
+        .await
+        .expect_err("Epic 4 CUT: trade flow must stay disabled even when logged in");
     assert!(err.to_string().contains("live-unverified"), "got {err}");
-    let triage = lineup_disabled_triage();
     assert!(
-        !triage.contains("lineup saved"),
-        "disabled path must never print a success verdict"
+        !err.to_string().contains("trade proposed"),
+        "disabled path must never imply a success verdict"
     );
-    let terr = trade_propose_via_seam(&session, "123456", "9999", "8888")
+}
+
+/// Dead-session check still takes priority over the disabled-trade error.
+#[tokio::test]
+async fn trade_should_surface_dead_session_hint_when_logged_out() {
+    use sleeper::browser::session::DEAD_SESSION_HINT;
+    let session = FakeSession::logged_out();
+    let err = trade_propose_via_seam(&session, LEAGUE_ID, "9999", "8888")
         .await
-        .expect_err("Epic 4 CUT: trade flow must stay disabled");
-    assert!(terr.to_string().contains("live-unverified"), "got {terr}");
-    let ttriage = trade_disabled_triage();
-    assert!(
-        !ttriage.contains("trade proposed"),
-        "disabled path must never print a success verdict"
-    );
-    // No orphan: the session closes clean exactly once.
-    session.close().await.expect("close leaves profile clean");
+        .expect_err("trade flow must refuse to run without a logged-in session");
+    assert_eq!(err.to_string(), DEAD_SESSION_HINT);
 }

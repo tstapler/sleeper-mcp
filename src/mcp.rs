@@ -9,15 +9,17 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::analysis::AnalysisService;
+use crate::config::Config;
 
 #[derive(Clone)]
 pub struct SleeperMcpServer {
     svc: Arc<AnalysisService>,
+    config: Arc<Config>,
 }
 
 impl SleeperMcpServer {
-    pub fn new(svc: AnalysisService) -> Self {
-        Self { svc: Arc::new(svc) }
+    pub fn new(svc: AnalysisService, config: Config) -> Self {
+        Self { svc: Arc::new(svc), config: Arc::new(config) }
     }
 }
 
@@ -187,6 +189,40 @@ struct TradeValueParams {
     league_id: String,
     /// Sleeper player IDs to look up (mix both sides of a proposed trade in one call)
     player_ids: Vec<String>,
+}
+
+/// LIVE WRITE ACTION: submits a real waiver claim/free-agent add against
+/// sleeper.com through the stealth-browser backend (plan.md
+/// undetected-chromedriver-rust, Story 3.2) on the operator's own persisted,
+/// manually-authenticated Chrome profile. Not a simulation — this spends
+/// FAAB and changes the live roster. Requires `sleeper browser login` to
+/// have been completed by hand at least once beforehand.
+#[derive(Deserialize, JsonSchema)]
+struct WaiverClaimParams {
+    league_id: String,
+    /// Sleeper player_id to claim/add.
+    player_id: String,
+    /// Sleeper player_id to drop, if any.
+    drop_player_id: Option<String>,
+    /// FAAB bid amount; ignored for a free agent not on waivers.
+    #[serde(default)]
+    bid: u32,
+}
+
+/// LIVE WRITE ACTION: swaps a bench player into a started slot against
+/// sleeper.com through the stealth-browser backend (plan.md
+/// undetected-chromedriver-rust, Story 4.1) on the operator's own persisted,
+/// manually-authenticated Chrome profile. Not a simulation — this changes
+/// the live starting lineup immediately with no confirm step. Requires
+/// `sleeper browser login` to have been completed by hand at least once
+/// beforehand.
+#[derive(Deserialize, JsonSchema)]
+struct LineupSetParams {
+    league_id: String,
+    /// Sleeper player_id of the currently-started player to bench.
+    out_player_id: String,
+    /// Sleeper player_id of the bench player to start in their place.
+    in_player_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -461,6 +497,45 @@ impl SleeperMcpServer {
                 "draft_id": league.draft_id,
             })),
         }
+    }
+
+    #[tool(description = "LIVE WRITE ACTION — submits a real waiver claim or free-agent add against sleeper.com (not a simulation: spends FAAB and changes the live roster immediately). Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the session is not logged in or the live UI has changed since the last verification.")]
+    async fn waiver_claim(
+        &self,
+        #[tool(aggr)] p: WaiverClaimParams,
+    ) -> Result<CallToolResult, McpError> {
+        let req = crate::cli::browser::ClaimRequest {
+            league: &p.league_id,
+            player_id: &p.player_id,
+            drop_id: p.drop_player_id.as_deref(),
+            bid: p.bid,
+        };
+        crate::cli::browser::run_claim(&self.config, &self.svc.client, req)
+            .await
+            .map_err(err)?;
+        ok(serde_json::json!({ "claim_submitted": true, "league_id": p.league_id, "player_id": p.player_id }))
+    }
+
+    #[tool(description = "LIVE WRITE ACTION — swaps a bench player into a started slot against sleeper.com (not a simulation: changes the live starting lineup immediately with no confirm step). Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the session is not logged in, the in-player is not eligible for that slot, or the live UI has changed since the last verification.")]
+    async fn lineup_set(
+        &self,
+        #[tool(aggr)] p: LineupSetParams,
+    ) -> Result<CallToolResult, McpError> {
+        crate::cli::browser::run_lineup_set(
+            &self.config,
+            &self.svc.client,
+            &p.league_id,
+            &p.out_player_id,
+            &p.in_player_id,
+        )
+        .await
+        .map_err(err)?;
+        ok(serde_json::json!({
+            "lineup_saved": true,
+            "league_id": p.league_id,
+            "out_player_id": p.out_player_id,
+            "in_player_id": p.in_player_id,
+        }))
     }
 }
 

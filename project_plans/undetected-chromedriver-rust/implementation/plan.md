@@ -379,39 +379,148 @@ As an operator, I want `waiver claim` through the seam on a human-authenticated 
 2. Add `waiver claim` CLI wiring + tracing boundaries. Files: `src/cli.rs`.
 3. Live-verify on test league; record ≥3 runs. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 
-### Story 3.1/3.2 — Q5-OPEN gate note (recorded 2026-09-08, this session — no live Chrome/network in this env)
+### Story 3.1 — Q5 RESOLVED (2026-09-11, live-verified via Chrome DevTools/claude-in-chrome against the operator's real authenticated session, league `1352883872131481600`)
 
-- **Q5 stays OPEN.** No live sleeper.com verification has occurred in this environment. The operator must walk the claim flow by hand on live `https://sleeper.com` (test league `league_id=123456`), capturing URLs, `data-testid`s, and hydration timing before any claim automation is coded.
-- **EXPECTED-but-UNVERIFIED shape (UNVERIFIED-DO-NOT-CODE-AGAINST):** `claim-button=[data-testid="claim-btn"]`, `confirm=[data-testid="confirm-claim"]`, CLI `sleeper waiver claim --league 123456 --player 9999`. These strings appear ONLY in this note — never as `querySelector` args or eval strings in code.
-- **AC2 stop rule:** if the live DOM differs (no `claim-btn`), no claim code is written and Q5 stays OPEN with fresh DOM notes recorded here.
-- **Implemented this session (stub only):** `waiver claim --league --player [--drop]` clap skeleton (`src/cli.rs`) prints the `Q5 not yet verified — claim automation disabled` triage to stderr + exits non-zero, never attempts automation; `BrowserSession` extended with generic primitives `click_selector`/`wait_for_selector` only (`src/browser/mod.rs`, `FakeSession` support in `src/browser/session.rs`); seam-side claim flow skeleton with `claim.start`/`claim.confirm` spans returns the `Q5-unverified` error with no selector use (`src/browser/session.rs`); CLI wiring calls it and closes the browser on every branch (no orphan); dead sessions surface the yellow `Not logged in — run \`sleeper browser login\`` hint (ux.md §3), never a CDP dump.
-- **≥3-runs table — PENDING-OPERATOR (no fabricated results):**
+Live UI walked by hand against real free-agent (Tuli Tuipulotu, no waivers) and real
+waiver-gated (Nick Emmanwori, `W Wed` badge) rows. **The plan's earlier placeholder
+selectors (`[data-testid="claim-btn"]`, `[data-testid="confirm-claim"]`) do not exist —
+confirmed zero `data-testid` attributes anywhere on `sleeper.com`.** AC2's stop rule
+correctly prevented coding against them. Verified structure instead:
 
-| Run | League | Player | Result | Triage? | Orphans (`pgrep`)? |
-|---|---|---|---|---|---|
-| claim 1/3 | 123456 | 9999 | PENDING (gated on Q5) | PENDING | PENDING |
-| claim 2/3 | 123456 | 9999 | PENDING (gated on Q5) | PENDING | PENDING |
-| claim 3/3 | 123456 | 9999 | PENDING (gated on Q5) | PENDING | PENDING |
+- **Player list is `react-virtualized`.** Rows for players outside the viewport are not
+  in the DOM at all — there is no `data-player-id` to `querySelector` for directly.
+  Automation must narrow via the search box first so exactly one row mounts.
+- **Search box:** `.player-search input` (placeholder `Find player Ctrl + U`), a
+  React-controlled input — type the player's resolved full name (from
+  `client.get_all_players("nfl")`, already used elsewhere for `full_name` lookups),
+  confirmed narrows `.player-list-item` to exactly 1 match.
+- **Row action trigger:** `.player-list-item a.player-action-button` — same base class
+  for both states, verified by inspecting live rows:
+  - Free agent (instant add): `a.player-action-button.add`
+  - On waivers (`W <weekday>` badge in the row): `a.player-action-button.waiver`
+- **Modal root:** `.add-player-panel` (full class
+  `add-player-panel drop-player-panel channel-settings`).
+- **Drop-candidate rows** (shown even with open roster slots, for optional drop):
+  `a.team-roster-item` inside `.add-player-panel`; clicking toggles a `.selected` class
+  (verified: clicked, confirmed `.selected` appended, clicked again to deselect — no
+  transaction submitted).
+- **Bid input** (present only for the waiver-gated modal — league is FAAB,
+  `waiver_type: 2`, `waiver_budget: 100`): `.add-player-panel .bid-input-container
+  input[type="number"]`, also React-controlled.
+- **Submit button — the one real surprise:** live DOM is a bare `<button>Add
+  Player</button>` / `<button>Make Waiver Bid</button>` with **zero attributes** (no
+  class, no id, no testid). CSS alone cannot select it. Verified via
+  `outerHTML` dump, not guessed. Selection strategy: text-match scoped to
+  `.add-player-panel` (new `click_in_row` primitive, Task 3 below — see also its
+  Story 4.1 generalization once the lineup row shape needed a separate target
+  selector), not a bare document-wide text search.
+- **No live-verified "on-waivers detection" DOM marker existed for reuse** — decided
+  instead of guessing: `eval_bool` on
+  `!!document.querySelector('.player-list-item a.player-action-button.waiver')`
+  right after the search narrows to one row.
+- Nothing was submitted for real during verification — every click either opened a
+  modal (read-only) or toggled/untoggled the `.selected` drop marker; the modal was
+  closed via the underlay each time, never via the submit button.
+
+**CLI shape amended from the original placeholder** (`--bid` added — not optional in a
+FAAB league; `--league`/`--player`/`--drop` still take numeric Sleeper IDs, resolved to
+full names internally before touching the DOM):
+
+```
+sleeper waiver claim --league <league_id> --player <player_id> [--drop <player_id>] [--bid <u32, default 0>]
+```
+
+### Story 3.2 — Waiver claim automation (implemented 2026-09-11, post-Q5)
+
+- `BrowserSession` gained two generic primitives (`src/browser/mod.rs` +
+  `src/browser/session.rs`): `type_into_selector` (native-setter + `input`/`change`
+  dispatch, for the two React-controlled inputs above) and `click_in_row` (row-scoped
+  substring match with a separate target selector, for the attribute-less submit
+  button and the drop-row text match — later generalized further for Story 4.1's
+  lineup rows, whose name text lives outside the clickable link). No selector or
+  button text is hardcoded in `mod.rs`; both stay in the flow function per the
+  Q5-era rule.
+- `claim_player_via_seam` (`src/browser/session.rs`) now drives the real flow: goto →
+  search → detect waiver-vs-add via `eval_bool` → open modal → optional drop-row
+  click → bid fill (waiver path only) → `click_in_row` the submit button. Tracing
+  spans `claim.start`/`claim.confirm` kept.
+- `sleeper waiver claim` (`src/cli.rs`) resolves `--player`/`--drop` IDs to full names
+  via `client.get_all_players("nfl")` before calling the seam, then wires the CLI.
+- **≥3-runs live table — PENDING-OPERATOR.** Code compiles and the flow matches every
+  verified selector above, but no claim has been submitted end-to-end yet (verification
+  deliberately avoided creating a real transaction). Run the table below by hand before
+  trusting this against a live add/drop that matters:
+
+| Run | League | Player | Drop | Bid | Result | Triage? | Orphans (`pgrep`)? |
+|---|---|---|---|---|---|---|---|
+| claim 1/3 | 1352883872131481600 | (pick a real free agent) | — | 0 | PENDING | PENDING | PENDING |
+| claim 2/3 | 1352883872131481600 | (pick a real waiver-gated player) | — | 1 | PENDING | PENDING | PENDING |
+| claim 3/3 | 1352883872131481600 | (pick a real waiver-gated player) | (a real bench player) | 1 | PENDING | PENDING | PENDING |
+
+### MCP wiring (2026-11-01): `waiver_claim` tool
+
+The module split (`src/cli.rs` → `src/cli/`, `src/browser/session.rs` →
+`src/browser/session/`) extracted the launch→flow→close core out of the CLI
+command into `run_claim` (`src/cli/browser/actions.rs`, `ClaimRequest`
+params struct), reused by the `sleeper waiver claim` CLI command and by a
+new `waiver_claim` MCP tool (`src/mcp.rs`) so an MCP client — including
+Claude — can call it directly. `SleeperMcpServer` now also holds `Config`
+(needed for `chrome_profile_dir()`). Live-verified via a raw JSON-RPC probe
+in this sandbox (no Chrome available here): `tools/list` shows the tool
+with its schema, and a real `tools/call` round-trips through the actual
+launch failure path and returns a clean JSON-RPC error — proving the
+dispatch plumbing, not the live claim flow. The ≥3-runs live table above is
+still the gate before trusting this for a real transaction; the MCP path
+doesn't change that, it's the same `run_claim` core either way.
+
+Fixed in the same pass: `StealthLauncher::spawn` held a manually-`.entered()`
+`tracing` span across an `.await` (`src/browser/launch.rs`), making its
+future `!Send` — harmless for the CLI (never needed `Send`) but a hard
+compile error for the MCP tool dispatcher, which boxes tool-call futures as
+`dyn Future + Send`. Switched to `#[tracing::instrument]`, which is
+`Send`-safe by construction; no behavior change.
+
+Also fixed: the module split had left `tests/browser_claim.rs` and
+`tests/browser_flows.rs` referencing the pre-Q5 stub API
+(`claim_disabled_triage`/`lineup_disabled_triage`, a 4-arg
+`claim_player_via_seam`) that no longer exists now that claim/lineup are
+real automation — `cargo test` didn't compile at all. Rewrote both against
+`FakeSession` to exercise the real flows (happy path, dead-session, and a
+documented note that a transport error during the initial login check is
+swallowed into the dead-session hint rather than surfaced distinctly — an
+existing `unwrap_or(false)` in all three flow functions, left as-is since
+it's not a safety issue and fixing it was out of scope for this pass).
 
 ---
 
-## Epic 4 — Lineups + trades (MAY BE CUT per appetite rule)
+## Epic 4 — Lineups + trades
 
-Cut rule: if Epics 1–3 exceed week 4, defer this epic; seam already supports it.
+Cut rule (trade-propose only, still in effect): if Epics 1–3 exceed week 4, defer;
+seam already supports it. **Lineups (Story 4.1) were un-cut and implemented
+2026-09-11** once live verification showed the mechanism was cheap to confirm and the
+operator asked for it explicitly — see the un-cut note below the trade story.
 
-### Story 4.1 — Lineups through the seam
+### Story 4.1 — Lineups through the seam (IMPLEMENTED 2026-09-11, live-verified selectors)
 
 As an operator, I want lineup changes through the same backend.
 
 **Acceptance criteria:**
 - AC1: Lineup set submits on verified selectors.
-  - Given an authenticated `BrowserSession` and league `123456`, When `sleeper lineup set --league 123456 --slot WR --player 9999` runs, Then stdout contains `lineup saved`.
+  - Given an authenticated `BrowserSession` and league `1352883872131481600`, When `sleeper lineup-set --league 1352883872131481600 --out <started_player_id> --in <bench_player_id>` runs, Then stdout contains `lineup saved`.
+
+**CLI shape amended from the original placeholder:** `--out`/`--in` (numeric Sleeper
+player IDs) replace the speculative `--slot WR --player 9999` — the live UI swaps by
+clicking the currently-started player's row then the bench replacement's row, not by
+an addressable slot name, so there is no "WR slot" to select against on the DOM. Both
+IDs resolve to display names via `client.get_all_players("nfl")` before touching the
+DOM, same as Story 3.2.
 
 **Files:** `src/cli.rs`, `src/browser/session.rs`, `src/browser/mod.rs`
 
 **Tasks:**
-1. Live-verify lineup selectors; record bundle. Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
-2. Implement lineup flow on seam + CLI. Files: `src/browser/session.rs`, `src/cli.rs`.
+1. ~~Live-verify lineup selectors; record bundle.~~ Done — see spot-check below.
+2. ~~Implement lineup flow on seam + CLI.~~ Done — `lineup_set_via_seam` in
+   `src/browser/session.rs`, wired via `cmd_lineup_set` in `src/cli.rs`.
 
 ### Story 4.2 — Trades through the seam
 
@@ -428,11 +537,65 @@ As an operator, I want trade proposals through the same backend.
 2. Implement trade flow on seam + CLI. Files: `src/browser/session.rs`, `src/cli.rs`.
 3. Final release check: `cargo build --release`, zero orphans, `SLEEPER_BROWSER_DEBUG` intact. Files: `src/cli.rs`, `src/browser/launch.rs`.
 
-### Epic 4 cut decision (recorded 2026-09-08, this session)
+### Epic 4 cut decision — original (recorded 2026-09-08, superseded for lineups below)
 
-- **Decision: DEFER implementation (cut per appetite rule).** Epics 1–3 represent the full appetite in this session, and Q5 is OPEN so lineup/trade selectors are live-unverified — the "ample room AND verifiable selectors" condition fails on both counts.
-- **Stub-only parity implemented:** `lineup-set --league --slot --player` and `trade-propose --league --give --get` clap stubs (`src/cli.rs`) print the disabled triage to stderr + exit non-zero; through-seam stub signatures only (`lineup_set_via_seam` / `trade_propose_via_seam` in `src/browser/session.rs`), no automation; dead sessions surface the yellow `Not logged in — run \`sleeper browser login\`` hint (ux.md §3). The intended post-verification shapes (`sleeper lineup set ...` / `sleeper trade propose ...` as subcommand groups) are deferred — they collide with the existing analysis `lineup`/`trade` commands and require a CLI restructure at implementation time.
-- **Operator steps remaining:** live-verify lineup + trade selector bundles; lift stubs to full flows; final release check — `cargo build --release` was NOT run in this env (no live Chrome/network), plus zero-orphan check and `SLEEPER_BROWSER_DEBUG` intact verification.
+- **Original decision: DEFER implementation (cut per appetite rule).** Epics 1–3 represented the full appetite that session, and Q5-for-lineups/trades was OPEN.
+- **Stub-only parity implemented that session:** `lineup-set --league --slot --player` and `trade-propose --league --give --get` clap stubs, through-seam stub signatures only, no automation.
+- **Trade-propose is still cut** — not spot-checked this session either (multi-party flow, lowest urgency, no pending need). Its Q5-equivalent stays fully OPEN; the stub in `trade_propose_via_seam` / `cmd_trade_propose` is unchanged.
+
+### Story 4.1 un-cut: lineup selector bundle, live-verified 2026-09-11
+
+Same session as Story 3.1/3.2 (Q5 resolution) — the operator asked to build lineups
+once the claim flow was working, so the mechanism was verified live (safely: entered
+select mode, confirmed the bench-target class, then cancelled by re-clicking the same
+starter — no swap was ever completed during verification) rather than left deferred.
+
+- Starter/bench rows: `.team-roster-item`; the clickable slot link is
+  `a.cell-position` — **its own text is just the position badge (e.g. "WRT"), not the
+  player's name**, which lives in a sibling element. This is why `click_in_row`
+  (row-scoped text match + separate target selector) replaced the earlier
+  `click_by_text` (self-text match) primitive from Story 3.2 — one primitive now
+  covers both shapes.
+- Clicking a starter's `a.cell-position` enters an in-place **swap-select mode**, no
+  modal, no confirm dialog:
+  - The clicked starter row gains classes `selected valid`.
+  - Each bench row eligible for that slot gains `valid`.
+  - Each ineligible bench row gains `invalid`.
+  - (Verified directly: clicked Tony Pollard's RB slot, confirmed Tyler Allgeier's RB
+    bench row went `valid` and Justin Fields' QB bench row went `invalid`.)
+- Clicking a `.valid` row's `a.cell-position` completes the swap **immediately** —
+  there is no separate save/submit step to intercept if the wrong row were clicked.
+- Locked/already-played slots still entered select mode when spot-checked (clicking
+  Joe Burrow's QB slot after his game had gone final) — the UI doesn't visibly block
+  it client-side, so the flow doesn't rely on lock state for safety; it relies on
+  never clicking a `.valid` target during verification.
+
+Implemented on top of this in `claim_selectors`-style `lineup_selectors` module
+(`src/browser/session.rs`): `ROSTER_ROW = ".team-roster-item"`,
+`ROW_LINK = "a.cell-position"`, `VALID_TARGET_ROW = ".team-roster-item.valid"`.
+
+**≥3-runs live table — PENDING-OPERATOR.** Code compiles against every verified
+selector above, but no swap has been submitted end-to-end yet (verification
+deliberately avoided completing one):
+
+| Run | League | Out (bench) | In (start) | Result | Orphans (`pgrep`)? |
+|---|---|---|---|---|---|
+| lineup 1/3 | 1352883872131481600 | (a real started player) | (a real eligible bench player) | PENDING | PENDING |
+| lineup 2/3 | 1352883872131481600 | (a real started player) | (a real eligible bench player) | PENDING | PENDING |
+| lineup 3/3 | 1352883872131481600 | (a real started player) | (a real eligible bench player) | PENDING | PENDING |
+
+### MCP wiring (2026-11-01): `lineup_set` tool
+
+Same pass as the `waiver_claim` MCP tool above: the CLI's launch→flow→close
+core was extracted into `run_lineup_set` (`src/cli/browser/actions.rs`),
+reused by `sleeper lineup-set` and by a new `lineup_set` MCP tool
+(`src/mcp.rs`). Trade-propose stayed CLI-only — it never leaves the disabled
+stub (Epic 4 cut, Q5-equivalent live-UI verification never happened), so an
+MCP tool for it would only ever return the disabled-triage error; no value
+in exposing it until Story 4.2 actually gets live-verified. Same live
+probe as the claim tool confirmed `tools/list` + a real `tools/call` round
+trip; the ≥3-runs live table above is still the gate before trusting this
+for a real transaction.
 
 ---
 

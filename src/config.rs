@@ -53,4 +53,13 @@ impl Config {
     pub fn cft_version_dir(&self, version: &str) -> PathBuf {
         self.cft_dir().join(version)
     }
+
+    /// Rich league-snapshot JSON dumps (`<data_dir>/snapshots/<league_id>.json`) —
+    /// always overwritten with the latest sync, for direct reading without a DB
+    /// query. History lives in `stats.db` (`roster_snapshots`/`transactions`
+    /// tables) instead, since disk holds latest-state and SQLite holds the
+    /// time series.
+    pub fn snapshot_path(&self, league_id: &str) -> PathBuf {
+        self.data_dir.join("snapshots").join(format!("{league_id}.json"))
+    }
 }

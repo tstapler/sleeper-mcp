@@ -16,6 +16,32 @@ pub struct StatsDb {
     pool: SqlitePool,
 }
 
+/// Params for `StatsDb::upsert_roster_snapshot` — grouped into a struct
+/// rather than positional args since the row has more fields than a call
+/// site can keep straight by position.
+pub struct RosterSnapshotRow<'a> {
+    pub league_id: &'a str,
+    pub roster_id: i32,
+    pub season: &'a str,
+    pub owner: Option<&'a str>,
+    pub wins: i32,
+    pub losses: i32,
+    pub data: &'a serde_json::Value,
+}
+
+/// Params for `StatsDb::upsert_transaction`.
+pub struct TransactionRow<'a> {
+    pub transaction_id: &'a str,
+    pub league_id: &'a str,
+    pub season: &'a str,
+    pub week: i32,
+    pub kind: &'a str,
+    pub status: Option<&'a str>,
+    pub created: i64,
+    pub adds: &'a serde_json::Value,
+    pub drops: &'a serde_json::Value,
+}
+
 impl StatsDb {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -63,7 +89,34 @@ impl StatsDb {
             CREATE INDEX IF NOT EXISTS league_members_username
                 ON league_members (league_id, username COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS league_members_display
-                ON league_members (league_id, display_name COLLATE NOCASE);",
+                ON league_members (league_id, display_name COLLATE NOCASE);
+            CREATE TABLE IF NOT EXISTS roster_snapshots (
+                league_id  TEXT    NOT NULL,
+                roster_id  INTEGER NOT NULL,
+                season     TEXT    NOT NULL,
+                fetched_at TEXT    NOT NULL,
+                owner      TEXT,
+                wins       INTEGER,
+                losses     INTEGER,
+                data       TEXT    NOT NULL,
+                PRIMARY KEY (league_id, roster_id, fetched_at)
+            );
+            CREATE INDEX IF NOT EXISTS roster_snapshots_latest
+                ON roster_snapshots (league_id, roster_id, fetched_at DESC);
+            CREATE TABLE IF NOT EXISTS transactions (
+                transaction_id TEXT    PRIMARY KEY,
+                league_id      TEXT    NOT NULL,
+                season         TEXT    NOT NULL,
+                week           INTEGER NOT NULL,
+                type           TEXT    NOT NULL,
+                status         TEXT,
+                created        INTEGER,
+                adds           TEXT,
+                drops          TEXT,
+                fetched_at     TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS transactions_league_week
+                ON transactions (league_id, season, week);",
         )
         .execute(&pool)
         .await?;
@@ -250,6 +303,21 @@ impl StatsDb {
         Ok(())
     }
 
+    /// All synced members of a league: (roster_id, user_id, username, display_name).
+    pub async fn list_league_members(
+        &self,
+        league_id: &str,
+    ) -> Result<Vec<(i32, String, Option<String>, Option<String>)>> {
+        let rows: Vec<(i32, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT roster_id, user_id, username, display_name
+             FROM league_members WHERE league_id = ?",
+        )
+        .bind(league_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Resolve a human-readable identifier to a roster_id.
     /// Accepts (in order): numeric roster_id, username, display_name, user_id.
     pub async fn resolve_roster_id(
@@ -303,6 +371,55 @@ impl StatsDb {
         )
         .bind(&league.league_id)
         .bind(&data)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Append one roster's enriched snapshot (`data` = the resolved JSON blob
+    /// analysis.rs builds — name/position/age/tier per player). Append-only
+    /// (PK includes `fetched_at`) so history accumulates for trend queries
+    /// (e.g. "how did roster 5's IDP count change over the season"), unlike
+    /// `leagues`/`league_members` which are point-in-time upserts.
+    pub async fn upsert_roster_snapshot(&self, row: RosterSnapshotRow<'_>) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO roster_snapshots
+             (league_id, roster_id, season, fetched_at, owner, wins, losses, data)
+             VALUES (?,?,?,?,?,?,?,?)",
+        )
+        .bind(row.league_id)
+        .bind(row.roster_id)
+        .bind(row.season)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(row.owner)
+        .bind(row.wins)
+        .bind(row.losses)
+        .bind(serde_json::to_string(row.data)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Idempotent upsert (PK = transaction_id) of one resolved transaction —
+    /// `adds`/`drops` are pre-resolved JSON (player name/position/owner, not
+    /// bare IDs) so a `sqlite3 stats.db` query can filter by position/owner
+    /// directly without a second lookup pass.
+    pub async fn upsert_transaction(&self, row: TransactionRow<'_>) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO transactions
+             (transaction_id, league_id, season, week, type, status, created, adds, drops, fetched_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(row.transaction_id)
+        .bind(row.league_id)
+        .bind(row.season)
+        .bind(row.week)
+        .bind(row.kind)
+        .bind(row.status)
+        .bind(row.created)
+        .bind(serde_json::to_string(row.adds)?)
+        .bind(serde_json::to_string(row.drops)?)
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;

@@ -363,16 +363,19 @@ impl StealthLauncher {
     /// the WS endpoint from stderr with a 10s deadline, and return the
     /// endpoint plus a teardown guard. Order: sweep → lock → spawn.
     /// Fails fast on a missing binary — before any port bind or spawn.
+    ///
+    /// Observability boundary (plan.md Layer 3): span covers resolve + spawn
+    /// + the async stderr-parse loop below; no behavior change. Uses the
+    /// `#[instrument]` attribute rather than a manually `.entered()` span —
+    /// an `EnteredSpan` guard held across an `.await` is not `Send`, which
+    /// broke every caller that needs a `Send` future (the MCP tool
+    /// dispatcher boxes tool-call futures as `dyn Future + Send`).
+    #[tracing::instrument(
+        name = "browser.launch",
+        skip(config),
+        fields(mode = ?config.mode, profile = %config.profile_dir.display(), cft = ?config.chrome_binary)
+    )]
     pub async fn spawn(config: &LaunchConfig) -> Result<LaunchedBrowser> {
-        // Observability boundary (plan.md Layer 3): span covers resolve +
-        // spawn + the async stderr-parse loop below; no behavior change.
-        let _launch_span = tracing::info_span!(
-            "browser.launch",
-            mode = ?config.mode,
-            profile = %config.profile_dir.display(),
-            cft = ?config.chrome_binary
-        )
-        .entered();
         let binary = Self::resolve_binary(config)?;
         let profile_dir = config.profile_dir.clone();
         let flags = config.flags();
