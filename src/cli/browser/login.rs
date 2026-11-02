@@ -97,11 +97,31 @@ impl LaunchOptions {
     }
 }
 
+/// Downloads the pinned CfT Chrome on first use. Root-cause fix (2026-11-01):
+/// `resolve()` (Story 2.1 Task 2 — download → sha256 → unzip → cache) had
+/// no caller anywhere outside an operator-gated test that required a human
+/// to paste a sha256 via `SLEEPER_CFT_SHA256` by hand — so `sleeper browser
+/// login` on a fresh machine (no pre-existing `<data_dir>/cft/`) could only
+/// ever fail with "CfT Chrome binary missing ... re-run `sleeper browser
+/// login`", which re-running did nothing to fix (same missing path, same
+/// error, forever). Resolves against the trust-on-first-use
+/// `PINNED_CHROME_SHA256` constant (see its doc comment — the CfT dashboard
+/// was found to publish no per-download checksum at all, for any version),
+/// closing that loop.
+async fn ensure_cft_downloaded(data_dir: &std::path::Path, pinned: &crate::browser::PinnedVersion) -> Result<()> {
+    use crate::browser::stealth::PINNED_CHROME_SHA256;
+    if crate::browser::cft::cft_chrome_binary(data_dir, pinned).is_file() {
+        return Ok(());
+    }
+    crate::browser::cft::resolve(data_dir, pinned, PINNED_CHROME_SHA256).await?;
+    Ok(())
+}
+
 /// Launch through the seam only: `StealthLauncher::spawn` + `connect`.
 /// Returns the boxed session plus the process guard; callers close both.
 /// CfT wiring (Story 2.1 Task 4): without an explicit binary/flag the
-/// resolved CfT path is used; a missing cache entry fails fast (never a
-/// silent system-Chrome fallback).
+/// resolved CfT path is used; a missing cache entry triggers
+/// [`ensure_cft_downloaded`] (never a silent system-Chrome fallback).
 pub(super) async fn launch_session(
     config: &Config,
     opts: LaunchOptions,
@@ -118,7 +138,9 @@ pub(super) async fn launch_session(
     if let Some(path) = chrome_binary {
         cfg = cfg.with_chrome_binary(path);
     } else if !system_chrome {
-        cfg = cfg.with_cft(&config.data_dir, &PinnedVersion::pinned());
+        let pinned = PinnedVersion::pinned();
+        ensure_cft_downloaded(&config.data_dir, &pinned).await?;
+        cfg = cfg.with_cft(&config.data_dir, &pinned);
     }
     let launched = StealthLauncher::spawn(&cfg).await?;
     let session: Box<dyn BrowserSession> =

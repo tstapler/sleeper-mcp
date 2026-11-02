@@ -1,8 +1,11 @@
 //! Chrome-for-Testing pinned resolver (Story 2.1).
 //!
-//! Transaction Script: resolve → verify (sha256 vs the CfT dashboard
-//! `downloads.chrome[].sha256` field, the source of truth) → unzip → cache
-//! under `<data_dir>/cft/<version>/`.
+//! Transaction Script: resolve → verify (sha256 vs
+//! [`crate::browser::stealth::PINNED_CHROME_SHA256`], a trust-on-first-use
+//! pin computed directly from the archive — NOT a CfT dashboard field; both
+//! dashboard endpoints were checked live on 2026-11-01 and neither
+//! publishes a `sha256` on any `downloads.chrome[]` entry, for any version)
+//! → unzip → cache under `<data_dir>/cft/<version>/`.
 //!
 //! NO binary patching rule (Story 2.5 Task 4): stealth = launch flags + CDP
 //! hygiene + CfT version pin only. The CfT Chrome binary is never patched in
@@ -24,7 +27,8 @@ use crate::error::Result;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeVersion(pub String);
 
-/// Pure helper: CfT dashboard download URL for a pinned version (linux64).
+/// Pure helper: CfT archive download URL for a pinned version (linux64) —
+/// the storage host, not the dashboard (the dashboard only lists this URL).
 pub fn cft_url(pinned: &PinnedVersion) -> String {
     format!(
         "https://storage.googleapis.com/chrome-for-testing-public/{}/linux64/chrome-linux64.zip",
@@ -54,8 +58,10 @@ pub fn check_skew(pinned: &PinnedVersion, runtime: &RuntimeVersion) -> Result<()
     )))
 }
 
-/// Verify downloaded bytes against the CfT dashboard `downloads.chrome[]`
-/// `sha256` field (source of truth; the inner-binary hash is never used).
+/// Verify downloaded bytes against the trust-on-first-use pinned hash
+/// ([`crate::browser::stealth::PINNED_CHROME_SHA256`]) — never the CfT
+/// dashboard, which doesn't publish per-download checksums (see the module
+/// doc comment). The inner-binary hash is never used either.
 pub fn verify_checksum(bytes: &[u8], expected_sha256_hex: &str) -> Result<()> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -64,40 +70,9 @@ pub fn verify_checksum(bytes: &[u8], expected_sha256_hex: &str) -> Result<()> {
     if got.eq_ignore_ascii_case(expected_sha256_hex.trim()) {
         return Ok(());
     }
-    Err(other(format!(
-        "CfT checksum mismatch (dashboard sha256 field is the source of truth) — re-run with update: delete the stale cache dir and re-run `sleeper browser login`; if it persists, update the pin."
-    )))
-}
-
-/// Pull the linux64 `downloads.chrome[].sha256` field for `version` out of a
-/// CfT dashboard JSON document (`last-known-good-versions-with-downloads.json`).
-pub fn dashboard_sha256_for_linux64(dashboard_json: &str, version: &str) -> Result<String> {
-    let doc: serde_json::Value = serde_json::from_str(dashboard_json).map_err(other)?;
-    let versions = doc
-        .get("versions")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| other("CfT dashboard JSON has no versions array"))?;
-    for entry in versions {
-        if entry.get("version").and_then(|v| v.as_str()) != Some(version) {
-            continue;
-        }
-        let downloads = entry
-            .get("downloads")
-            .and_then(|d| d.get("chrome"))
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| other("CfT dashboard entry has no downloads.chrome array"))?;
-        for item in downloads {
-            if item.get("platform").and_then(|p| p.as_str()) == Some("linux64") {
-                if let Some(sha) = item.get("sha256").and_then(|s| s.as_str()) {
-                    return Ok(sha.to_string());
-                }
-            }
-        }
-        return Err(other(format!(
-            "CfT dashboard has no linux64 chrome download for v{version}"
-        )));
-    }
-    Err(other(format!("CfT dashboard has no entry for v{version}")))
+    Err(other(
+        "CfT checksum mismatch against the pinned hash — re-run with update: delete the stale cache dir and re-run `sleeper browser login`; if it persists, the pin itself may be stale — re-derive PINNED_CHROME_SHA256 from a fresh download.".to_string()
+    ))
 }
 
 /// Zip-slip guard: reject absolute entries and any `..` component, and
@@ -165,9 +140,11 @@ pub fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Transaction Script: download → sha256 (vs dashboard field) → unzip →
-/// cache. `30s` connect / `120s` total timeouts, 3 attempts, offline + disk-
-/// full triage, `*.part` temp file + atomic rename on success.
+/// Transaction Script: download → sha256 (vs `expected_sha256_hex`, the
+/// trust-on-first-use pin — callers pass
+/// [`crate::browser::stealth::PINNED_CHROME_SHA256`]) → unzip → cache.
+/// `30s` connect / `120s` total timeouts, 3 attempts, offline + disk-full
+/// triage, `*.part` temp file + atomic rename on success.
 pub async fn resolve(
     data_dir: &Path,
     pinned: &PinnedVersion,
@@ -302,11 +279,10 @@ pub fn stealth_leaves_binary_untouched(binary_bytes: &[u8], _flags: &[StealthFla
 #[cfg(test)]
 mod tests {
     use super::{
-        cft_chrome_binary, cft_path, cft_url, check_skew, dashboard_sha256_for_linux64,
-        extract_zip, stealth_flag_set_hash, stealth_leaves_binary_untouched, verify_checksum,
-        PinnedVersion, RuntimeVersion,
+        cft_chrome_binary, cft_path, cft_url, check_skew, extract_zip, stealth_flag_set_hash,
+        stealth_leaves_binary_untouched, verify_checksum, PinnedVersion, RuntimeVersion,
     };
-    use crate::browser::stealth::{stealth_flags, StealthFlag};
+    use crate::browser::stealth::{stealth_flags, StealthFlag, PINNED_CHROME_SHA256};
     use crate::browser::LaunchMode;
     use std::io::Write;
 
@@ -324,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn cft_url_should_point_at_dashboard_endpoint_when_pinned_version_given() {
+    fn cft_url_should_point_at_download_host_when_pinned_version_given() {
         let url = cft_url(&PinnedVersion::pinned());
         assert!(
             url.contains("chrome-for-testing"),
@@ -338,27 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_should_error_when_checksum_mismatches_dashboard_field() {
+    fn resolve_should_error_when_checksum_mismatches_pinned_hash() {
         let dir = std::env::temp_dir().join(format!(
             "sleeper-cft-checksum-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("tempdir");
-        // Dashboard source-of-truth shape: downloads.chrome[].sha256.
-        let dashboard = serde_json::json!({
-            "versions": [{
-                "version": PinnedVersion::pinned().0,
-                "downloads": { "chrome": [
-                    { "platform": "linux64", "url": cft_url(&PinnedVersion::pinned()), "sha256": "0".repeat(64) }
-                ]}
-            }]
-        });
-        let expected =
-            dashboard_sha256_for_linux64(&dashboard.to_string(), &PinnedVersion::pinned().0)
-                .expect("dashboard parse");
-        let bytes = b"tampered chrome bytes, not what the dashboard signed";
-        let err = verify_checksum(bytes, &expected).expect_err("mismatch must Err");
+        let bytes = b"tampered chrome bytes, not what PINNED_CHROME_SHA256 pins";
+        let err = verify_checksum(bytes, PINNED_CHROME_SHA256).expect_err("mismatch must Err");
         assert!(
             err.to_string().contains("checksum"),
             "checksum error must name the cause, got {err}"

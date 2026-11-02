@@ -24,6 +24,22 @@ use crate::browser::launch::LaunchMode;
 /// RuntimeVersion)` so operands cannot swap.
 pub const PINNED_CHROME_VERSION: &str = "126.0.6478.126";
 
+/// Trust-on-first-use sha256 of `https://storage.googleapis.com/
+/// chrome-for-testing-public/126.0.6478.126/linux64/chrome-linux64.zip`,
+/// computed directly from that archive on 2026-11-01. NOT from a CfT
+/// dashboard field — both dashboard endpoints
+/// (`last-known-good-versions-with-downloads.json` and
+/// `known-good-versions-with-downloads.json`) were checked live and neither
+/// publishes a `sha256` on any `downloads.chrome[]` entry, for any version;
+/// the "verify against the dashboard field" design in the original Story
+/// 2.1 plan was never true. This constant is the actual source of truth: it
+/// pins this one download to this one hash, the same trust-on-first-use
+/// model as a `Cargo.lock` checksum. Bumping `PINNED_CHROME_VERSION`
+/// requires recomputing this too — download the new version's
+/// `chrome-linux64.zip` and `sha256sum` it.
+pub const PINNED_CHROME_SHA256: &str =
+    "b0dcb2cb784fdf72797279f33a8fdca589f35075eae6c67354e35212939a0d2b";
+
 /// Newtype for the CfT pin (`$PINNED`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedVersion(pub String);

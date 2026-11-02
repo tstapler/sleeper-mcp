@@ -257,6 +257,48 @@ As a maintainer, I want Chrome/driver pins reproducible so that auto-update neve
 4. Wire `LaunchConfig` to resolved CfT binary; fail-fast on skew with triage line; explicit no-silent-fallback rule (failed download = error exit, never system Chrome). Files: `src/browser/launch.rs`, `src/browser/cft.rs`.
 5. Bump procedure (owner Tyler, cadence tied to CfT stable releases, re-run ≥3-run gate per profile state after each bump) + fallback trigger (nodriver-style transport replacement if pass-rate drops below gate). Files: `project_plans/undetected-chromedriver-rust/implementation/plan.md`.
 
+### Root-cause fix (2026-11-01): `sleeper browser login` could never succeed on a fresh machine
+
+Reported symptom: "the browser login didn't work, it returned an error." Root cause was
+two layered gaps in this story's own implementation, not a login-flow bug:
+
+1. **`cft::resolve` (Task 2) had zero callers outside an `#[ignore]`d test.**
+   `launch_session`'s CfT branch (`with_cft`) only computed the *expected* cache path
+   (`cft_chrome_binary`) — it never called `resolve` to actually download anything. So
+   on any machine without a pre-existing `<data_dir>/cft/` (every fresh install), every
+   browser subcommand failed with "CfT Chrome binary missing ... re-run `sleeper
+   browser login`" — and re-running did nothing differently, forever. Fixed by adding
+   `ensure_cft_downloaded` (`src/cli/browser/login.rs`), called from `launch_session`
+   before every launch: download+verify+cache on first use, no-op once cached.
+2. **The "verify sha256 against the CfT dashboard field" premise (AC1, Task 2 doc
+   comments) is factually false.** Checked live on 2026-11-01 against both
+   `last-known-good-versions-with-downloads.json` and
+   `known-good-versions-with-downloads.json` (the only two CfT dashboard endpoints):
+   neither has ever published a `sha256` key on any `downloads.chrome[]` entry, for any
+   version, current or historical. There was never a dashboard field to paste, by
+   human or by code — `resolve_should_cache_verified_chrome_when_cache_empty`'s
+   `SLEEPER_CFT_SHA256` operator-env-var gate asked for something that doesn't exist.
+   Replaced with `PINNED_CHROME_SHA256` (`src/browser/stealth.rs`), a trust-on-first-use
+   hash computed directly from the pinned version's actual
+   `chrome-linux64.zip` (same model as a `Cargo.lock` checksum) — paired with
+   `PINNED_CHROME_VERSION` and requiring the same recompute on a version bump (Task 5's
+   bump procedure now covers both). `dashboard_sha256_for_linux64` and the dashboard-JSON
+   fetch were deleted; `verify_checksum`/`resolve`'s doc comments corrected.
+
+Verified end to end in a headless (no-`DISPLAY`) sandbox, which this story's own gate
+language never covered (`sleeper browser login` needs a real display for the human
+step — only `status`/`doctor`/the write-action flows are headless-reachable): the live
+`resolve_should_cache_verified_chrome_when_cache_empty` test (previously blocked on a
+nonexistent env var) now runs and passes against the real CfT endpoint; `sleeper
+browser status --debug` auto-downloads, launches, connects, and correctly reports
+"Not logged in" (the honest state for a profile with no completed manual login through
+this binary — not an error); `sleeper browser doctor` shows cft/chrome-runtime/patch/
+profile all `✓`; and the `waiver_claim` MCP tool reaches the same correct
+"Not logged in" error instead of the CfT failure. None of this exercises the headed
+manual-login step itself (needs a real display + a human), so the Story 1.4 ≥3-run
+parity tables are still the next real gate, now that the thing they're testing can
+actually run on a machine that starts with an empty `<data_dir>/cft/`.
+
 ### Story 2.2 — Process-group cleanup + profile lock (12-state table)
 
 As an operator, I want zero orphans and no profile theft so that status never corrupts a live login.

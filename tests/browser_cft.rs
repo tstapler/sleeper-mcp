@@ -3,6 +3,7 @@
 //! Do NOT run in CI: `cargo test -- --ignored <name>` only by the operator.
 
 use sleeper::browser::cft::{cft_chrome_binary, cft_path, resolve};
+use sleeper::browser::stealth::PINNED_CHROME_SHA256;
 use sleeper::browser::{LaunchConfig, PinnedVersion, StealthLauncher};
 use std::path::PathBuf;
 
@@ -14,8 +15,9 @@ fn temp_data_dir(suffix: &str) -> PathBuf {
 }
 
 /// Live download: empty `<data_dir>/cft/` → verified `<version>/chrome`.
-/// Needs network + the dashboard sha256 for the pinned version; the
-/// operator pastes it via `SLEEPER_CFT_SHA256` (dashboard source of truth).
+/// Needs network only now — `PINNED_CHROME_SHA256` is a hardcoded
+/// trust-on-first-use pin (no dashboard field exists to paste by hand; see
+/// its doc comment), so this no longer needs an operator-supplied env var.
 #[tokio::test]
 #[ignore]
 async fn resolve_should_cache_verified_chrome_when_cache_empty() {
@@ -25,9 +27,7 @@ async fn resolve_should_cache_verified_chrome_when_cache_empty() {
         !cft_path(&data_dir, &pinned).exists(),
         "precondition: cache starts empty"
     );
-    let expected = std::env::var("SLEEPER_CFT_SHA256")
-        .expect("operator gates this test: set SLEEPER_CFT_SHA256 from the CfT dashboard downloads.chrome[].sha256 field");
-    let binary = resolve(&data_dir, &pinned, &expected).await.expect("resolve");
+    let binary = resolve(&data_dir, &pinned, PINNED_CHROME_SHA256).await.expect("resolve");
     assert_eq!(binary, cft_chrome_binary(&data_dir, &pinned));
     assert!(binary.is_file(), "verified chrome must exist after resolve");
     let _ = std::fs::remove_dir_all(&data_dir);
