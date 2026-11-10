@@ -45,25 +45,38 @@ pub enum LoginVerdict {
 pub const LOGIN_PROBE_JS: &str = r#"!Array.from(document.querySelectorAll('button'))
     .some(b => b.offsetParent !== null && b.textContent.trim().toLowerCase() === 'log in')"#;
 
-/// Session-marker probe: authenticated session cookie/localStorage marker.
-/// LIVE-VERIFY-PENDING: exact marker key verified live against sleeper.com
-/// during Epic 3 live-UI work (Q5); the shape below is a placeholder that
-/// degrades to Unknown on mismatch rather than guessing.
+/// Session-marker probe: real persisted-auth localStorage keys.
+/// Root-cause fix (2026-11-10): the prior check (`document.cookie.match(/session/i)`
+/// or `localStorage.getItem('sleeper_session')`) was an unverified Story 2.3
+/// placeholder. Live inspection of an authenticated profile's storage (dumped
+/// key list + presence checks via read-only CDP `Runtime.evaluate`, never
+/// the raw token value) found no `sleeper_session` key and no cookie whose
+/// NAME contains "session" — the cookie branch's one observed `true` was a
+/// coincidental substring match inside an unrelated analytics cookie's
+/// opaque value, not a real signal. Sleeper's actual client auth keys are
+/// `token`/`user_id` in `localStorage`, confirmed present (347-char token)
+/// on a freshly relaunched Chrome pointed at the same profile, i.e. they
+/// really do survive a full browser restart.
 pub const LOGIN_SESSION_MARKER_JS: &str =
-    r#"!!(document.cookie.match(/session/i) || (() => { try { return localStorage.getItem('sleeper_session'); } catch (e) { return null; } })())"#;
+    r#"!!(localStorage.getItem('token') || localStorage.getItem('user_id'))"#;
 
-/// Avatar/nav-marker probe: logged-in navigation chrome.
-/// LIVE-VERIFY-PENDING: exact avatar/nav selector verified live against
-/// sleeper.com during Epic 3 live-UI work (Q5); placeholder degrades to
-/// Unknown on mismatch rather than guessing.
-pub const LOGIN_AVATAR_MARKER_JS: &str = r#"!!document.querySelector('nav [data-avatar], nav img[alt*="avatar" i], [data-testid="user-menu"]')"#;
+/// No-signup-CTA probe: complements [`LOGIN_PROBE_JS`]'s "no visible Log In
+/// button" with "no visible Sign Up button" — both auth CTAs show together
+/// when logged out, neither when logged in (verified live). Root-cause fix
+/// (2026-11-10): the prior selector (`nav [data-avatar]`, `.nav-profile-item`,
+/// etc.) chased DOM elements that only exist on `/leagues/*` sub-pages, never
+/// on the bare `https://sleeper.com` root that `goto` always lands on before
+/// this probe runs — so it read `false` even fully authenticated, and the
+/// unanimous-agreement verdict never reached `LoggedIn`.
+pub const LOGIN_NO_SIGNUP_CTA_JS: &str = r#"!Array.from(document.querySelectorAll('button'))
+    .some(b => b.offsetParent !== null && b.textContent.trim().toLowerCase() === 'sign up')"#;
 
 /// Probe bundle read in ONE transport call via `eval_batch` (CDP hygiene).
 /// Conjunction: LoggedIn only when ALL THREE agree; any split → Unknown.
 pub const LOGIN_PROBES: &[&str] = &[
     LOGIN_PROBE_JS,
     LOGIN_SESSION_MARKER_JS,
-    LOGIN_AVATAR_MARKER_JS,
+    LOGIN_NO_SIGNUP_CTA_JS,
 ];
 
 /// Pure verdict over one batch of signal reads: unanimous-true → LoggedIn,
@@ -127,9 +140,29 @@ pub trait BrowserSession: Send + Sync {
     fn close(&mut self) -> BoxFuture<'_, Result<()>>;
 
     /// Provided: batched single-call verdict (no per-signal round-trips).
+    /// Navigates to the base URL first — correct for a one-shot status
+    /// check, but never call this from a poll loop sharing a tab with an
+    /// active human: use [`is_logged_in_here`](Self::is_logged_in_here)
+    /// there instead.
     fn is_logged_in<'a>(&'a self) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             self.goto("https://sleeper.com").await?;
+            self.is_logged_in_here().await
+        })
+    }
+
+    /// Provided: same three-signal verdict as [`is_logged_in`](Self::is_logged_in),
+    /// without the navigation. Root-cause fix (2026-11-10): the manual-login
+    /// poll in `cmd_browser_login` called `is_logged_in()` every 5s for up
+    /// to 10 minutes against the SAME tab the human was actively driving —
+    /// each tick's `goto("https://sleeper.com")` forced a full reload back
+    /// to the home page mid-flow (mid-CAPTCHA, mid-passkey, wherever the
+    /// user currently was), reported as "it keeps jumping out of login".
+    /// Live passive-CDP capture confirmed the account was actually
+    /// authenticating (an account-scoped `graphql` response came back
+    /// mid-poll) — the repeated reload was the only thing disrupting it.
+    fn is_logged_in_here<'a>(&'a self) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
             let verdicts = self.eval_batch(LOGIN_PROBES).await?;
             Ok(verdict_from_signals(&verdicts) == LoginVerdict::LoggedIn)
         })

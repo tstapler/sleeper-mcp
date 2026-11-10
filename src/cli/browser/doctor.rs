@@ -114,17 +114,29 @@ pub fn build_doctor_report(inputs: DoctorInputs) -> DoctorReport {
             ),
         ));
     }
-    if webdriver_clean {
-        checks.push((
-            true,
-            format!("headless login check: {login}, webdriver: false"),
-        ));
+    // Root-cause fix (2026-11-10): this used to be ONE check gated entirely
+    // on `webdriver_clean`, so a genuinely successful login (`login ==
+    // "logged in"`) still rendered ✗ whenever the webdriver signal read
+    // unclean — text starting with "logged in" formatted as a failure line,
+    // which is exactly what misled this investigation. Login state and the
+    // webdriver stealth signal are orthogonal facts; report them as two
+    // independent checks.
+    if login == "logged in" {
+        checks.push((true, format!("headless login check: {login}")));
     } else {
         checks.push((
             false,
             format!(
                 "headless login check: {login} — re-run `sleeper browser status`; re-login only if persistent"
             ),
+        ));
+    }
+    if webdriver_clean {
+        checks.push((true, "webdriver signal: false (clean)".to_string()));
+    } else {
+        checks.push((
+            false,
+            "webdriver signal: missing/tampered — re-run `sleeper browser status --debug` to inspect".to_string(),
         ));
     }
     DoctorReport { checks }
@@ -236,10 +248,11 @@ mod tests {
         assert!(rendered.contains("cft: 126.0.6478.126"), "got {rendered}");
         assert!(rendered.contains("patch: a1b2c3d4"), "got {rendered}");
         assert!(rendered.contains("lock: free"), "got {rendered}");
-        assert!(rendered.contains("webdriver: false"), "got {rendered}");
+        assert!(rendered.contains("headless login check: logged in"), "got {rendered}");
+        assert!(rendered.contains("webdriver signal: false (clean)"), "got {rendered}");
         assert!(
             rendered.lines().all(|l| l.starts_with("✓")),
-            "all checks pass → all ✓, got:\n{rendered}"
+            "login and webdriver are independent checks — a real login must stay ✓ regardless of the webdriver signal, got:\n{rendered}"
         );
         assert_eq!(report.exit_code(), 0);
         let _ = std::fs::remove_file(&bin);
@@ -267,6 +280,39 @@ mod tests {
                 "✗ line must name a re-run command, got {line}"
             );
         }
+    }
+
+    /// Regression gate for the 2026-11-10 root-cause fix: a real, successful
+    /// login must never render as a doctor ✗. Before the fix, the single
+    /// combined check line was gated entirely on `webdriver_clean`, so
+    /// `login: "logged in"` with `webdriver_clean: false` rendered
+    /// `✗ headless login check: logged in — re-run ...` — a successful
+    /// login reported and exited as a failure.
+    #[test]
+    fn doctor_should_keep_login_check_green_when_webdriver_signal_is_unclean() {
+        let report = build_doctor_report(DoctorInputs {
+            pinned: "126.0.6478.126",
+            cft_binary: std::path::Path::new("/tmp/doctor-missing"),
+            runtime: "126.0.6478.126",
+            flag_hash: "a1b2c3d4",
+            profile: std::path::Path::new("/tmp/chrome-profile"),
+            lock_free: true,
+            login: "logged in",
+            webdriver_clean: false,
+        });
+        let rendered = report.render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("✓") && l.contains("headless login check: logged in")),
+            "a real login must render ✓ regardless of the webdriver signal, got:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("✗") && l.contains("webdriver signal")),
+            "the webdriver signal must still surface as its own, separate ✗, got:\n{rendered}"
+        );
     }
 
     #[test]

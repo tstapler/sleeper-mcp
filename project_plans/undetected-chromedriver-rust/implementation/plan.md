@@ -338,6 +338,54 @@ As an operator, I want login verdicts robust to DOM drift so that status does no
 2. Extend `eval_dump`/`debug_dump` with stealth signals (UA, webdriver, languages, plugins) + per-signal fired/missed log line + the `DEBUG browser:` fields from ux.md Surface G (pinned/runtime chrome versions, flag-set hash, CDP port, profile path, cleanup/reaped PIDs). Files: `src/browser/session.rs`, `src/cli.rs`.
 3. Live-verify logged-in vs logged-out vs unknown verdicts; record DOM notes + re-baselining procedure for login signals on Sleeper drift (selector bundle refreshed live, never guessed). Files: `src/browser/session.rs`.
 
+### Root-cause fixes (2026-11-10): a real login never registered as `LoggedIn`
+
+AC1's "avatar selector marked live-verify, never assumed" above was itself wrong —
+`LOGIN_SESSION_MARKER_JS`/`LOGIN_AVATAR_MARKER_JS` shipped as unverified Story 2.3
+placeholders (the code's own doc comments said `LIVE-VERIFY-PENDING`, correctly).
+First real end-to-end manual login (operator: Tyler, real Google account, real
+league) surfaced three compounding bugs, all live-verified via read-only CDP
+`Runtime.evaluate`/`Network` capture against the authenticated session (no
+synthetic input at any point):
+
+1. **Poll loop forced a reload every 5s.** `is_logged_in()` (`src/browser/mod.rs`)
+   did `goto("https://sleeper.com")` before every check; `cmd_browser_login`'s
+   10-minute poll called it every 5s against the SAME tab the human was actively
+   logging into — yanking the page back to the home route mid-CAPTCHA/mid-passkey
+   every tick. Reported as "it keeps jumping out of login". Fix: split into
+   `is_logged_in()` (navigates, for one-shot status checks) and
+   `is_logged_in_here()` (no navigation, for the poll loop).
+2. **Both DOM/storage probes were wrong guesses.** `LOGIN_AVATAR_MARKER_JS`
+   targeted `.nav-profile-item`, which only exists on `/leagues/*` sub-pages, never
+   on the bare `https://sleeper.com` root the probes always run against — always
+   `false`. `LOGIN_SESSION_MARKER_JS` checked `document.cookie.match(/session/i)`
+   (a coincidental substring hit inside an unrelated analytics cookie's opaque
+   value, not real) and `localStorage.getItem('sleeper_session')` (wrong key —
+   confirmed via a live dump of an authenticated profile's `localStorage` keys that
+   Sleeper's real auth keys are `token`/`user_id`). Net effect: even a fully
+   successful login (confirmed by an authenticated `graphql` response carrying the
+   operator's real league data) never reached a unanimous `LoggedIn` verdict,
+   because the unanimous-agreement design (AC1) correctly refused to guess, and two
+   of three signals were simply wrong. Fix: `LOGIN_SESSION_MARKER_JS` now checks
+   `localStorage.getItem('token') || localStorage.getItem('user_id')`;
+   `LOGIN_AVATAR_MARKER_JS` is renamed `LOGIN_NO_SIGNUP_CTA_JS` and checks for no
+   visible "Sign Up" button (symmetric with the existing "no Log In button" probe,
+   verified on the actual bare-root route).
+3. **`doctor` conflated login state with the webdriver stealth signal.** The
+   combined check line in `build_doctor_report` was gated entirely on
+   `webdriver_clean`, so a genuinely successful login rendered
+   `✗ headless login check: logged in — re-run …` whenever the webdriver signal
+   read unclean — a success reported and exited as a failure, which actively
+   misled this investigation. Fix: split into two independent check lines (login
+   state; webdriver signal).
+
+All three fixes are covered by unit tests (`cargo test --release`: 48 passed, 0
+failed) plus the live verification above. The webdriver signal itself is STILL
+unclean on this machine (`doctor` correctly reports it as its own ✗) — that is a
+real, separate, lower-priority finding (stealth bootstrap not fully suppressing
+`navigator.webdriver` against real Chrome stable) that does not block login
+detection or any write action, left open for a future pass.
+
 ### Story 2.4 — UX: spinner, timeout copy, `--json` status, triage lines
 
 As an operator, I want silent polls visible and errors actionable so that I know whether to wait, re-run, or update.

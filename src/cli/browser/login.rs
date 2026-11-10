@@ -201,7 +201,11 @@ pub(super) async fn cmd_browser_login(
             // Tool-news framing (never operator blame) on long waits.
             eprintln!("{}", style(challenge_loop_copy(polls)).dim());
         }
-        if session.is_logged_in().await? {
+        // No `goto` here (see `is_logged_in_here` doc comment) — this tab
+        // is shared with the human actively logging in by hand; reloading
+        // it every tick would knock them out of the flow mid-CAPTCHA or
+        // mid-passkey.
+        if session.is_logged_in_here().await? {
             pb.finish_with_message("login detected");
             println!("{}", style("Logged in. Session persisted for future runs.").green());
             session.close().await?;
