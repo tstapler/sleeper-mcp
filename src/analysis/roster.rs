@@ -209,6 +209,8 @@ impl AnalysisService {
                         created: t.created,
                         adds: &resolve_side(&adds),
                         drops: &resolve_side(&drops),
+                        roster_ids: &serde_json::json!(t.roster_ids),
+                        waiver_bid: None,
                     })
                     .await?;
                 stored += 1;

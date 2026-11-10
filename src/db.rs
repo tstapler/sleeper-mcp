@@ -29,7 +29,10 @@ pub struct RosterSnapshotRow<'a> {
     pub data: &'a serde_json::Value,
 }
 
-/// Params for `StatsDb::upsert_transaction`.
+/// Params for `StatsDb::upsert_transaction`. `roster_ids`/`waiver_bid` are
+/// `None`/empty for rows sourced from the public REST transactions endpoint
+/// (which never carries a bid amount — live-verified 2026-11-10); rows
+/// sourced from the authenticated browser GraphQL path populate both.
 pub struct TransactionRow<'a> {
     pub transaction_id: &'a str,
     pub league_id: &'a str,
@@ -40,6 +43,24 @@ pub struct TransactionRow<'a> {
     pub created: i64,
     pub adds: &'a serde_json::Value,
     pub drops: &'a serde_json::Value,
+    pub roster_ids: &'a serde_json::Value,
+    pub waiver_bid: Option<i64>,
+}
+
+/// Row shape returned by `StatsDb::list_transactions` — read from the local
+/// cache only, never triggers an API/browser call.
+#[derive(Debug, Clone)]
+pub struct CachedTransaction {
+    pub transaction_id: String,
+    pub season: String,
+    pub week: i32,
+    pub kind: String,
+    pub status: Option<String>,
+    pub created: i64,
+    pub adds: serde_json::Value,
+    pub drops: serde_json::Value,
+    pub roster_ids: serde_json::Value,
+    pub waiver_bid: Option<i64>,
 }
 
 impl StatsDb {
@@ -120,6 +141,23 @@ impl StatsDb {
         )
         .execute(&pool)
         .await?;
+
+        // `roster_ids`/`waiver_bid` columns: the authenticated-browser sync
+        // path carries a real FAAB bid and every participating roster,
+        // unlike the public REST endpoint. `ADD COLUMN` has no
+        // `IF NOT EXISTS` in SQLite, so check `PRAGMA table_info` first
+        // (idempotent re-open).
+        let existing_cols: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('transactions')")
+                .fetch_all(&pool)
+                .await?;
+        let has_col = |name: &str| existing_cols.iter().any(|(c,)| c == name);
+        if !has_col("roster_ids") {
+            sqlx::query("ALTER TABLE transactions ADD COLUMN roster_ids TEXT").execute(&pool).await?;
+        }
+        if !has_col("waiver_bid") {
+            sqlx::query("ALTER TABLE transactions ADD COLUMN waiver_bid INTEGER").execute(&pool).await?;
+        }
 
         Ok(Self { pool })
     }
@@ -406,10 +444,26 @@ impl StatsDb {
     /// bare IDs) so a `sqlite3 stats.db` query can filter by position/owner
     /// directly without a second lookup pass.
     pub async fn upsert_transaction(&self, row: TransactionRow<'_>) -> Result<()> {
+        // `waiver_bid` is COALESCEd on conflict rather than overwritten: the
+        // public-REST sync path never knows a bid amount, and a re-sync from
+        // there must not erase a bid the authenticated-browser sync path
+        // already recorded for the same transaction_id.
         sqlx::query(
-            "INSERT OR REPLACE INTO transactions
-             (transaction_id, league_id, season, week, type, status, created, adds, drops, fetched_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO transactions
+             (transaction_id, league_id, season, week, type, status, created, adds, drops, roster_ids, waiver_bid, fetched_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(transaction_id) DO UPDATE SET
+                 league_id  = excluded.league_id,
+                 season     = excluded.season,
+                 week       = excluded.week,
+                 type       = excluded.type,
+                 status     = excluded.status,
+                 created    = excluded.created,
+                 adds       = excluded.adds,
+                 drops      = excluded.drops,
+                 roster_ids = excluded.roster_ids,
+                 waiver_bid = COALESCE(excluded.waiver_bid, transactions.waiver_bid),
+                 fetched_at = excluded.fetched_at",
         )
         .bind(row.transaction_id)
         .bind(row.league_id)
@@ -420,10 +474,54 @@ impl StatsDb {
         .bind(row.created)
         .bind(serde_json::to_string(row.adds)?)
         .bind(serde_json::to_string(row.drops)?)
+        .bind(serde_json::to_string(row.roster_ids)?)
+        .bind(row.waiver_bid)
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Cached transaction history for `league_id`, optionally narrowed to
+    /// one `type` (`"waiver"`/`"trade"`/`"free_agent"`). Reads only the
+    /// local cache — no API/browser call — so analysis built on this never
+    /// re-fetches to run.
+    pub async fn list_transactions(
+        &self,
+        league_id: &str,
+        kind_filter: Option<&str>,
+    ) -> Result<Vec<CachedTransaction>> {
+        let rows: Vec<(String, String, i32, String, Option<String>, i64, String, String, Option<String>, Option<i64>)> =
+            sqlx::query_as(
+                "SELECT transaction_id, season, week, type, status, created, adds, drops, roster_ids, waiver_bid
+                 FROM transactions
+                 WHERE league_id = ? AND (? IS NULL OR type = ?)
+                 ORDER BY created ASC",
+            )
+            .bind(league_id)
+            .bind(kind_filter)
+            .bind(kind_filter)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|(transaction_id, season, week, kind, status, created, adds, drops, roster_ids, waiver_bid)| {
+                Ok(CachedTransaction {
+                    transaction_id,
+                    season,
+                    week,
+                    kind,
+                    status,
+                    created,
+                    adds: serde_json::from_str(&adds)?,
+                    drops: serde_json::from_str(&drops)?,
+                    roster_ids: roster_ids
+                        .map(|s| serde_json::from_str(&s))
+                        .transpose()?
+                        .unwrap_or(serde_json::Value::Array(Vec::new())),
+                    waiver_bid,
+                })
+            })
+            .collect()
     }
 
     pub async fn get_league(&self, league_id: &str) -> Result<Option<League>> {
