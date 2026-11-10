@@ -209,6 +209,20 @@ struct WaiverClaimParams {
     bid: u32,
 }
 
+/// Read-only: your own pending waiver claims. Root-cause fix (2026-11-10) —
+/// the public REST transactions endpoint only ever returns `status:
+/// "complete"`, so pending claims are invisible there. Reads through the
+/// operator's own persisted, manually-authenticated Chrome profile instead,
+/// via the same authenticated GraphQL query the Sleeper web app itself
+/// fires. Requires `sleeper browser login` to have been completed by hand
+/// at least once beforehand. Not a write action.
+#[derive(Deserialize, JsonSchema)]
+struct PendingWaiversParams {
+    league_id: String,
+    /// Your numeric Sleeper roster_id in this league.
+    roster_id: i64,
+}
+
 /// LIVE WRITE ACTION: swaps a bench player into a started slot against
 /// sleeper.com through the stealth-browser backend (plan.md
 /// undetected-chromedriver-rust, Story 4.1) on the operator's own persisted,
@@ -536,6 +550,18 @@ impl SleeperMcpServer {
             "out_player_id": p.out_player_id,
             "in_player_id": p.in_player_id,
         }))
+    }
+
+    #[tool(description = "Read-only: your own pending waiver claims (player, FAAB bid, drop if any, status). The public REST transactions endpoint never exposes pending claims — this reads through the operator's authenticated browser session instead. Requires `sleeper browser login` to have been run by hand at least once first.")]
+    async fn get_pending_waivers(
+        &self,
+        #[tool(aggr)] p: PendingWaiversParams,
+    ) -> Result<CallToolResult, McpError> {
+        let txns =
+            crate::cli::browser::run_pending_transactions(&self.config, &p.league_id, p.roster_id, &["waiver"])
+                .await
+                .map_err(err)?;
+        ok(serde_json::json!({ "league_id": p.league_id, "roster_id": p.roster_id, "pending_waivers": txns }))
     }
 }
 

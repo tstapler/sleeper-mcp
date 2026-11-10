@@ -1,7 +1,7 @@
 //! Login flow (manual login + poll) plus the shared launch/triage plumbing
 //! (`launch_session`, `triage_error`, `debug_detail`, `launch_failure_exit`,
-//! `launch_failure_json_error`) that `status.rs`, `doctor.rs`, and
-//! `actions.rs` all reuse for their own flows.
+//! `launch_failure_error`, `launch_failure_json_error`) that `status.rs`,
+//! `doctor.rs`, `actions.rs`, and `pending.rs` all reuse for their own flows.
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -230,6 +230,32 @@ pub(super) fn debug_detail(detail: &str) -> String {
     } else {
         String::new()
     }
+}
+
+/// Launch-failure variant of [`launch_failure_exit`] that returns an `Err`
+/// instead of exiting the process — the shared action cores (`actions.rs`,
+/// `pending.rs`) run inside a long-lived MCP server, which a launch failure
+/// must not take down.
+pub(super) fn launch_failure_error(e: &crate::error::Error) -> crate::error::Error {
+    let msg = e.to_string();
+    if msg.contains("version skew") {
+        return crate::browser::other(triage_error(&msg, &debug_detail(&msg)));
+    }
+    crate::browser::other(triage_error(&check_failed_triage("browser launch"), &debug_detail(&msg)))
+}
+
+/// Shared CLI-wrapper tail for the write/read action commands (claim,
+/// lineup-set, pending-waivers): a dead session prints the yellow Surface C
+/// hint, anything else prints the error's `Display` (already the full
+/// triage line) in red. Both branches exit 1.
+pub(super) fn exit_on_action_error(e: crate::error::Error) -> ! {
+    use crate::browser::session::DEAD_SESSION_HINT;
+    if e.to_string() == DEAD_SESSION_HINT {
+        eprintln!("{}", style(DEAD_SESSION_HINT).yellow());
+    } else {
+        eprintln!("{}", style(e.to_string()).red());
+    }
+    std::process::exit(1);
 }
 
 /// Launch/transport failure exit (contract: 1 = logged-out, so a failed

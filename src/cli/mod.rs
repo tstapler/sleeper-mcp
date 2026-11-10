@@ -280,6 +280,18 @@ pub enum WaiverAction {
         #[arg(long, default_value_t = 0)]
         bid: u32,
     },
+    /// Read your own pending waiver claims (root-cause fix, 2026-11-10): the
+    /// public REST transactions endpoint only ever returns `status:
+    /// "complete"` — pending claims are invisible there, for every roster.
+    /// This reads them through the authenticated browser session instead,
+    /// via the same GraphQL query the Sleeper web app itself fires.
+    Pending {
+        #[arg(long)]
+        league: String,
+        /// Your numeric Sleeper roster_id in this league.
+        #[arg(long)]
+        roster: i64,
+    },
 }
 
 /// Resolve a username/display_name/user_id/numeric string to a roster_id.

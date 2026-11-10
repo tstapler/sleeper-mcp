@@ -11,6 +11,7 @@ use super::BrowserAction;
 mod actions;
 mod doctor;
 pub mod login;
+mod pending;
 pub mod status;
 
 pub(super) async fn cmd_browser(config: &Config, action: BrowserAction) -> Result<()> {
@@ -28,7 +29,8 @@ pub(super) async fn cmd_browser(config: &Config, action: BrowserAction) -> Resul
 
 pub(super) use actions::{cmd_lineup_set, cmd_trade_propose, cmd_waiver};
 
-/// Crate-wide (not just `cli`-wide): the `waiver_claim`/`lineup_set` MCP
-/// tools in `src/mcp.rs` call these shared cores directly, bypassing the
-/// CLI's printing/process-exit wrapper.
+/// Crate-wide (not just `cli`-wide): the `waiver_claim`/`lineup_set`/
+/// `get_pending_waivers` MCP tools in `src/mcp.rs` call these shared cores
+/// directly, bypassing the CLI's printing/process-exit wrapper.
 pub(crate) use actions::{run_claim, run_lineup_set, ClaimRequest};
+pub(crate) use pending::run_pending_transactions;

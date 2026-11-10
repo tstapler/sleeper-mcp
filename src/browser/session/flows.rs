@@ -143,3 +143,63 @@ pub async fn trade_propose_via_seam(
         "selectors live-unverified — trade automation disabled (Epic 4 deferred; see plan.md cut note)",
     ))
 }
+
+/// Root-cause fix (2026-11-10): the public REST `/league/{id}/transactions/{round}`
+/// endpoint only ever returns `status: "complete"` entries — live-verified
+/// against this exact league: a pending waiver claim and rejected/cancelled
+/// trades are both invisible there, for every roster, not just the caller's
+/// own. Pending claims are only visible through the same authenticated
+/// GraphQL query the Sleeper web app itself fires when the Team page's
+/// WAIVER/TRADE sub-tab is opened: `league_transactions_filtered`.
+///
+/// Auth: the app sends the token it already holds in
+/// `localStorage.token` as the raw `Authorization` header value (no
+/// `Bearer ` prefix — confirmed live; a `Bearer `-prefixed value is
+/// rejected). That value is read and used ENTIRELY inside the page's own
+/// JS via `fetch` — it is built into the request here, in Rust, only as a
+/// JS snippet that reads `localStorage` itself; the token never crosses
+/// into a Rust value, a log line, or this function's return value, which
+/// is only the (non-secret) transactions payload.
+pub async fn pending_transactions_via_seam(
+    session: &dyn BrowserSession,
+    league_id: &str,
+    roster_id: i64,
+    type_filters: &[&str],
+) -> Result<String> {
+    let start = tracing::info_span!(
+        "pending_transactions.start",
+        league = league_id,
+        roster_id,
+        types = ?type_filters
+    );
+    let _enter = start.enter();
+    if !session.is_logged_in().await.unwrap_or(false) {
+        return Err(other(DEAD_SESSION_HINT));
+    }
+
+    let types_json = serde_json::to_string(type_filters).map_err(other)?;
+    let query = format!(
+        r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: "{league_id}", roster_id_filters: [{roster_id}], type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
+    );
+    let body = serde_json::json!({
+        "operationName": "league_transactions_filtered",
+        "variables": {},
+        "query": query,
+    })
+    .to_string();
+    let body_json = serde_json::to_string(&body).map_err(other)?;
+    let js = format!(
+        r#"(function(){{
+            let t; try {{ t = JSON.parse(localStorage.getItem('token_data')); }} catch (e) {{ t = null; }}
+            const tok = (t && (t.token || t.access_token || t.jwt)) || localStorage.getItem('token');
+            return fetch('/graphql', {{
+                method: 'POST',
+                headers: {{ 'content-type': 'application/json', 'authorization': tok }},
+                body: {body_json}
+            }}).then(r => r.text());
+        }})()"#
+    );
+    let raw = session.eval_string(&js).await?;
+    tracing::info!("pending_transactions fetched");
+    Ok(raw)
+}

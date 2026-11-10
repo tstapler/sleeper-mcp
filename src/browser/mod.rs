@@ -103,6 +103,15 @@ pub trait BrowserSession: Send + Sync {
     fn goto<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<()>>;
     fn eval_bool<'a>(&'a self, js: &'a str) -> BoxFuture<'a, Result<bool>>;
     fn eval_dump<'a>(&'a self) -> BoxFuture<'a, Result<String>>;
+    /// Generic string-returning eval primitive: evaluates caller-supplied
+    /// JS (which may return a `Promise`, awaited transparently —
+    /// chromiumoxide defaults `awaitPromise: true` whenever the caller
+    /// doesn't set it) and returns its value as a `String`. No script is
+    /// hardcoded here — flow modules build the actual expression (Q5 gate).
+    /// Added for reading the authenticated GraphQL data the Sleeper web
+    /// app itself uses (e.g. pending waiver claims), which the public REST
+    /// API never exposes.
+    fn eval_string<'a>(&'a self, js: &'a str) -> BoxFuture<'a, Result<String>>;
     /// Generic click primitive (Story 3.1 Task 3): clicks the element
     /// matching the caller-supplied `selector`. No selectors are hardcoded
     /// here or in impls — Q5 forbids guessing selectors in code.

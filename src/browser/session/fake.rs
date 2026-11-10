@@ -10,6 +10,7 @@ pub struct FakeSession {
     split_signals: bool,
     eval_calls: AtomicUsize,
     dump: tokio::sync::Mutex<String>,
+    eval_string_response: tokio::sync::Mutex<String>,
     closed: bool,
 }
 
@@ -23,8 +24,19 @@ impl FakeSession {
             dump: tokio::sync::Mutex::new(
                 r#"{"url":"https://sleeper.com/","title":"Sleeper","webdriver: false","ua: Chrome/126","languages: en-US","plugins: 5"}"#.to_string(),
             ),
+            eval_string_response: tokio::sync::Mutex::new(r#"{"data":{}}"#.to_string()),
             closed: false,
         }
+    }
+
+    /// Canned response for the next [`BrowserSession::eval_string`] call —
+    /// used to fixture the GraphQL `league_transactions_filtered` reply in
+    /// tests without a live Chrome.
+    pub fn with_eval_string_response(json: &str) -> Self {
+        let s = Self::logged_in();
+        *s.eval_string_response.try_lock().expect("fresh fixture, no contention") =
+            json.to_string();
+        s
     }
 
     pub fn logged_out() -> Self {
@@ -72,6 +84,15 @@ impl BrowserSession for FakeSession {
         // tokio Mutex has no poison: lock() is infallible, so no expect() and
         // no panic path (this double ships in non-cfg(test) code).
         Box::pin(async move { Ok(self.dump.lock().await.clone()) })
+    }
+
+    fn eval_string<'a>(&'a self, _js: &'a str) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            if self.transport_error {
+                return Err(other("fake transport error"));
+            }
+            Ok(self.eval_string_response.lock().await.clone())
+        })
     }
 
     fn eval_batch<'a>(&'a self, scripts: &'a [&'a str]) -> BoxFuture<'a, Result<Vec<bool>>> {

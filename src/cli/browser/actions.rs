@@ -15,20 +15,9 @@ use crate::error::Result;
 
 use super::super::WaiverAction;
 use super::login::{
-    check_failed_triage, debug_detail, launch_failure_exit, launch_session, triage_error,
-    LaunchOptions,
+    debug_detail, exit_on_action_error, launch_failure_error, launch_failure_exit, launch_session,
+    triage_error, LaunchOptions,
 };
-
-/// Launch-failure variant of [`launch_failure_exit`] that returns an `Err`
-/// instead of exiting the process — the shared cores run inside a long-lived
-/// MCP server, which a launch failure must not take down.
-fn launch_failure_error(e: &crate::error::Error) -> crate::error::Error {
-    let msg = e.to_string();
-    if msg.contains("version skew") {
-        return crate::browser::other(triage_error(&msg, &debug_detail(&msg)));
-    }
-    crate::browser::other(triage_error(&check_failed_triage("browser launch"), &debug_detail(&msg)))
-}
 
 /// Claim-flow failure triage (Story 3.2, live automation): stderr-only,
 /// never a stdout verdict. Raw detail (selector/timeout specifics) rides
@@ -50,7 +39,13 @@ fn trade_disabled_triage() -> String {
 
 pub(crate) async fn cmd_waiver(config: &Config, client: &SleeperClient, action: WaiverAction) -> Result<()> {
     match action {
-        WaiverAction::Claim { .. } => cmd_waiver_claim(config, client, action).await,
+        WaiverAction::Claim { league, player, drop, bid } => {
+            let req = ClaimRequest { league: &league, player_id: &player, drop_id: drop.as_deref(), bid };
+            cmd_waiver_claim(config, client, req).await
+        }
+        WaiverAction::Pending { league, roster } => {
+            super::pending::cmd_pending_waivers(config, &league, roster).await
+        }
     }
 }
 
@@ -103,23 +98,13 @@ pub(crate) async fn run_claim(
 
 /// CLI wrapper: prints `claim submitted` on success; dead sessions get the
 /// yellow Surface C hint (ux.md §3), everything else prints red and exits 1.
-async fn cmd_waiver_claim(config: &Config, client: &SleeperClient, action: WaiverAction) -> Result<()> {
-    use crate::browser::session::DEAD_SESSION_HINT;
-    let WaiverAction::Claim { league, player, drop, bid } = action;
-    let req = ClaimRequest { league: &league, player_id: &player, drop_id: drop.as_deref(), bid };
+async fn cmd_waiver_claim(config: &Config, client: &SleeperClient, req: ClaimRequest<'_>) -> Result<()> {
     match run_claim(config, client, req).await {
         Ok(()) => {
             println!("claim submitted");
             Ok(())
         }
-        Err(e) if e.to_string() == DEAD_SESSION_HINT => {
-            eprintln!("{}", style(DEAD_SESSION_HINT).yellow());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("{}", style(e.to_string()).red());
-            std::process::exit(1);
-        }
+        Err(e) => exit_on_action_error(e),
     }
 }
 
@@ -164,20 +149,12 @@ pub(crate) async fn cmd_lineup_set(
     out: &str,
     in_: &str,
 ) -> Result<()> {
-    use crate::browser::session::DEAD_SESSION_HINT;
     match run_lineup_set(config, client, league, out, in_).await {
         Ok(()) => {
             println!("lineup saved");
             Ok(())
         }
-        Err(e) if e.to_string() == DEAD_SESSION_HINT => {
-            eprintln!("{}", style(DEAD_SESSION_HINT).yellow());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("{}", style(e.to_string()).red());
-            std::process::exit(1);
-        }
+        Err(e) => exit_on_action_error(e),
     }
 }
 

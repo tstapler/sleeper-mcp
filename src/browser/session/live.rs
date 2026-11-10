@@ -68,6 +68,14 @@ impl BrowserSession for SleeperBrowser {
         })
     }
 
+    fn eval_string<'a>(&'a self, js: &'a str) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let v: String =
+                self.page.evaluate(js).await.map_err(other)?.into_value().map_err(other)?;
+            Ok(v)
+        })
+    }
+
     fn eval_dump<'a>(&'a self) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let dump: String = self

@@ -5,7 +5,9 @@
 //! replace the operator's live ≥3-run table for lineups (plan.md Story 4.1),
 //! which still needs a real browser.
 
-use sleeper::browser::session::{lineup_set_via_seam, trade_propose_via_seam, FakeSession};
+use sleeper::browser::session::{
+    lineup_set_via_seam, pending_transactions_via_seam, trade_propose_via_seam, FakeSession,
+};
 
 const LEAGUE_ID: &str = "123456";
 
@@ -55,5 +57,31 @@ async fn trade_should_surface_dead_session_hint_when_logged_out() {
     let err = trade_propose_via_seam(&session, LEAGUE_ID, "9999", "8888")
         .await
         .expect_err("trade flow must refuse to run without a logged-in session");
+    assert_eq!(err.to_string(), DEAD_SESSION_HINT);
+}
+
+/// Root-cause fix (2026-11-10): the public REST transactions endpoint never
+/// returns pending claims (live-verified), so this flow reads the same
+/// authenticated GraphQL query the Sleeper web app itself fires. Happy
+/// path: a logged-in session returns the fixture payload unchanged.
+#[tokio::test]
+async fn pending_transactions_should_return_payload_when_session_logged_in() {
+    let fixture = r#"{"data":{"league_transactions_filtered":[{"transaction_id":"1","status":"pending","type":"waiver"}]}}"#;
+    let session = FakeSession::with_eval_string_response(fixture);
+    let raw = pending_transactions_via_seam(&session, LEAGUE_ID, 5, &["waiver"])
+        .await
+        .expect("flow must complete through the seam primitives");
+    assert_eq!(raw, fixture);
+}
+
+/// A dead/logged-out session surfaces the dead-session hint instead of
+/// attempting any fetch.
+#[tokio::test]
+async fn pending_transactions_should_surface_dead_session_hint_when_logged_out() {
+    use sleeper::browser::session::DEAD_SESSION_HINT;
+    let session = FakeSession::logged_out();
+    let err = pending_transactions_via_seam(&session, LEAGUE_ID, 5, &["waiver"])
+        .await
+        .expect_err("flow must refuse to run without a logged-in session");
     assert_eq!(err.to_string(), DEAD_SESSION_HINT);
 }
