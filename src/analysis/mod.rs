@@ -16,6 +16,7 @@ use crate::db::StatsDb;
 use crate::error::Result;
 use crate::models::*;
 
+mod bid_projection;
 mod dynasty;
 mod lineup;
 mod players;
@@ -23,6 +24,7 @@ mod roster;
 mod trades;
 mod waivers;
 
+pub use bid_projection::BidProjection;
 pub use players::{PlayerStats, StatsContext};
 // Epic 2.2 / Task 2.2.1c: `resolve_side` lives in the private `roster`
 // submodule but `run_league_transactions_sync` (src/cli/browser/transactions.rs)
