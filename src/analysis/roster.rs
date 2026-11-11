@@ -211,6 +211,8 @@ impl AnalysisService {
                         drops: &resolve_side(&drops),
                         roster_ids: &serde_json::json!(t.roster_ids),
                         waiver_bid: None,
+                        status_updated: None,
+                        source: "rest",
                     })
                     .await?;
                 stored += 1;

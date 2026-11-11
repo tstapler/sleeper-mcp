@@ -2,6 +2,10 @@
 //! stub) — built entirely on the generic seam primitives from `mod.rs`
 //! (`click_selector`/`wait_for_selector`/`type_into_selector`/`click_in_row`),
 //! never on transport types.
+// kibitzer:ignore file-size -- Epic 1.4's task brief scopes this work to
+// flows.rs/fake.rs/a new test file only (coordinator constraint, avoiding a
+// merge conflict with a parallel worker's Epic 1.1 files); splitting this
+// file is a reasonable follow-up but out of this epic's scope.
 use crate::browser::{other, BrowserSession};
 use crate::error::Result;
 
@@ -202,4 +206,316 @@ pub async fn pending_transactions_via_seam(
     let raw = session.eval_string(&js).await?;
     tracing::info!("pending_transactions fetched");
     Ok(raw)
+}
+
+// --- Epic 1.4 / Story 1.4.1: edit/cancel row-identity disambiguation ---
+// ADR-004: resolved without a new `BrowserSession` trait primitive. See
+// Step 0.5 fork #3 and the Domain Glossary entries for `claim_row_disambiguator`
+// / `edit_cancel_claim_via_seam` / `EditCancelAction` / `EditCancelOutcome` in
+// project_plans/waiver-intelligence/implementation/plan.md.
+
+/// One candidate claim row, parsed from the JSON [`BrowserSession::eval_string`]
+/// returns for the claims panel (Task 1.4.1a). `transaction_id` is `None`
+/// when the live DOM turns out not to expose it anywhere (ADR-004
+/// Consequences) — the only case `RowTarget::Fallback` exists for.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct CandidateRow {
+    index: usize,
+    text: String,
+    #[serde(default)]
+    transaction_id: Option<String>,
+}
+
+/// Disambiguation key for [`claim_row_disambiguator`]. A `TransactionId`
+/// always wins when present; `Fallback` (bid amount / add-player name
+/// substring match) is only used when no `transaction_id` is available —
+/// ADR-004 explicitly forbids a "closest match" or "first match" fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowTarget {
+    TransactionId(String),
+    // Only reachable once live selector discovery confirms the DOM exposes
+    // no `transaction_id` at all (ADR-004 Consequences) — exercised today
+    // by `claim_row_disambiguator`'s own unit tests, not yet by any caller.
+    #[allow(dead_code)]
+    Fallback {
+        bid: Option<i64>,
+        add_name: Option<String>,
+    },
+}
+
+/// Task 1.4.1a: pure, no I/O. Resolves exactly one candidate row index, or
+/// fails closed on 0 or >1 matches — never guesses "closest" or "first"
+/// (ADR-004, pitfalls.md §3's Brissett/Brissett-Jones near-miss).
+fn claim_row_disambiguator(rows: &[CandidateRow], target: &RowTarget) -> Result<usize> {
+    let matches: Vec<usize> = rows
+        .iter()
+        .filter(|row| match target {
+            RowTarget::TransactionId(tid) => row.transaction_id.as_deref() == Some(tid.as_str()),
+            RowTarget::Fallback { bid, add_name } => {
+                let name_ok = add_name.as_deref().is_none_or(|n| row.text.contains(n));
+                let bid_ok = bid.is_none_or(|b| row.text.contains(&format!("${b}")));
+                name_ok && bid_ok
+            }
+        })
+        .map(|row| row.index)
+        .collect();
+
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(other(
+            "no candidate claim row matched the disambiguation target — nothing clicked",
+        )),
+        _ => Err(other(format!(
+            "ambiguous claim row match: candidate indices {matches:?} all matched — refusing to guess (ADR-004)"
+        ))),
+    }
+}
+
+/// Candidate CSS/DOM selector bundle for the claims panel's edit/cancel
+/// controls — **UNVERIFIED** against real sleeper.com DOM (ADR-004; unlike
+/// `claim_selectors`/`lineup_selectors` above, no live-run has happened for
+/// this flow yet). Follows the same STUB doc-comment discipline as
+/// `trade_propose_via_seam`'s selector-less stub above, with one
+/// difference: `trade_propose_via_seam` never runs any JS built from a
+/// selector at all (Epic 4 cut), while `edit_cancel_claim_via_seam` here IS
+/// fully exercised against `FakeSession` — only the actual selector
+/// strings/JS shape below remain unverified until a live-run session
+/// resolves plan.md's Unresolved Questions (e.g. whether the DOM exposes
+/// `transaction_id` anywhere at all, per ADR-004 Consequences).
+mod edit_claim_selectors {
+    /// Opens the Team page's pending-claims panel (candidate selector).
+    pub const CLAIMS_TAB: &str = ".league-transactions-tab.waivers";
+    /// One row per pending claim once the panel is open.
+    pub const CLAIM_ROW: &str = ".pending-claim-row";
+    /// Candidate attribute the DOM may expose the GraphQL `transaction_id`
+    /// through. If live discovery finds no such attribute anywhere, only
+    /// `claim_row_disambiguator`'s `RowTarget::Fallback` branch needs
+    /// redesigning (ADR-004 Consequences) — not this module's shape.
+    pub const ROW_TRANSACTION_ID_ATTR: &str = "data-transaction-id";
+    pub const BID_EDIT_INPUT: &str = ".bid-input-container input";
+    pub const CANCEL_BUTTON: &str = ".cancel-claim-button";
+    pub const SAVE_BUTTON: &str = ".save-claim-button";
+}
+
+/// Task 1.4.1b: the two write operations `edit_cancel_claim_via_seam`
+/// supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditCancelAction {
+    EditBid(u32),
+    Cancel,
+}
+
+/// Task 1.4.1b: never a bare `Result<()>` (Domain Glossary) — the "never
+/// claim success it can't prove" discipline's concrete type.
+/// `AbortedBeforeWrite` means the pre-click, same-`eval_string`-call
+/// row-identity re-assertion found no single exact match, so nothing was
+/// clicked and the claim is provably unchanged — safe to retry immediately.
+/// `Ambiguous` means the click already fired and the post-click
+/// confirmation read came back unverified — the outcome is genuinely
+/// unknown, real risk in a blind retry. Neither collapses into a bare `Err`
+/// that would imply nothing happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditCancelOutcome {
+    Confirmed,
+    AbortedBeforeWrite { reason: String },
+    Ambiguous { reason: String },
+}
+
+/// Pure, no I/O: interprets the second `eval_string` call's JSON per the
+/// pre-click/post-click distinction `EditCancelOutcome` draws. Unparseable
+/// JSON is treated as `Ambiguous`, never as a bare error swallowed into
+/// `Confirmed` or `AbortedBeforeWrite` — by the time the call attempted a
+/// JSON response at all, the click may already have fired.
+fn parse_edit_cancel_outcome(raw: &str) -> EditCancelOutcome {
+    #[derive(serde::Deserialize, Default)]
+    struct RawOutcome {
+        #[serde(default)]
+        reasserted: Option<bool>,
+        #[serde(default)]
+        confirmed: Option<bool>,
+    }
+
+    match serde_json::from_str::<RawOutcome>(raw) {
+        Ok(RawOutcome {
+            reasserted: Some(false),
+            ..
+        }) => EditCancelOutcome::AbortedBeforeWrite {
+            reason: "pre-click row-identity re-assertion found no exact match — nothing clicked, claim unchanged".to_string(),
+        },
+        Ok(RawOutcome {
+            reasserted: Some(true),
+            confirmed: Some(true),
+        }) => EditCancelOutcome::Confirmed,
+        Ok(RawOutcome {
+            reasserted: Some(true),
+            ..
+        }) => EditCancelOutcome::Ambiguous {
+            reason: "click fired but the post-click confirmation read did not confirm success".to_string(),
+        },
+        _ => EditCancelOutcome::Ambiguous {
+            reason: format!("post-click confirmation read was unparseable: {raw}"),
+        },
+    }
+}
+
+/// Builds call 1's JS (unverified selectors, ADR-004): opens the claims
+/// panel and reads back every candidate row's index/text/transaction_id.
+fn build_read_claim_rows_js() -> String {
+    use edit_claim_selectors::*;
+    format!(
+        r#"(function(){{
+            document.querySelector('{CLAIMS_TAB}')?.click();
+            return JSON.stringify(Array.from(document.querySelectorAll('{CLAIM_ROW}')).map((el, index) => ({{
+                index: index,
+                text: el.textContent || '',
+                transaction_id: el.getAttribute('{ROW_TRANSACTION_ID_ATTR}'),
+            }})));
+        }})()"#
+    )
+}
+
+/// Builds call 2's JS (unverified selectors, ADR-004): re-asserts the
+/// resolved row's identity in the SAME `eval_string` call that performs the
+/// write (TOCTOU guard, pre-mortem P1 #2) — only when that re-assertion
+/// still holds does the JS click anything.
+fn build_edit_cancel_write_js(
+    resolved_index: usize,
+    transaction_id_json: &str,
+    action: EditCancelAction,
+) -> String {
+    use edit_claim_selectors::*;
+    match action {
+        EditCancelAction::EditBid(bid) => format!(
+            r#"(function(){{
+                const row = document.querySelectorAll('{CLAIM_ROW}')[{resolved_index}];
+                if (!row || row.getAttribute('{ROW_TRANSACTION_ID_ATTR}') !== {transaction_id_json}) {{
+                    return JSON.stringify({{reasserted: false}});
+                }}
+                const input = row.querySelector('{BID_EDIT_INPUT}');
+                if (!input) return JSON.stringify({{reasserted: false}});
+                input.value = '{bid}';
+                input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                const save = row.querySelector('{SAVE_BUTTON}');
+                if (!save) return JSON.stringify({{reasserted: true}});
+                save.click();
+                const confirmed = (row.textContent || '').includes('${bid}');
+                return JSON.stringify({{reasserted: true, clicked: true, confirmed: confirmed}});
+            }})()"#
+        ),
+        EditCancelAction::Cancel => format!(
+            r#"(function(){{
+                const row = document.querySelectorAll('{CLAIM_ROW}')[{resolved_index}];
+                if (!row || row.getAttribute('{ROW_TRANSACTION_ID_ATTR}') !== {transaction_id_json}) {{
+                    return JSON.stringify({{reasserted: false}});
+                }}
+                const cancel = row.querySelector('{CANCEL_BUTTON}');
+                if (!cancel) return JSON.stringify({{reasserted: false}});
+                cancel.click();
+                const confirmed = !document.querySelector('{CLAIM_ROW}[{ROW_TRANSACTION_ID_ATTR}="' + {transaction_id_json} + '"]');
+                return JSON.stringify({{reasserted: true, clicked: true, confirmed: confirmed}});
+            }})()"#
+        ),
+    }
+}
+
+/// Task 1.4.1b seam-side edit/cancel flow (ADR-004). Selects the correct
+/// row via [`claim_row_disambiguator`] rather than `click_in_row`'s
+/// first-match-substring semantics — a mis-click here (editing or
+/// cancelling the wrong pending claim) is irreversible, a materially higher
+/// stakes near-miss than the existing flows'. Built only on the seam's
+/// existing primitives: one `eval_string` call reads every candidate row,
+/// Rust resolves the index, a second `eval_string` call re-asserts that
+/// row's identity and only then performs the write — never a new
+/// `BrowserSession` trait method.
+pub async fn edit_cancel_claim_via_seam(
+    session: &dyn BrowserSession,
+    league_id: &str,
+    transaction_id: &str,
+    action: EditCancelAction,
+) -> Result<EditCancelOutcome> {
+    let start = tracing::info_span!(
+        "edit_cancel.start",
+        league = league_id,
+        transaction_id,
+        action = ?action
+    );
+    let _enter = start.enter();
+    if !session.is_logged_in().await.unwrap_or(false) {
+        return Err(other(DEAD_SESSION_HINT));
+    }
+
+    // Call 1: read every candidate row, then resolve in Rust.
+    let rows_raw = session.eval_string(&build_read_claim_rows_js()).await?;
+    let rows: Vec<CandidateRow> = serde_json::from_str(&rows_raw).map_err(other)?;
+    let resolved_index =
+        claim_row_disambiguator(&rows, &RowTarget::TransactionId(transaction_id.to_string()))?;
+
+    let confirm = tracing::info_span!("edit_cancel.confirm", resolved_index);
+    let _enter_confirm = confirm.enter();
+
+    // Call 2: re-assert identity, write, and read back confirmation.
+    let transaction_id_json = serde_json::to_string(transaction_id).map_err(other)?;
+    let write_js = build_edit_cancel_write_js(resolved_index, &transaction_id_json, action);
+    let outcome_raw = session.eval_string(&write_js).await?;
+    let outcome = parse_edit_cancel_outcome(&outcome_raw);
+    tracing::info!(outcome = ?outcome, "edit_cancel resolved");
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_brissett_rows() -> Vec<CandidateRow> {
+        vec![
+            CandidateRow {
+                index: 0,
+                text: "Jacoby Brissett — bid $78".to_string(),
+                transaction_id: Some("1".to_string()),
+            },
+            CandidateRow {
+                index: 1,
+                text: "Brissett Jones — bid $12".to_string(),
+                transaction_id: Some("2".to_string()),
+            },
+        ]
+    }
+
+    /// Happy path (Story 1.4.1 AC1): resolved by the strong key even though
+    /// the rendered text is ambiguous across both rows.
+    #[test]
+    fn claim_row_disambiguator_should_resolve_by_strong_key_when_transaction_id_matches_one_row() {
+        let rows = two_brissett_rows();
+        let resolved = claim_row_disambiguator(&rows, &RowTarget::TransactionId("1".to_string()))
+            .expect("strong key must resolve despite the shared ambiguous substring");
+        assert_eq!(resolved, 0);
+    }
+
+    /// Error path (Story 1.4.1 AC1): a weak fallback key matching both
+    /// rows' rendered text must fail closed and name both candidates —
+    /// never guess the first (ADR-004).
+    #[test]
+    fn claim_row_disambiguator_should_fail_closed_when_fallback_key_matches_multiple_rows() {
+        let rows = two_brissett_rows();
+        let target = RowTarget::Fallback {
+            bid: None,
+            add_name: Some("Brissett".to_string()),
+        };
+        let err = claim_row_disambiguator(&rows, &target)
+            .expect_err("ambiguous fallback match must never guess the first row");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('0') && msg.contains('1'),
+            "error must name both candidate indices, got {msg}"
+        );
+    }
+
+    #[test]
+    fn claim_row_disambiguator_should_fail_closed_when_no_row_matches() {
+        let rows = two_brissett_rows();
+        let err = claim_row_disambiguator(&rows, &RowTarget::TransactionId("999".to_string()))
+            .expect_err("no match must be Err, never a guessed index");
+        assert!(err.to_string().contains("no candidate"));
+    }
 }

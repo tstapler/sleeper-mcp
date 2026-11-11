@@ -10,7 +10,14 @@ pub struct FakeSession {
     split_signals: bool,
     eval_calls: AtomicUsize,
     dump: tokio::sync::Mutex<String>,
-    eval_string_response: tokio::sync::Mutex<String>,
+    /// Canned `eval_string` responses, consumed in order across successive
+    /// calls within one flow (e.g. a candidate-row read followed by a
+    /// distinct post-click confirmation read). A call past the end of the
+    /// list repeats the last entry rather than erroring, so existing
+    /// single-response fixtures (flows that call `eval_string` more than
+    /// once) keep their prior behavior unchanged.
+    eval_string_responses: tokio::sync::Mutex<Vec<String>>,
+    eval_string_call_count: AtomicUsize,
     closed: bool,
 }
 
@@ -24,18 +31,28 @@ impl FakeSession {
             dump: tokio::sync::Mutex::new(
                 r#"{"url":"https://sleeper.com/","title":"Sleeper","webdriver: false","ua: Chrome/126","languages: en-US","plugins: 5"}"#.to_string(),
             ),
-            eval_string_response: tokio::sync::Mutex::new(r#"{"data":{}}"#.to_string()),
+            eval_string_responses: tokio::sync::Mutex::new(vec![r#"{"data":{}}"#.to_string()]),
+            eval_string_call_count: AtomicUsize::new(0),
             closed: false,
         }
     }
 
-    /// Canned response for the next [`BrowserSession::eval_string`] call —
+    /// Canned response for every [`BrowserSession::eval_string`] call —
     /// used to fixture the GraphQL `league_transactions_filtered` reply in
     /// tests without a live Chrome.
     pub fn with_eval_string_response(json: &str) -> Self {
+        Self::with_eval_string_responses(&[json])
+    }
+
+    /// Canned responses consumed in order across successive `eval_string`
+    /// calls within one flow (Task 1.4.1b: the claims-panel read needs a
+    /// different canned reply than the post-click confirmation read). The
+    /// last entry repeats for any call beyond the list's length.
+    pub fn with_eval_string_responses(jsons: &[&str]) -> Self {
         let s = Self::logged_in();
-        *s.eval_string_response.try_lock().expect("fresh fixture, no contention") =
-            json.to_string();
+        *s.eval_string_responses
+            .try_lock()
+            .expect("fresh fixture, no contention") = jsons.iter().map(|j| j.to_string()).collect();
         s
     }
 
@@ -91,7 +108,13 @@ impl BrowserSession for FakeSession {
             if self.transport_error {
                 return Err(other("fake transport error"));
             }
-            Ok(self.eval_string_response.lock().await.clone())
+            let responses = self.eval_string_responses.lock().await;
+            let idx = self.eval_string_call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(responses
+                .get(idx)
+                .or_else(|| responses.last())
+                .cloned()
+                .unwrap_or_default())
         })
     }
 

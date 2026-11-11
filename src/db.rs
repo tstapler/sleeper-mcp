@@ -33,6 +33,11 @@ pub struct RosterSnapshotRow<'a> {
 /// `None`/empty for rows sourced from the public REST transactions endpoint
 /// (which never carries a bid amount — live-verified 2026-11-10); rows
 /// sourced from the authenticated browser GraphQL path populate both.
+///
+/// `status_updated` is the GraphQL-epoch timestamp of `status`; REST never
+/// carries one, so it's `None` there (see `upsert_transaction`'s CAS guard).
+/// `source` is plain observability metadata (`"rest"`/`"graphql"`), not
+/// correctness-bearing.
 pub struct TransactionRow<'a> {
     pub transaction_id: &'a str,
     pub league_id: &'a str,
@@ -45,6 +50,8 @@ pub struct TransactionRow<'a> {
     pub drops: &'a serde_json::Value,
     pub roster_ids: &'a serde_json::Value,
     pub waiver_bid: Option<i64>,
+    pub status_updated: Option<i64>,
+    pub source: &'a str,
 }
 
 /// Row shape returned by `StatsDb::list_transactions` — read from the local
@@ -157,6 +164,12 @@ impl StatsDb {
         }
         if !has_col("waiver_bid") {
             sqlx::query("ALTER TABLE transactions ADD COLUMN waiver_bid INTEGER").execute(&pool).await?;
+        }
+        if !has_col("status_updated") {
+            sqlx::query("ALTER TABLE transactions ADD COLUMN status_updated INTEGER").execute(&pool).await?;
+        }
+        if !has_col("source") {
+            sqlx::query("ALTER TABLE transactions ADD COLUMN source TEXT").execute(&pool).await?;
         }
 
         Ok(Self { pool })
@@ -439,30 +452,80 @@ impl StatsDb {
         Ok(())
     }
 
+    /// Best-effort staleness check purely for the warn log — the CASE
+    /// clauses in `upsert_transaction`'s SQL are what actually enforce
+    /// monotonicity, this only explains *why* a write had no effect. A race
+    /// between this read and the upsert can't cause incorrect data, only a
+    /// missed/extra log line.
+    async fn warn_if_stale_status_write(&self, row: &TransactionRow<'_>) -> Result<()> {
+        let Some(incoming) = row.status_updated else {
+            return Ok(());
+        };
+        let existing: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT status_updated FROM transactions WHERE transaction_id = ?")
+                .bind(row.transaction_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some((Some(stored),)) = existing {
+            if incoming < stored {
+                tracing::warn!(
+                    transaction_id = row.transaction_id,
+                    incoming_status_updated = incoming,
+                    stored_status_updated = stored,
+                    "upsert_transaction: rejected out-of-order status write (stale status_updated)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Idempotent upsert (PK = transaction_id) of one resolved transaction —
     /// `adds`/`drops` are pre-resolved JSON (player name/position/owner, not
     /// bare IDs) so a `sqlite3 stats.db` query can filter by position/owner
     /// directly without a second lookup pass.
+    // kibitzer:ignore long-function -- body is one atomic SQL upsert statement; the line
+    // count is the query text itself, splitting it further would fragment one operation.
     pub async fn upsert_transaction(&self, row: TransactionRow<'_>) -> Result<()> {
+        self.warn_if_stale_status_write(&row).await?;
+
         // `waiver_bid` is COALESCEd on conflict rather than overwritten: the
         // public-REST sync path never knows a bid amount, and a re-sync from
         // there must not erase a bid the authenticated-browser sync path
         // already recorded for the same transaction_id.
+        //
+        // `status`/`status_updated` are CAS-guarded the same way, but on
+        // epoch rather than presence: an incoming write only applies if its
+        // `status_updated` is non-NULL and >= the stored value (NULL stored
+        // treated as 0), so a delayed/out-of-order sync can never regress a
+        // resolved status back to `pending`. A NULL incoming `status_updated`
+        // (REST writes) never touches `status` at all.
         sqlx::query(
             "INSERT INTO transactions
-             (transaction_id, league_id, season, week, type, status, created, adds, drops, roster_ids, waiver_bid, fetched_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             (transaction_id, league_id, season, week, type, status, created, adds, drops, roster_ids, waiver_bid, status_updated, source, fetched_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT(transaction_id) DO UPDATE SET
                  league_id  = excluded.league_id,
                  season     = excluded.season,
                  week       = excluded.week,
                  type       = excluded.type,
-                 status     = excluded.status,
+                 status = CASE
+                     WHEN excluded.status_updated IS NULL THEN transactions.status
+                     WHEN excluded.status_updated >= COALESCE(transactions.status_updated, 0)
+                         THEN excluded.status
+                     ELSE transactions.status
+                 END,
+                 status_updated = CASE
+                     WHEN excluded.status_updated IS NULL THEN transactions.status_updated
+                     WHEN excluded.status_updated >= COALESCE(transactions.status_updated, 0)
+                         THEN excluded.status_updated
+                     ELSE transactions.status_updated
+                 END,
                  created    = excluded.created,
                  adds       = excluded.adds,
                  drops      = excluded.drops,
                  roster_ids = excluded.roster_ids,
                  waiver_bid = COALESCE(excluded.waiver_bid, transactions.waiver_bid),
+                 source     = excluded.source,
                  fetched_at = excluded.fetched_at",
         )
         .bind(row.transaction_id)
@@ -476,6 +539,8 @@ impl StatsDb {
         .bind(serde_json::to_string(row.drops)?)
         .bind(serde_json::to_string(row.roster_ids)?)
         .bind(row.waiver_bid)
+        .bind(row.status_updated)
+        .bind(row.source)
         .bind(chrono::Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -568,5 +633,175 @@ impl StatsDb {
                 "weeks_cached": w,
             })).collect::<Vec<_>>(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// `StatsDb::open` takes a file path (no in-memory mode), so each test
+    /// gets its own scratch file under the OS temp dir rather than sharing state.
+    async fn test_db(name: &str) -> StatsDb {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sleeper_test_{name}_{}_{nanos}.db",
+            std::process::id()
+        ));
+        StatsDb::open(&path).await.expect("open test db")
+    }
+
+    fn base_row<'a>(
+        transaction_id: &'a str,
+        empty: &'a serde_json::Value,
+        roster_ids: &'a serde_json::Value,
+    ) -> TransactionRow<'a> {
+        TransactionRow {
+            transaction_id,
+            league_id: "league1",
+            season: "2026",
+            week: 9,
+            kind: "waiver",
+            status: Some("pending"),
+            created: 1_781_000_000,
+            adds: empty,
+            drops: empty,
+            roster_ids,
+            waiver_bid: None,
+            status_updated: None,
+            source: "rest",
+        }
+    }
+
+    async fn stored_status(db: &StatsDb, transaction_id: &str) -> (Option<String>, Option<i64>) {
+        sqlx::query_as("SELECT status, status_updated FROM transactions WHERE transaction_id = ?")
+            .bind(transaction_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("row exists")
+    }
+
+    /// `MakeWriter` that appends formatted log output into a shared buffer —
+    /// enough to assert a specific `warn!` fired without a dev-dependency.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    // AC1: an incoming write with an older status_updated than the stored
+    // row never changes `status`, and the rejection is warn-logged.
+    #[tokio::test]
+    async fn upsert_transaction_should_reject_status_downgrade_when_status_updated_is_older() {
+        let db = test_db("reject_downgrade").await;
+        let empty = serde_json::json!({});
+        let roster_ids = serde_json::json!([5]);
+
+        let mut seed = base_row("998877", &empty, &roster_ids);
+        seed.status = Some("complete");
+        seed.status_updated = Some(1_781_900_000);
+        seed.source = "graphql";
+        db.upsert_transaction(seed).await.expect("seed upsert");
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut stale = base_row("998877", &empty, &roster_ids);
+        stale.status = Some("pending");
+        stale.status_updated = Some(1_781_890_000); // 10 minutes older than stored
+        stale.source = "graphql";
+        db.upsert_transaction(stale).await.expect("stale upsert");
+
+        drop(_guard);
+        let log_text = logs.text();
+        assert!(
+            log_text.contains("rejected out-of-order"),
+            "expected a warn log for the rejected downgrade, got: {log_text}"
+        );
+
+        let (status, status_updated) = stored_status(&db, "998877").await;
+        assert_eq!(status, Some("complete".to_string()));
+        assert_eq!(status_updated, Some(1_781_900_000));
+    }
+
+    // AC2: a REST write (status_updated: None) never touches an existing
+    // status/status_updated on conflict — the CASE branch never applies.
+    #[tokio::test]
+    async fn upsert_transaction_should_preserve_status_when_source_is_rest_and_status_updated_is_none(
+    ) {
+        let db = test_db("rest_never_touches_status").await;
+        let empty = serde_json::json!({});
+        let roster_ids = serde_json::json!([5]);
+
+        let mut seed = base_row("998877", &empty, &roster_ids);
+        seed.status = Some("complete");
+        seed.status_updated = Some(1_781_900_000);
+        seed.source = "graphql";
+        db.upsert_transaction(seed).await.expect("seed upsert");
+
+        let mut rest_resync = base_row("998877", &empty, &roster_ids);
+        rest_resync.status = Some("complete");
+        rest_resync.status_updated = None;
+        rest_resync.source = "rest";
+        db.upsert_transaction(rest_resync).await.expect("rest resync upsert");
+
+        let (status, status_updated) = stored_status(&db, "998877").await;
+        assert_eq!(status, Some("complete".to_string()));
+        assert_eq!(status_updated, Some(1_781_900_000));
+    }
+
+    // AC3: a first-ever status_updated value (stored row currently NULL,
+    // inserted by an earlier REST sync) is always accepted, never rejected
+    // as a false "stale" downgrade.
+    #[tokio::test]
+    async fn upsert_transaction_should_accept_status_update_when_no_prior_status_updated_exists()
+    {
+        let db = test_db("first_ever_status_updated").await;
+        let empty = serde_json::json!({});
+        let roster_ids = serde_json::json!([5]);
+
+        let mut seed = base_row("1", &empty, &roster_ids);
+        seed.status = Some("pending");
+        seed.status_updated = None;
+        seed.source = "rest";
+        db.upsert_transaction(seed).await.expect("seed upsert");
+
+        let mut graphql_write = base_row("1", &empty, &roster_ids);
+        graphql_write.status = Some("pending");
+        graphql_write.status_updated = Some(1_781_850_000);
+        graphql_write.source = "graphql";
+        db.upsert_transaction(graphql_write).await.expect("graphql upsert");
+
+        let (status, status_updated) = stored_status(&db, "1").await;
+        assert_eq!(status, Some("pending".to_string()));
+        assert_eq!(status_updated, Some(1_781_850_000));
     }
 }
