@@ -269,6 +269,29 @@ struct BidProjectionParams {
     roster_id: i64,
 }
 
+/// LIVE WRITE ACTION: edits the FAAB bid on a real pending waiver claim
+/// against sleeper.com (Epic 4.3, Story 4.3.2). Same real-money framing as
+/// `WaiverClaimParams` — `new_bid` is required so a missing/invalid bid is
+/// a validation error before any browser launch, never a launch followed
+/// by a DOM-level failure.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EditWaiverClaimParams {
+    league_id: String,
+    /// The Sleeper transaction_id of the pending claim to edit.
+    transaction_id: String,
+    /// New FAAB bid amount to replace the claim's current bid.
+    new_bid: u32,
+}
+
+/// LIVE WRITE ACTION: cancels a real pending waiver claim against
+/// sleeper.com (Epic 4.3, Story 4.3.2).
+#[derive(Deserialize, JsonSchema)]
+struct CancelWaiverClaimParams {
+    league_id: String,
+    /// The Sleeper transaction_id of the pending claim to cancel.
+    transaction_id: String,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct PlayerReportParams {
     /// Sleeper player IDs — use search_players first if you only have a name
@@ -626,6 +649,45 @@ impl SleeperMcpServer {
     ) -> Result<CallToolResult, McpError> {
         ok(self.svc.project_waiver_bid(&p.league_id, &p.player_id, p.roster_id).await.map_err(err)?)
     }
+
+    #[tool(description = "LIVE WRITE ACTION — edits the FAAB bid on a real pending waiver claim against sleeper.com (not a simulation: changes the live bid immediately, with no confirm step). Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the claim is no longer pending, the session is not logged in, the target claim could not be matched to exactly one row in the live claims panel, the claims panel's expected structure could not be found at all (the live UI may have changed since the last verification), the target row moved before the write could fire (safe — nothing changed), or the outcome is unknown (e.g. a timeout between the DOM click and confirmation) — and on any error, re-check pending-claim state via get_transaction_history/get_pending_waivers before retrying, since the write may already have landed even when this tool can't confirm it.")]
+    async fn edit_waiver_claim(
+        &self,
+        #[tool(aggr)] p: EditWaiverClaimParams,
+    ) -> Result<CallToolResult, McpError> {
+        let action = crate::browser::session::EditCancelAction::EditBid(p.new_bid);
+        let outcome =
+            crate::cli::browser::run_edit_cancel_claim(&self.config, &self.svc, &p.league_id, &p.transaction_id, action)
+                .await;
+        match crate::cli::browser::render_edit_cancel_outcome(outcome, action) {
+            Ok(_detail) => ok(serde_json::json!({
+                "claim_bid_updated": true,
+                "league_id": p.league_id,
+                "transaction_id": p.transaction_id,
+                "new_bid": p.new_bid,
+            })),
+            Err(triage) => Err(McpError::internal_error(triage, None)),
+        }
+    }
+
+    #[tool(description = "LIVE WRITE ACTION — cancels a real pending waiver claim against sleeper.com (not a simulation: frees the FAAB that claim had committed, immediately, with no confirm step). Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the claim is no longer pending, the session is not logged in, the target claim could not be matched to exactly one row in the live claims panel, the claims panel's expected structure could not be found at all (the live UI may have changed since the last verification), the target row moved before the write could fire (safe — nothing changed), or the outcome is unknown (e.g. a timeout between the DOM click and confirmation) — and on any error, re-check pending-claim state via get_transaction_history/get_pending_waivers before retrying, since the write may already have landed even when this tool can't confirm it.")]
+    async fn cancel_waiver_claim(
+        &self,
+        #[tool(aggr)] p: CancelWaiverClaimParams,
+    ) -> Result<CallToolResult, McpError> {
+        let action = crate::browser::session::EditCancelAction::Cancel;
+        let outcome =
+            crate::cli::browser::run_edit_cancel_claim(&self.config, &self.svc, &p.league_id, &p.transaction_id, action)
+                .await;
+        match crate::cli::browser::render_edit_cancel_outcome(outcome, action) {
+            Ok(_detail) => ok(serde_json::json!({
+                "claim_cancelled": true,
+                "league_id": p.league_id,
+                "transaction_id": p.transaction_id,
+            })),
+            Err(triage) => Err(McpError::internal_error(triage, None)),
+        }
+    }
 }
 
 #[tool(tool_box)]
@@ -759,6 +821,110 @@ mod tests {
         assert!(
             result.is_err(),
             "missing player_id must be a validation Err before any DB/analysis call, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Epic 4.3 / Task 4.3.2a: `edit_waiver_claim`/`cancel_waiver_claim`'s
+    // outcome mapping — proven against the shared renderer
+    // (`render_edit_cancel_outcome`) directly, the exact call both tool
+    // bodies make, since the full tool call always launches a real browser
+    // (no live Chrome in this sandbox — the same documented gap
+    // `waiver_claim`/`lineup_set` already carry).
+    // -----------------------------------------------------------------
+
+    use crate::browser::session::{EditCancelAction, EditCancelOutcome};
+    use crate::cli::browser::{render_edit_cancel_outcome, EditCancelRunOutcome};
+
+    /// Mirrors exactly what `edit_waiver_claim`/`cancel_waiver_claim`'s tool
+    /// bodies do with `render_edit_cancel_outcome`'s result — one copy
+    /// source (the renderer), proven here to map correctly into `McpError`.
+    fn to_mcp_result(
+        outcome: crate::error::Result<EditCancelRunOutcome>,
+        action: EditCancelAction,
+    ) -> std::result::Result<(), McpError> {
+        match render_edit_cancel_outcome(outcome, action) {
+            Ok(_detail) => Ok(()),
+            Err(triage) => Err(McpError::internal_error(triage, None)),
+        }
+    }
+
+    #[test]
+    fn only_confirmed_detail_maps_to_an_mcp_ok_result() {
+        assert!(
+            to_mcp_result(
+                Ok(EditCancelRunOutcome::Confirmed { detail: "cancelled".to_string() }),
+                EditCancelAction::Cancel,
+            )
+            .is_ok(),
+            "Confirmed{{detail}} must map to Ok"
+        );
+
+        let non_success = [
+            to_mcp_result(Ok(EditCancelRunOutcome::ConfirmedButUnverified), EditCancelAction::Cancel),
+            to_mcp_result(
+                Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Confirmed)),
+                EditCancelAction::Cancel,
+            ),
+            to_mcp_result(
+                Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous { reason: "r".to_string() })),
+                EditCancelAction::Cancel,
+            ),
+            to_mcp_result(
+                Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite {
+                    reason: "r".to_string(),
+                })),
+                EditCancelAction::Cancel,
+            ),
+            to_mcp_result(Err(crate::browser::other("already-formed triage text")), EditCancelAction::Cancel),
+        ];
+        for result in non_success {
+            assert!(result.is_err(), "every non-Confirmed{{detail}} outcome must map to Err, never Ok");
+        }
+    }
+
+    #[test]
+    fn ambiguous_and_aborted_before_write_map_to_genuinely_different_mcp_error_text() {
+        let same_reason = "row no longer matched by the time the write-stage eval_string ran";
+        let ambiguous = to_mcp_result(
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous { reason: same_reason.to_string() })),
+            EditCancelAction::Cancel,
+        )
+        .unwrap_err();
+        let aborted = to_mcp_result(
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite {
+                reason: same_reason.to_string(),
+            })),
+            EditCancelAction::Cancel,
+        )
+        .unwrap_err();
+        assert_ne!(
+            ambiguous.message, aborted.message,
+            "Ambiguous (re-check before retrying) and AbortedBeforeWrite (safe, nothing changed) \
+             must never produce the same McpError text, even given the identical underlying reason"
+        );
+        assert!(ambiguous.message.contains("outcome unknown"));
+        assert!(aborted.message.contains("nothing was clicked"));
+    }
+
+    #[test]
+    fn already_formed_err_text_passes_through_into_mcp_error_unmodified() {
+        // `run_edit_cancel_claim`'s own `Err` is already ready-to-print
+        // (the dead-session hint, the already-resolved triage, or its own
+        // catch-all-wrapped generic-flow-failure triage) — the MCP mapping
+        // layer must never re-wrap or alter it.
+        let ready_text = "Edit/cancel failed — the live claims panel may have changed since the last verification, or the selector bundle needs live re-verification. Re-run with SLEEPER_BROWSER_DEBUG=1 for detail.";
+        let mapped = to_mcp_result(Err(crate::browser::other(ready_text)), EditCancelAction::Cancel).unwrap_err();
+        assert_eq!(mapped.message, ready_text);
+    }
+
+    #[test]
+    fn edit_waiver_claim_params_should_fail_deserialization_when_new_bid_param_missing() {
+        let value = serde_json::json!({ "league_id": "1352883872131481600", "transaction_id": "1" });
+        let result: std::result::Result<EditWaiverClaimParams, _> = serde_json::from_value(value);
+        assert!(
+            result.is_err(),
+            "missing new_bid must be a validation Err before any browser launch, got {result:?}"
         );
     }
 }

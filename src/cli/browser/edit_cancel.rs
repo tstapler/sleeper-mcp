@@ -1,3 +1,10 @@
+// kibitzer:ignore file-size -- Epic 4.3 added the shared CLI/MCP renderer
+// (`render_edit_cancel_outcome`), three new triage fns, and the CLI wrapper
+// to the ~300-line non-test core; the rest of the file's growth past 500
+// lines is its own `#[cfg(test)]` module (same "one surface, one file"
+// convention `mcp.rs`'s own file-size suppression already documents) —
+// splitting tests into a second file would scatter, not shrink, this epic's
+// footprint.
 //! Epic 4.1 / Story 4.1.1: `run_edit_cancel_claim` — the pre-write (and
 //! post-write) status re-check wrapped around Epic 4.2's live DOM
 //! edit/cancel flow (`edit_cancel_claim_via_seam`, `flows.rs`). Split out of
@@ -9,13 +16,15 @@
 //! future CLI command and MCP tool (Epic 4.3), the same split
 //! `run_claim`/`run_lineup_set` (`actions.rs`) already use for their own
 //! write actions.
+use console::style;
+
 use crate::analysis::AnalysisService;
 use crate::browser::session::{EditCancelAction, EditCancelOutcome};
 use crate::config::Config;
 use crate::db::CachedTransaction;
 use crate::error::Result;
 
-use super::login::{launch_failure_error, launch_session, LaunchOptions};
+use super::login::{debug_detail, launch_failure_error, launch_session, triage_error, LaunchOptions};
 use super::transactions::{read_through, StalenessTolerance};
 
 /// Epic 4.1 / Story 4.1.1: pre-write (and post-write) status re-check
@@ -80,15 +89,45 @@ fn post_write_verified(
     }
 }
 
+/// Epic 4.3 / Tasks 4.3.1a/4.3.2a: catch-all triage for a generic flow-level
+/// failure (selector/DOM-shape drift — `edit_cancel_claim_via_seam` itself
+/// returned `Err` without ever reaching one of `EditCancelOutcome`'s three
+/// typed checkpoints), sibling to `claim_failed_triage()`/
+/// `lineup_failed_triage()` (`actions.rs:25-33`) and identical in shape.
+/// Per the Observability Plan this is never a `sleeper browser doctor`
+/// suggestion — selector drift isn't a session/login-health check in the
+/// sense `doctor.rs` covers.
+fn edit_cancel_failed_triage() -> String {
+    "Edit/cancel failed — the live claims panel may have changed since the last verification, or the selector bundle needs live re-verification. Re-run with SLEEPER_BROWSER_DEBUG=1 for detail.".to_string()
+}
+
+/// Epic 4.3 / Task 4.2.1b's described (but previously unbuilt) triage fn:
+/// the click already fired and the post-click confirmation read couldn't
+/// confirm it landed — the outcome is genuinely unknown, so this must never
+/// read like a safe-to-retry case. Shared verbatim by both the CLI print
+/// and the MCP tool's `Err` text (one copy source, two renderers) — see
+/// `render_edit_cancel_outcome` — so it names no CLI- or MCP-specific
+/// command, only the concrete recovery action common to both surfaces.
+fn edit_cancel_ambiguous_outcome_triage(reason: &str) -> String {
+    format!(
+        "Edit/cancel outcome unknown ({reason}) — the write may already have landed; do not assume the claim is still active. Re-check its current status (`sleeper transactions`, or the `get_transaction_history`/`get_pending_waivers` MCP tools) before retrying."
+    )
+}
+
+/// Epic 4.3 / Task 4.2.1c's described (but previously unbuilt) triage fn:
+/// the click-stage row-identity re-assertion found the target row had
+/// already moved before any click fired — nothing was clicked, so this is a
+/// provable fact, never the `Ambiguous` case's genuine unknown. Same
+/// shared-copy rationale as `edit_cancel_ambiguous_outcome_triage` above.
+fn edit_cancel_aborted_before_write_triage(reason: &str) -> String {
+    format!(
+        "Edit/cancel aborted before the write could fire ({reason}) — nothing was clicked, the claim is unchanged. Safe to retry immediately."
+    )
+}
+
 /// Epic 4.1 core result (Task 4.1.1a): everything Epic 4.3's CLI/MCP
 /// surface needs to pick its own copy, without re-deriving any decision
 /// `run_edit_cancel_claim` already made.
-// Epic 4.1 lands ahead of Epic 4.3's CLI/MCP wiring (plan.md's own task
-// split) — nothing in the crate calls `run_edit_cancel_claim` yet outside
-// this file's own tests, so both are allowed dead code until that lands,
-// the same forward-declared-but-unwired situation `RowTarget::Fallback`
-// (`flows.rs`) documents for Epic 1.4/ADR-004.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EditCancelRunOutcome {
     /// The seam flow reported `Confirmed` AND the post-write re-check
@@ -121,7 +160,6 @@ pub(crate) enum EditCancelRunOutcome {
 /// Epic 4.3). An already-resolved (or not-found) claim short-circuits
 /// before `launch_session` is even called — no browser launch, no DOM write
 /// attempted (ux.md §5/§11's explicit ordering requirement).
-#[allow(dead_code)] // Epic 4.3 wires this in; see `EditCancelRunOutcome`'s note above.
 // kibitzer:ignore long-function -- pre-check, launch, seam call, close
 // (every branch), post-check: one atomic launch→check→flow→triage
 // operation, the same shape/rationale as `read_through`'s own suppression
@@ -179,9 +217,88 @@ pub(crate) async fn run_edit_cancel_claim(
         Ok(other_outcome) => Ok(EditCancelRunOutcome::SeamOutcome(other_outcome)),
         Err(e) if e.to_string() == DEAD_SESSION_HINT => Err(e),
         // Generic flow failure (no-unique-row-match, selector/DOM-drift,
-        // etc.) — passed through verbatim; Epic 4.3 (Tasks 4.3.1a/4.3.2a)
-        // builds `edit_cancel_failed_triage()` to render it, not this fn.
-        Err(e) => Err(e),
+        // etc.) — never reached one of `EditCancelOutcome`'s three typed
+        // checkpoints, so it gets the same catch-all triage treatment
+        // `run_claim`'s own generic `Err(e)` arm uses (`actions.rs:98-101`).
+        Err(e) => Err(crate::browser::other(triage_error(
+            &edit_cancel_failed_triage(),
+            &debug_detail(&e.to_string()),
+        ))),
+    }
+}
+
+/// Epic 4.3 / Tasks 4.3.1a & 4.3.2a: the single rendering function shared by
+/// the CLI (`cmd_waiver_edit_cancel` below) and the MCP `edit_waiver_claim`/
+/// `cancel_waiver_claim` tools (`src/mcp.rs`) — one copy source, two
+/// renderers. `Ok` is the success line to print/return verbatim;
+/// `Err` is the triage line to print/return verbatim. Both are already
+/// fully formed — neither caller does any further string-building.
+pub(crate) fn render_edit_cancel_outcome(
+    outcome: Result<EditCancelRunOutcome>,
+    action: EditCancelAction,
+) -> std::result::Result<String, String> {
+    match outcome {
+        Ok(EditCancelRunOutcome::Confirmed { detail }) => Ok(match action {
+            EditCancelAction::Cancel => "claim cancelled".to_string(),
+            EditCancelAction::EditBid(_) => format!("claim bid updated to ${detail}"),
+        }),
+        // The seam flow claimed success but the independent post-write
+        // re-check (`AlwaysLive`, the real source of truth) still disagrees
+        // — never a bare success print. Practically identical risk to
+        // `Ambiguous` (the write may or may not have landed), so it shares
+        // that triage.
+        Ok(EditCancelRunOutcome::ConfirmedButUnverified) => Err(edit_cancel_ambiguous_outcome_triage(
+            "the live DOM reported success but the independent post-write re-check could not confirm it",
+        )),
+        // Defensive only — per `EditCancelRunOutcome`'s own doc comment this
+        // arm shouldn't occur in practice (a real `Confirmed` is intercepted
+        // into `Confirmed{detail}`/`ConfirmedButUnverified` above first).
+        // Still never a bare success print if it somehow does.
+        Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Confirmed)) => {
+            Err(edit_cancel_ambiguous_outcome_triage(
+                "the seam flow reported success without going through the post-write re-check (unexpected path)",
+            ))
+        }
+        Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous { reason })) => {
+            Err(edit_cancel_ambiguous_outcome_triage(&reason))
+        }
+        Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite { reason })) => {
+            Err(edit_cancel_aborted_before_write_triage(&reason))
+        }
+        // Already ready-to-print `Display` text: the dead-session hint, the
+        // already-resolved pre-write triage, or (per `run_edit_cancel_claim`'s
+        // own generic `Err` arm above) `edit_cancel_failed_triage()`.
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Epic 4.3 / Task 4.3.1a: CLI wrapper for `WaiverAction::Edit`/`Cancel` —
+/// prints the shared render's success line to stdout, or its triage line to
+/// stderr (yellow for a dead session, matching the existing Surface C hint
+/// `login.rs`/`doctor.rs`/`exit_on_action_error` already use; red for
+/// everything else), and exits 1 on any failure branch.
+pub(crate) async fn cmd_waiver_edit_cancel(
+    config: &Config,
+    analysis: &AnalysisService,
+    league: &str,
+    transaction: &str,
+    action: EditCancelAction,
+) -> Result<()> {
+    use crate::browser::session::DEAD_SESSION_HINT;
+    let outcome = run_edit_cancel_claim(config, analysis, league, transaction, action).await;
+    match render_edit_cancel_outcome(outcome, action) {
+        Ok(success) => {
+            println!("{success}");
+            Ok(())
+        }
+        Err(triage) => {
+            if triage == DEAD_SESSION_HINT {
+                eprintln!("{}", style(&triage).yellow());
+            } else {
+                eprintln!("{}", style(&triage).red());
+            }
+            std::process::exit(1);
+        }
     }
 }
 
@@ -220,6 +337,57 @@ mod tests {
             msg,
             "claim 1 is no longer pending (now: complete) — nothing to edit/cancel. Run `sleeper transactions --league 1352883872131481600` to see its resolved outcome."
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Epic 4.3's three new triage fns — distinguishable from each other and
+    // from `edit_cancel_already_resolved_triage` above (ux.md §11 AC: five
+    // distinguishable failure messages, never collapsed into one wording).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn edit_cancel_failed_triage_should_match_the_catch_all_shape_verbatim() {
+        assert_eq!(
+            edit_cancel_failed_triage(),
+            "Edit/cancel failed — the live claims panel may have changed since the last verification, or the selector bundle needs live re-verification. Re-run with SLEEPER_BROWSER_DEBUG=1 for detail."
+        );
+    }
+
+    #[test]
+    fn edit_cancel_ambiguous_outcome_triage_should_state_outcome_unknown_and_never_doctor() {
+        let msg = edit_cancel_ambiguous_outcome_triage("click fired but confirmation read failed");
+        assert!(msg.contains("outcome unknown"), "must state the outcome is unknown: {msg}");
+        assert!(msg.contains("do not assume"), "must warn against assuming success: {msg}");
+        assert!(!msg.contains("sleeper browser doctor"), "must never suggest doctor: {msg}");
+    }
+
+    #[test]
+    fn edit_cancel_aborted_before_write_triage_should_state_nothing_changed_and_safe_to_retry() {
+        let msg = edit_cancel_aborted_before_write_triage("row identity changed between resolution and click");
+        assert!(msg.contains("nothing was clicked"), "must state nothing was clicked: {msg}");
+        assert!(msg.contains("Safe to retry"), "must state it's safe to retry: {msg}");
+        assert!(!msg.contains("outcome unknown"), "must never use Ambiguous's wording: {msg}");
+    }
+
+    #[test]
+    fn ambiguous_and_aborted_before_write_triage_should_never_share_wording() {
+        let ambiguous = edit_cancel_ambiguous_outcome_triage("same reason text");
+        let aborted = edit_cancel_aborted_before_write_triage("same reason text");
+        assert_ne!(
+            ambiguous, aborted,
+            "Ambiguous (risky, re-check before retrying) and AbortedBeforeWrite (safe, nothing changed) \
+             must never be rendered with the same copy — collapsing them misrepresents one as the other"
+        );
+    }
+
+    #[test]
+    fn all_three_epic_4_3_triage_fns_should_be_mutually_distinct() {
+        let failed = edit_cancel_failed_triage();
+        let ambiguous = edit_cancel_ambiguous_outcome_triage("reason");
+        let aborted = edit_cancel_aborted_before_write_triage("reason");
+        assert_ne!(failed, ambiguous);
+        assert_ne!(failed, aborted);
+        assert_ne!(ambiguous, aborted);
     }
 
     // -----------------------------------------------------------------
@@ -368,5 +536,119 @@ mod tests {
         );
         // No code path above reaches `launch_session` before this return —
         // structurally, not just observably, zero browser launches.
+    }
+
+    // -----------------------------------------------------------------
+    // `render_edit_cancel_outcome` — Epic 4.3's shared CLI/MCP renderer.
+    // Constructed `EditCancelRunOutcome`/`Result` values only, no live
+    // launch, per plan.md Tasks 4.3.1a/4.3.2a's own test guidance (same
+    // pattern every prior CLI epic used).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn render_should_print_claim_cancelled_verbatim_on_confirmed_cancel() {
+        let outcome = Ok(EditCancelRunOutcome::Confirmed { detail: "cancelled".to_string() });
+        assert_eq!(render_edit_cancel_outcome(outcome, EditCancelAction::Cancel), Ok("claim cancelled".to_string()));
+    }
+
+    #[test]
+    fn render_should_print_bid_updated_with_new_amount_on_confirmed_edit_bid() {
+        let outcome = Ok(EditCancelRunOutcome::Confirmed { detail: "85".to_string() });
+        assert_eq!(
+            render_edit_cancel_outcome(outcome, EditCancelAction::EditBid(85)),
+            Ok("claim bid updated to $85".to_string())
+        );
+    }
+
+    #[test]
+    fn render_should_never_print_success_on_confirmed_but_unverified() {
+        let outcome = Ok(EditCancelRunOutcome::ConfirmedButUnverified);
+        let rendered = render_edit_cancel_outcome(outcome, EditCancelAction::Cancel);
+        let triage = rendered.expect_err("ConfirmedButUnverified must never render as success");
+        assert!(triage.contains("outcome unknown"), "must share Ambiguous's triage shape: {triage}");
+    }
+
+    #[test]
+    fn render_should_never_print_success_on_defensive_seam_confirmed() {
+        // Per `EditCancelRunOutcome`'s doc comment this path shouldn't occur
+        // in practice (a real `Confirmed` is intercepted above first) — but
+        // must still never render as a bare success if it somehow does.
+        let outcome = Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Confirmed));
+        let rendered = render_edit_cancel_outcome(outcome, EditCancelAction::Cancel);
+        assert!(rendered.is_err(), "defensive SeamOutcome(Confirmed) must never render as success");
+    }
+
+    #[test]
+    fn render_should_surface_ambiguous_reason_in_the_triage_text() {
+        let outcome = Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous {
+            reason: "transport error between click and confirmation".to_string(),
+        }));
+        let triage = render_edit_cancel_outcome(outcome, EditCancelAction::Cancel)
+            .expect_err("Ambiguous must never render as success");
+        assert!(triage.contains("outcome unknown"));
+        assert!(triage.contains("transport error between click and confirmation"));
+    }
+
+    #[test]
+    fn render_should_surface_aborted_before_write_reason_in_the_triage_text() {
+        let outcome = Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite {
+            reason: "row identity changed between resolution and click".to_string(),
+        }));
+        let triage = render_edit_cancel_outcome(outcome, EditCancelAction::Cancel)
+            .expect_err("AbortedBeforeWrite must never render as success");
+        assert!(triage.contains("nothing was clicked"));
+        assert!(triage.contains("row identity changed between resolution and click"));
+    }
+
+    #[test]
+    fn render_should_pass_through_an_already_ready_to_print_err_display_verbatim() {
+        let ready_text = edit_cancel_already_resolved_triage("1", LEAGUE_ID, "complete");
+        let outcome: Result<EditCancelRunOutcome> = Err(crate::browser::other(ready_text.clone()));
+        assert_eq!(render_edit_cancel_outcome(outcome, EditCancelAction::Cancel), Err(ready_text));
+    }
+
+    #[test]
+    fn ambiguous_and_aborted_before_write_renders_should_never_collapse_to_the_same_text() {
+        let same_reason = "row no longer matched by the time the write-stage eval_string ran";
+        let ambiguous = render_edit_cancel_outcome(
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous { reason: same_reason.to_string() })),
+            EditCancelAction::Cancel,
+        )
+        .unwrap_err();
+        let aborted = render_edit_cancel_outcome(
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite {
+                reason: same_reason.to_string(),
+            })),
+            EditCancelAction::Cancel,
+        )
+        .unwrap_err();
+        assert_ne!(
+            ambiguous, aborted,
+            "same underlying reason text must still render as genuinely different triage copy \
+             for the risky (Ambiguous) vs. safe (AbortedBeforeWrite) case"
+        );
+    }
+
+    #[test]
+    fn only_confirmed_detail_ever_renders_ok() {
+        // Every other `EditCancelRunOutcome`/`Err` variant must render `Err`
+        // — proof for Task 4.3.2a's "only Confirmed{detail} ever produces
+        // Ok" MCP-mapping requirement, at the shared-core level both the
+        // CLI and MCP tool call.
+        let non_success_outcomes: Vec<Result<EditCancelRunOutcome>> = vec![
+            Ok(EditCancelRunOutcome::ConfirmedButUnverified),
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Confirmed)),
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous { reason: "r".to_string() })),
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite { reason: "r".to_string() })),
+            Err(crate::browser::other("generic flow failure")),
+        ];
+        for outcome in non_success_outcomes {
+            assert!(render_edit_cancel_outcome(outcome, EditCancelAction::Cancel).is_err());
+        }
+        assert!(render_edit_cancel_outcome(
+            Ok(EditCancelRunOutcome::Confirmed { detail: "cancelled".to_string() }),
+            EditCancelAction::Cancel
+        )
+        .is_ok());
     }
 }

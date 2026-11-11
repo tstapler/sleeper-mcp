@@ -37,9 +37,19 @@ pub(super) use actions::{cmd_lineup_set, cmd_trade_propose, cmd_waiver};
 /// `get_pending_waivers` MCP tools in `src/mcp.rs` call these shared cores
 /// directly, bypassing the CLI's printing/process-exit wrapper.
 pub(crate) use actions::{run_claim, run_lineup_set, ClaimRequest};
-/// `run_edit_cancel_claim`/`EditCancelRunOutcome` (Epic 4.1), exported the
-/// same way, ready for Epic 4.3's CLI/MCP wiring — not yet called from
-/// either surface, hence the explicit allow until that lands.
-#[allow(unused_imports)]
-pub(crate) use edit_cancel::{run_edit_cancel_claim, EditCancelRunOutcome};
+/// `run_edit_cancel_claim`/`EditCancelRunOutcome` (Epic 4.1) plus Epic 4.3's
+/// shared renderer (`render_edit_cancel_outcome`, called by both the CLI
+/// dispatch below and the `edit_waiver_claim`/`cancel_waiver_claim` MCP
+/// tools) and CLI wrapper (`cmd_waiver_edit_cancel`, called from
+/// `cli::run`'s `WaiverAction::Edit`/`Cancel` interception — it needs
+/// `AnalysisService`, which `cmd_waiver` above doesn't have).
+/// `EditCancelRunOutcome` itself is only referenced from `mcp.rs`'s
+/// `#[cfg(test)]` module (to construct fixtures for
+/// `render_edit_cancel_outcome`) — real callers only ever see the `String`
+/// `render_edit_cancel_outcome` returns — hence the explicit allow in a
+/// non-test build.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use edit_cancel::{
+    cmd_waiver_edit_cancel, render_edit_cancel_outcome, run_edit_cancel_claim, EditCancelRunOutcome,
+};
 pub(crate) use pending::run_pending_transactions;

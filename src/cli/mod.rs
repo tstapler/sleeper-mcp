@@ -331,6 +331,33 @@ pub enum WaiverAction {
         #[arg(long)]
         full: bool,
     },
+    /// Epic 4.3 / Story 4.3.1: edit the FAAB bid on a real pending waiver
+    /// claim (`sleeper waiver edit --league --transaction --bid`). LIVE
+    /// WRITE ACTION — always launches a browser, never a simulation. Prints
+    /// `claim bid updated to $N` only once an independent post-write
+    /// re-check confirms the new bid landed (ux.md §5).
+    Edit {
+        #[arg(long)]
+        league: String,
+        /// The Sleeper transaction_id of the pending claim to edit.
+        #[arg(long)]
+        transaction: String,
+        /// New FAAB bid amount.
+        #[arg(long)]
+        bid: u32,
+    },
+    /// Epic 4.3 / Story 4.3.1: cancel a real pending waiver claim
+    /// (`sleeper waiver cancel --league --transaction`). LIVE WRITE ACTION —
+    /// always launches a browser, never a simulation. Prints
+    /// `claim cancelled` only once an independent post-write re-check
+    /// confirms the cancel landed (ux.md §5).
+    Cancel {
+        #[arg(long)]
+        league: String,
+        /// The Sleeper transaction_id of the pending claim to cancel.
+        #[arg(long)]
+        transaction: String,
+    },
 }
 
 /// Resolve a username/display_name/user_id/numeric string to a roster_id.
@@ -479,6 +506,31 @@ pub async fn run(cli: Cli) -> Result<()> {
         // has `client`, not `svc`.
         Commands::Waiver { action: WaiverAction::BidProjection { league, player, roster, full } } => {
             dynasty_cmds::cmd_waiver_bid_projection(&svc, &league, &player, roster, full).await?
+        }
+
+        // Epic 4.3: also intercepted here rather than threaded into
+        // `browser::cmd_waiver` (same reason as `BidProjection` above) —
+        // `run_edit_cancel_claim` needs `AnalysisService` (`svc`), which
+        // `cmd_waiver` only has as `client`.
+        Commands::Waiver { action: WaiverAction::Edit { league, transaction, bid } } => {
+            browser::cmd_waiver_edit_cancel(
+                &config,
+                &svc,
+                &league,
+                &transaction,
+                crate::browser::session::EditCancelAction::EditBid(bid),
+            )
+            .await?
+        }
+        Commands::Waiver { action: WaiverAction::Cancel { league, transaction } } => {
+            browser::cmd_waiver_edit_cancel(
+                &config,
+                &svc,
+                &league,
+                &transaction,
+                crate::browser::session::EditCancelAction::Cancel,
+            )
+            .await?
         }
 
         Commands::Waiver { action } => browser::cmd_waiver(&config, &client, action).await?,

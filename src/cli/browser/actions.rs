@@ -52,6 +52,13 @@ pub(crate) async fn cmd_waiver(config: &Config, client: &SleeperClient, action: 
         WaiverAction::BidProjection { .. } => {
             unreachable!("BidProjection is handled in cli::run before reaching cmd_waiver")
         }
+        // Epic 4.3: also intercepted in `cli::run` before dispatch reaches
+        // this function, the same reason as `BidProjection` above —
+        // `run_edit_cancel_claim` needs `AnalysisService`, which this
+        // function only has as `client`, not `svc`.
+        WaiverAction::Edit { .. } | WaiverAction::Cancel { .. } => {
+            unreachable!("Edit/Cancel are handled in cli::run before reaching cmd_waiver")
+        }
     }
 }
 
