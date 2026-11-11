@@ -92,6 +92,69 @@ fn injury_risk_notes<'a>(players: impl Iterator<Item = &'a serde_json::Value>) -
         .collect()
 }
 
+/// How many wins back of the playoff cutoff a team can be and still count as
+/// "contending" rather than "rebuilding" in [`competitive_posture`]. 1 win
+/// back still leaves a real path with games to play — this matches this
+/// league's own live standings, 2026-11-11: roster_id 5 sat exactly 1 win
+/// back of the 6th playoff spot with 5 games left and was correctly judged
+/// still squarely in the hunt, not a team that should be selling.
+const CONTENDING_GAMES_BACK: i32 = 1;
+
+/// The win total of the worst team still inside a playoff spot — the
+/// reference point [`competitive_posture`] measures games-back against.
+/// `playoff_teams` is the league's own setting (`playoff_teams` on
+/// `LeagueSettings`), never a hardcoded team count, since that varies by
+/// league. Ties within a win count don't change which win total sits at the
+/// cutoff index, so this doesn't need `AnalysisService::standings`'s
+/// points-based tiebreak — just the win totals, sorted.
+fn playoff_cutoff_wins(rosters: &[Roster], playoff_teams: usize) -> i32 {
+    let mut wins: Vec<i32> = rosters.iter().map(|r| r.settings.wins).collect();
+    wins.sort_by(|a, b| b.cmp(a));
+    let idx = playoff_teams.saturating_sub(1).min(wins.len().saturating_sub(1));
+    wins.get(idx).copied().unwrap_or(0)
+}
+
+/// "contending" (in a playoff spot, or within [`CONTENDING_GAMES_BACK`] wins
+/// of the cutoff) vs "rebuilding" (meaningfully behind) — informational
+/// signal only (see `find_win_win_trades`'s use of it): a rebuilding team may
+/// prefer youth/picks over more aging veterans, but that's a judgment call
+/// for a human to weigh, not grounds to silently drop a proposal.
+fn competitive_posture(wins: i32, cutoff_wins: i32) -> &'static str {
+    if cutoff_wins - wins <= CONTENDING_GAMES_BACK {
+        "contending"
+    } else {
+        "rebuilding"
+    }
+}
+
+/// Whether a player is already in the age-decline band for their position —
+/// mirrors `dynasty_tier_for_pos`'s own aging-curve thresholds in
+/// `src/analysis/dynasty.rs` (QB 34+, RB 28+, WR/TE/IDP 30+, generic 31+)
+/// rather than inventing a second set of numbers for the same concept. Not
+/// callable directly (that fn is private to `dynasty.rs` and takes raw
+/// age/years_exp/team, not an enriched player `Value`), so the thresholds
+/// are mirrored here instead of shared.
+fn is_declining_age(player: &serde_json::Value) -> bool {
+    let age = player["age"].as_i64().unwrap_or(0);
+    match player["position"].as_str().unwrap_or("") {
+        "QB" => age >= 34,
+        "RB" => age >= 28,
+        "WR" | "TE" | "DL" | "LB" | "DB" => age >= 30,
+        _ => age >= 31,
+    }
+}
+
+/// Whether a majority of the players being offered are already in their
+/// position's age-decline band — the "offering more of what a rebuilding
+/// team doesn't need" signal for `find_win_win_trades`'s posture note.
+fn offering_is_mostly_aging_vets(given: &[&serde_json::Value]) -> bool {
+    if given.is_empty() {
+        return false;
+    }
+    let aging = given.iter().filter(|p| is_declining_age(p)).count();
+    aging * 2 > given.len()
+}
+
 /// Nearest tier (searching outward, cheaper first) that actually has a
 /// median — guards the rare case a tier bucket comes up empty (e.g. a thin
 /// FantasyCalc snapshot), rather than silently returning no value at all.
@@ -348,6 +411,15 @@ impl AnalysisService {
             self.fetch_rosters_users_players_state(league_id).await?;
         let (_eval_season, stats_ctx) = self.eval_season_stats(&nfl_state.season).await;
 
+        // Falls back to half the league when the commissioner hasn't set
+        // `playoff_teams` explicitly (Sleeper allows this) — a reasonable
+        // default, not load-bearing for the hard filters above, only for the
+        // informational posture note below.
+        let league = self.client.get_league(league_id).await?;
+        let playoff_teams =
+            league.settings.playoff_teams.unwrap_or((rosters.len() / 2) as i32).max(1) as usize;
+        let cutoff_wins = playoff_cutoff_wins(&rosters, playoff_teams);
+
         let user_map: HashMap<_, _> = users
             .iter()
             .map(|u| (u.user_id.clone(), u.display_name.clone()))
@@ -588,6 +660,22 @@ impl AnalysisService {
             let risk_notes =
                 injury_risk_notes(i_give_top.iter().copied().chain(they_give_top.iter().copied()));
 
+            // Informational only — never drops a proposal (unlike the two hard
+            // filters above), since a rebuilding team lateral-trading veteran
+            // value isn't necessarily a bad idea, just a closer call a human
+            // should weigh with real context (see this fn's doc comment).
+            let partner_posture = competitive_posture(other.settings.wins, cutoff_wins);
+            let posture_note = (partner_posture == "rebuilding"
+                && offering_is_mostly_aging_vets(&i_give_top))
+            .then(|| {
+                format!(
+                    "{partner_name} is well out of playoff contention ({}-{}) — may prefer \
+                     youth/draft picks over more aging veterans; confirm before assuming \
+                     they'd want this.",
+                    other.settings.wins, other.settings.losses,
+                )
+            });
+
             proposals.push(serde_json::json!({
                 "kind": "need_match",
                 "partner": partner_name,
@@ -600,6 +688,8 @@ impl AnalysisService {
                 "ppg_given": give_ppg,
                 "ppg_received": receive_ppg,
                 "risk_notes": risk_notes,
+                "partner_posture": partner_posture,
+                "posture_note": posture_note,
                 "summary": format!(
                     "Give {} {} → fills their {:?} need. Receive {} {} → fills your {:?} need.",
                     i_give_top.first().and_then(|p| p["name"].as_str()).unwrap_or("?"),
@@ -759,5 +849,81 @@ mod win_win_trade_guard_tests {
         let hurt = serde_json::json!({"name": "Deebo Samuel Sr.", "injury_status": "Questionable"});
         let notes = injury_risk_notes([&healthy, &hurt].into_iter());
         assert_eq!(notes, vec!["Deebo Samuel Sr. — Questionable".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod competitive_posture_tests {
+    use super::{
+        competitive_posture, is_declining_age, offering_is_mostly_aging_vets, playoff_cutoff_wins,
+    };
+    use crate::models::{Roster, RosterSettings};
+
+    fn roster_with_wins(roster_id: i32, wins: i32) -> Roster {
+        Roster {
+            roster_id,
+            owner_id: None,
+            league_id: "league1".to_string(),
+            players: Vec::new(),
+            starters: Vec::new(),
+            reserve: Vec::new(),
+            taxi: None,
+            settings: RosterSettings { wins, losses: 9 - wins, ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn playoff_cutoff_wins_should_return_the_win_total_at_the_cutoff_rank() {
+        // Mirrors the real league checked live, 2026-11-11: 12 teams, 6 playoff
+        // spots, 6th seed at 5 wins.
+        let rosters: Vec<Roster> =
+            [8, 7, 7, 6, 5, 5, 4, 3, 3, 2, 2, 2].iter().enumerate().map(|(i, &w)| roster_with_wins(i as i32, w)).collect();
+        assert_eq!(playoff_cutoff_wins(&rosters, 6), 5);
+    }
+
+    #[test]
+    fn playoff_cutoff_wins_should_clamp_when_playoff_teams_exceeds_roster_count() {
+        let rosters = vec![roster_with_wins(1, 8), roster_with_wins(2, 3)];
+        assert_eq!(playoff_cutoff_wins(&rosters, 6), 3, "must not panic/overflow — clamps to the worst team");
+    }
+
+    #[test]
+    fn competitive_posture_should_be_contending_when_in_a_playoff_spot() {
+        assert_eq!(competitive_posture(5, 5), "contending");
+    }
+
+    #[test]
+    fn competitive_posture_should_be_contending_when_one_win_back_of_the_cutoff() {
+        // The real case this threshold was calibrated against: roster_id 5 at
+        // 4 wins, cutoff at 5 — still squarely in the hunt.
+        assert_eq!(competitive_posture(4, 5), "contending");
+    }
+
+    #[test]
+    fn competitive_posture_should_be_rebuilding_when_two_or_more_wins_back() {
+        // galphonse's real record: 3 wins against a 5-win cutoff.
+        assert_eq!(competitive_posture(3, 5), "rebuilding");
+    }
+
+    #[test]
+    fn is_declining_age_should_use_each_positions_own_aging_curve() {
+        assert!(!is_declining_age(&serde_json::json!({"position": "WR", "age": 29})));
+        assert!(is_declining_age(&serde_json::json!({"position": "WR", "age": 33})));
+        assert!(!is_declining_age(&serde_json::json!({"position": "RB", "age": 27})));
+        assert!(is_declining_age(&serde_json::json!({"position": "RB", "age": 29})));
+    }
+
+    #[test]
+    fn offering_is_mostly_aging_vets_should_require_a_strict_majority() {
+        let young = serde_json::json!({"position": "WR", "age": 24});
+        let old_te = serde_json::json!({"position": "TE", "age": 33});
+        let old_qb = serde_json::json!({"position": "QB", "age": 37});
+        assert!(!offering_is_mostly_aging_vets(&[&young, &old_te]), "a tie must not count as 'mostly'");
+        assert!(offering_is_mostly_aging_vets(&[&young, &old_te, &old_qb]));
+    }
+
+    #[test]
+    fn offering_is_mostly_aging_vets_should_be_false_for_an_empty_offer() {
+        assert!(!offering_is_mostly_aging_vets(&[]));
     }
 }

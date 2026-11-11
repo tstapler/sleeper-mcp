@@ -363,6 +363,13 @@ pub(super) async fn cmd_find_trades(
         for player in p["you_receive"].as_array().unwrap_or(&vec![]) {
             println!("{}", fmt_player(player));
         }
+
+        if let Some(note) = p["posture_note"].as_str() {
+            for line in textwrap(note, 76) {
+                println!("    {} {}", style("⚠").yellow(), style(line).yellow());
+            }
+        }
+
         println!();
     }
     Ok(())
