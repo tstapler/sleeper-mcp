@@ -333,6 +333,29 @@ struct PlayerReportParams {
     season: Option<String>,
 }
 
+/// Persist a dated analysis finding (e.g. a standings/trade-scan review) to
+/// the local stats DB so it survives past this chat session. Not a Sleeper
+/// write action — this never touches the live league.
+#[derive(Deserialize, JsonSchema)]
+struct LogAnalysisNoteParams {
+    league_id: String,
+    /// Short category label, e.g. "standings_review", "trade_scan".
+    topic: String,
+    summary: String,
+    /// Optional longer supporting detail.
+    detail: Option<String>,
+}
+
+/// Read back previously logged analysis notes, most recent first.
+#[derive(Deserialize, JsonSchema)]
+struct GetAnalysisNotesParams {
+    /// Omit to return notes across every league.
+    league_id: Option<String>,
+    #[serde(default = "default_20")]
+    limit: i64,
+}
+
+fn default_20() -> i64 { 20 }
 fn default_nfl() -> String { "nfl".to_string() }
 fn default_add() -> String { "add".to_string() }
 fn default_48() -> i32 { 48 }
@@ -668,6 +691,36 @@ impl SleeperMcpServer {
             .await
             .map_err(err)?;
         ok(serde_json::json!({ "league_id": p.league_id, "trade_block": players }))
+    }
+
+    #[tool(description = "Persist a dated analysis finding (e.g. a standings check or trade-scan review) to the local stats DB so it survives past this chat session, for a future session to read back with get_analysis_notes. Not a Sleeper write action.")]
+    async fn log_analysis_note(
+        &self,
+        #[tool(aggr)] p: LogAnalysisNoteParams,
+    ) -> Result<CallToolResult, McpError> {
+        let id = self
+            .svc
+            .db
+            .log_analysis_note(&p.league_id, &p.topic, &p.summary, p.detail.as_deref())
+            .await
+            .map_err(err)?;
+        ok(serde_json::json!({ "id": id }))
+    }
+
+    #[tool(description = "Read back previously logged analysis notes (see log_analysis_note), most recent first. Omit league_id to return notes across every league.")]
+    async fn get_analysis_notes(
+        &self,
+        #[tool(aggr)] p: GetAnalysisNotesParams,
+    ) -> Result<CallToolResult, McpError> {
+        let notes = self.svc.db.list_analysis_notes(p.league_id.as_deref(), p.limit).await.map_err(err)?;
+        ok(serde_json::json!({ "notes": notes.iter().map(|n| serde_json::json!({
+            "id": n.id,
+            "league_id": n.league_id,
+            "created_at": n.created_at,
+            "topic": n.topic,
+            "summary": n.summary,
+            "detail": n.detail,
+        })).collect::<Vec<_>>() }))
     }
 
     #[tool(description = "Read-only: transaction history for a league (waiver claims, trades, free-agent adds) served from the local unified cache, refreshing live only when a row's status/age genuinely warrants it (a pending claim inside the league's Tuesday waiver-processing window, or a never-synced league) rather than on a fixed interval. Returns structured JSON per row, including `source` (\"rest\" or \"graphql\") and `fetched_at` (when this tool's own cache last wrote the row) — never a formatted sentence. Omit `max_age_secs` to use this per-row default; pass `max_age_secs: 0` to force a live refresh.")]

@@ -8,6 +8,7 @@ use crate::client::SleeperClient;
 use crate::error::Result;
 
 pub mod browser;
+mod chat_cmds;
 mod dynasty_cmds;
 mod roster_cmds;
 mod sync;
@@ -253,6 +254,54 @@ pub enum Commands {
         give: String,
         #[arg(long)]
         get: String,
+    },
+
+    /// Durable analysis log + chat-transcript import — so a session's
+    /// findings (standings reviews, trade scans) survive past the session
+    /// itself, in the local stats DB rather than only in chat scrollback.
+    Chat {
+        #[command(subcommand)]
+        action: ChatAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ChatAction {
+    /// Persist a dated analysis finding.
+    Log {
+        #[arg(long)]
+        league: String,
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        detail: Option<String>,
+    },
+
+    /// List logged analysis findings, most recent first.
+    List {
+        #[arg(long)]
+        league: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+
+    /// Import a chat session transcript file (e.g. a Claude Code session
+    /// JSONL) verbatim, keyed by filename so re-importing an
+    /// actively-growing session file updates rather than duplicates.
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        league: Option<String>,
+    },
+
+    /// List imported transcripts (metadata only), most recent first.
+    Transcripts {
+        #[arg(long)]
+        league: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
     },
 }
 
@@ -551,6 +600,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::TradePropose { league, give, get } => {
             browser::cmd_trade_propose(&config, &league, &give, &get).await?
         }
+
+        Commands::Chat { action } => chat_cmds::cmd_chat(&*svc.db, action).await?,
     }
     Ok(())
 }

@@ -78,6 +78,40 @@ pub struct TransactionSyncRun<'a> {
 /// `fetched_at`/`status_updated`/`source` (Epic 2.1, Task 2.1.1a) let a
 /// staleness decision (`StalenessTolerance::is_fresh`) be made from this
 /// struct alone, without a second query back into `StatsDb`.
+/// Row returned by `StatsDb::list_analysis_notes`.
+#[derive(Debug, Clone)]
+pub struct AnalysisNote {
+    pub id: i64,
+    pub league_id: String,
+    pub created_at: String,
+    pub topic: String,
+    pub summary: String,
+    pub detail: Option<String>,
+}
+
+/// Row returned by `StatsDb::list_chat_transcripts` — metadata only. Deliberately
+/// excludes `raw_text`: a transcript file can be large, and a list call should stay
+/// cheap even when several sessions have been imported. Use `get_chat_transcript`
+/// to read one back in full.
+#[derive(Debug, Clone)]
+pub struct ChatTranscriptMeta {
+    pub session_id: String,
+    pub league_id: Option<String>,
+    pub imported_at: String,
+    pub source_path: String,
+    pub size_bytes: i64,
+}
+
+/// Row returned by `StatsDb::get_chat_transcript` — the full imported text.
+#[derive(Debug, Clone)]
+pub struct ChatTranscriptFull {
+    pub session_id: String,
+    pub league_id: Option<String>,
+    pub imported_at: String,
+    pub source_path: String,
+    pub raw_text: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedTransaction {
     pub transaction_id: String,
@@ -184,7 +218,26 @@ impl StatsDb {
                 synced_at    TEXT    NOT NULL,
                 rows_fetched INTEGER NOT NULL,
                 rows_changed INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS analysis_notes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                league_id  TEXT    NOT NULL,
+                created_at TEXT    NOT NULL,
+                topic      TEXT    NOT NULL,
+                summary    TEXT    NOT NULL,
+                detail     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS analysis_notes_league_created
+                ON analysis_notes (league_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS chat_transcripts (
+                session_id  TEXT PRIMARY KEY,
+                league_id   TEXT,
+                imported_at TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                raw_text    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS chat_transcripts_league_imported
+                ON chat_transcripts (league_id, imported_at DESC);",
         )
         .execute(&pool)
         .await?;
@@ -526,6 +579,154 @@ impl StatsDb {
             chrono::DateTime::parse_from_rfc3339(&s)
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
+        }))
+    }
+
+    /// Persist a dated analysis finding (e.g. a standings/trade-scan review) so it
+    /// survives past this chat session. Returns the new row's `id`.
+    pub async fn log_analysis_note(
+        &self,
+        league_id: &str,
+        topic: &str,
+        summary: &str,
+        detail: Option<&str>,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO analysis_notes (league_id, created_at, topic, summary, detail)
+             VALUES (?,?,?,?,?)",
+        )
+        .bind(league_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(topic)
+        .bind(summary)
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Most recent analysis notes, optionally filtered to one league.
+    pub async fn list_analysis_notes(
+        &self,
+        league_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AnalysisNote>> {
+        let rows: Vec<(i64, String, String, String, String, Option<String>)> = match league_id {
+            Some(lid) => {
+                sqlx::query_as(
+                    "SELECT id, league_id, created_at, topic, summary, detail
+                     FROM analysis_notes WHERE league_id = ?
+                     ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(lid)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, league_id, created_at, topic, summary, detail
+                     FROM analysis_notes ORDER BY created_at DESC LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(id, league_id, created_at, topic, summary, detail)| AnalysisNote {
+                id,
+                league_id,
+                created_at,
+                topic,
+                summary,
+                detail,
+            })
+            .collect())
+    }
+
+    /// Import a chat session transcript verbatim, keyed by `session_id` so
+    /// re-importing the same (actively-growing) session file is idempotent
+    /// rather than creating duplicate rows.
+    pub async fn import_chat_transcript(
+        &self,
+        session_id: &str,
+        league_id: Option<&str>,
+        source_path: &str,
+        raw_text: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO chat_transcripts
+             (session_id, league_id, imported_at, source_path, raw_text)
+             VALUES (?,?,?,?,?)",
+        )
+        .bind(session_id)
+        .bind(league_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(source_path)
+        .bind(raw_text)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Metadata for imported transcripts, optionally filtered to one league.
+    /// Never loads `raw_text` — see [`ChatTranscriptMeta`]'s doc comment.
+    pub async fn list_chat_transcripts(
+        &self,
+        league_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ChatTranscriptMeta>> {
+        let rows: Vec<(String, Option<String>, String, String, i64)> = match league_id {
+            Some(lid) => {
+                sqlx::query_as(
+                    "SELECT session_id, league_id, imported_at, source_path, LENGTH(raw_text)
+                     FROM chat_transcripts WHERE league_id = ?
+                     ORDER BY imported_at DESC LIMIT ?",
+                )
+                .bind(lid)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT session_id, league_id, imported_at, source_path, LENGTH(raw_text)
+                     FROM chat_transcripts ORDER BY imported_at DESC LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(session_id, league_id, imported_at, source_path, size_bytes)| ChatTranscriptMeta {
+                session_id,
+                league_id,
+                imported_at,
+                source_path,
+                size_bytes,
+            })
+            .collect())
+    }
+
+    /// Read back one imported transcript in full, by `session_id`.
+    pub async fn get_chat_transcript(&self, session_id: &str) -> Result<Option<ChatTranscriptFull>> {
+        let row: Option<(String, Option<String>, String, String, String)> = sqlx::query_as(
+            "SELECT session_id, league_id, imported_at, source_path, raw_text
+             FROM chat_transcripts WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(session_id, league_id, imported_at, source_path, raw_text)| ChatTranscriptFull {
+            session_id,
+            league_id,
+            imported_at,
+            source_path,
+            raw_text,
         }))
     }
 
@@ -1349,5 +1550,105 @@ mod tests {
             .await
             .expect("second open of now-migrated file must not error");
         drop(db2);
+    }
+
+    #[tokio::test]
+    async fn log_analysis_note_should_round_trip_through_list_analysis_notes() {
+        let db = test_db("log_note").await;
+        let id = db
+            .log_analysis_note("league1", "trade_scan", "summary text", Some("detail text"))
+            .await
+            .expect("log note");
+        assert!(id > 0);
+
+        let notes = db.list_analysis_notes(Some("league1"), 10).await.expect("list notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, id);
+        assert_eq!(notes[0].topic, "trade_scan");
+        assert_eq!(notes[0].summary, "summary text");
+        assert_eq!(notes[0].detail.as_deref(), Some("detail text"));
+    }
+
+    #[tokio::test]
+    async fn list_analysis_notes_should_return_most_recent_first_and_respect_limit() {
+        let db = test_db("list_notes_order").await;
+        db.log_analysis_note("league1", "a", "first", None).await.expect("log a");
+        db.log_analysis_note("league1", "b", "second", None).await.expect("log b");
+        db.log_analysis_note("league1", "c", "third", None).await.expect("log c");
+
+        let notes = db.list_analysis_notes(Some("league1"), 2).await.expect("list notes");
+        assert_eq!(notes.len(), 2, "limit must be respected");
+        assert_eq!(notes[0].topic, "c", "most recently logged note must come first");
+        assert_eq!(notes[1].topic, "b");
+    }
+
+    #[tokio::test]
+    async fn list_analysis_notes_should_filter_by_league_when_given_one() {
+        let db = test_db("list_notes_league_filter").await;
+        db.log_analysis_note("league1", "a", "league1 note", None).await.expect("log a");
+        db.log_analysis_note("league2", "b", "league2 note", None).await.expect("log b");
+
+        let notes = db.list_analysis_notes(Some("league1"), 10).await.expect("list notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].summary, "league1 note");
+
+        let all_notes = db.list_analysis_notes(None, 10).await.expect("list all notes");
+        assert_eq!(all_notes.len(), 2, "omitting league_id must return every league's notes");
+    }
+
+    #[tokio::test]
+    async fn import_chat_transcript_should_round_trip_through_get_chat_transcript() {
+        let db = test_db("import_transcript").await;
+        db.import_chat_transcript("session-1", Some("league1"), "/tmp/session-1.jsonl", "raw jsonl content")
+            .await
+            .expect("import transcript");
+
+        let full = db
+            .get_chat_transcript("session-1")
+            .await
+            .expect("get transcript")
+            .expect("transcript must exist");
+        assert_eq!(full.session_id, "session-1");
+        assert_eq!(full.league_id.as_deref(), Some("league1"));
+        assert_eq!(full.source_path, "/tmp/session-1.jsonl");
+        assert_eq!(full.raw_text, "raw jsonl content");
+    }
+
+    #[tokio::test]
+    async fn import_chat_transcript_should_replace_not_duplicate_on_re_import_of_same_session() {
+        let db = test_db("import_transcript_idempotent").await;
+        db.import_chat_transcript("session-1", None, "/tmp/session-1.jsonl", "v1 content")
+            .await
+            .expect("first import");
+        db.import_chat_transcript("session-1", None, "/tmp/session-1.jsonl", "v2 content, grown since")
+            .await
+            .expect("re-import of same actively-growing session");
+
+        let all = db.list_chat_transcripts(None, 10).await.expect("list transcripts");
+        assert_eq!(all.len(), 1, "re-importing the same session_id must replace, not duplicate");
+        assert_eq!(all[0].size_bytes, "v2 content, grown since".len() as i64);
+
+        let full = db.get_chat_transcript("session-1").await.expect("get transcript").expect("must exist");
+        assert_eq!(full.raw_text, "v2 content, grown since");
+    }
+
+    #[tokio::test]
+    async fn list_chat_transcripts_should_never_load_raw_text_into_the_metadata_row() {
+        let db = test_db("list_transcripts_metadata_only").await;
+        db.import_chat_transcript("session-1", Some("league1"), "/tmp/a.jsonl", "some real content")
+            .await
+            .expect("import");
+
+        let metas = db.list_chat_transcripts(Some("league1"), 10).await.expect("list");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id, "session-1");
+        assert_eq!(metas[0].size_bytes, "some real content".len() as i64);
+    }
+
+    #[tokio::test]
+    async fn get_chat_transcript_should_return_none_when_session_id_was_never_imported() {
+        let db = test_db("get_transcript_missing").await;
+        let result = db.get_chat_transcript("never-imported").await.expect("get transcript");
+        assert!(result.is_none());
     }
 }
