@@ -221,8 +221,10 @@ impl AnalysisService {
             .collect();
 
         let mut stored = 0usize;
+        let mut rows_fetched = 0usize;
         for &week in weeks {
             let txns = self.client.get_league_transactions(league_id, week).await?;
+            rows_fetched += txns.len();
             for t in &txns {
                 let adds = t.adds.clone().unwrap_or_default();
                 let drops = t.drops.clone().unwrap_or_default();
@@ -246,6 +248,13 @@ impl AnalysisService {
                 stored += 1;
             }
         }
+        // `stored` counts every upsert attempted, not just rows that
+        // actually changed (unlike `persist_league_transactions`'s
+        // graphql path, `upsert_transaction` here doesn't report a
+        // changed/unchanged outcome) — logged as `rows_stored`, not
+        // `rows_changed`, to avoid implying a distinction this path
+        // doesn't make.
+        tracing::info!(league_id, rows_fetched, rows_stored = stored, "sync_transaction_history: sync complete");
         Ok(stored)
     }
 

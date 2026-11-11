@@ -173,11 +173,26 @@ pub(crate) async fn run_edit_cancel_claim(
 ) -> Result<EditCancelRunOutcome> {
     use crate::browser::session::{edit_cancel_claim_via_seam, DEAD_SESSION_HINT};
 
+    // Entry span for this service boundary (plan.md Observability Plan:
+    // "structured log lines at entry and exit of new service boundaries").
+    // Referenced via `parent: &span` on each exit-point log below rather
+    // than `span.enter()`/`.entered()`, since this function's guard would
+    // otherwise need to stay alive across several `.await` points —
+    // `read_through`'s own doc comment above documents why that guard isn't
+    // `Send`-safe to hold across an `.await`.
+    let span = tracing::info_span!(
+        "edit_cancel.start",
+        league_id,
+        transaction_id,
+        action = ?action,
+    );
+
     let pre_check =
         read_through(config, analysis, league_id, None, StalenessTolerance::AlwaysLive, false).await?;
     match pre_write_status_check(&pre_check, transaction_id) {
         PreWriteCheck::StillPending => {}
         PreWriteCheck::AlreadyResolved(status) => {
+            tracing::info!(parent: &span, status = %status, "edit_cancel: already resolved, no write attempted");
             return Err(crate::browser::other(edit_cancel_already_resolved_triage(
                 transaction_id,
                 league_id,
@@ -185,6 +200,7 @@ pub(crate) async fn run_edit_cancel_claim(
             )));
         }
         PreWriteCheck::NotFound => {
+            tracing::info!(parent: &span, "edit_cancel: transaction not found in cache, no write attempted");
             return Err(crate::browser::other(edit_cancel_already_resolved_triage(
                 transaction_id,
                 league_id,
@@ -195,7 +211,10 @@ pub(crate) async fn run_edit_cancel_claim(
 
     let (mut session, launched) = match launch_session(config, LaunchOptions::headless()).await {
         Ok(pair) => pair,
-        Err(e) => return Err(launch_failure_error(&e)),
+        Err(e) => {
+            tracing::warn!(parent: &span, error = %e, "edit_cancel: browser launch failed");
+            return Err(launch_failure_error(&e));
+        }
     };
     let outcome = edit_cancel_claim_via_seam(&*session, league_id, transaction_id, action).await;
     // Fix 1 (Phase 6 review): capture both close results separately and only
@@ -209,8 +228,12 @@ pub(crate) async fn run_edit_cancel_claim(
             launched_close_result?;
             o
         }
-        Err(e) if e.to_string() == DEAD_SESSION_HINT => return Err(e),
+        Err(e) if e.to_string() == DEAD_SESSION_HINT => {
+            tracing::info!(parent: &span, "edit_cancel: dead session detected, re-login required");
+            return Err(e);
+        }
         Err(e) => {
+            tracing::warn!(parent: &span, error = %e, "edit_cancel: seam flow failed before reaching a typed outcome");
             return Err(crate::browser::other(triage_error(
                 &edit_cancel_failed_triage(),
                 &debug_detail(&e.to_string()),
@@ -227,11 +250,27 @@ pub(crate) async fn run_edit_cancel_claim(
                 read_through(config, analysis, league_id, None, StalenessTolerance::AlwaysLive, false)
                     .await?;
             match post_write_verified(&post_check, transaction_id, action) {
-                Some(detail) => Ok(EditCancelRunOutcome::Confirmed { detail }),
-                None => Ok(EditCancelRunOutcome::ConfirmedButUnverified),
+                Some(detail) => {
+                    tracing::info!(parent: &span, detail = %detail, "edit_cancel: confirmed and post-write verified");
+                    Ok(EditCancelRunOutcome::Confirmed { detail })
+                }
+                None => {
+                    tracing::warn!(
+                        parent: &span,
+                        "edit_cancel: seam reported confirmed but post-write re-check could not verify it"
+                    );
+                    Ok(EditCancelRunOutcome::ConfirmedButUnverified)
+                }
             }
         }
-        other_outcome => Ok(EditCancelRunOutcome::SeamOutcome(other_outcome)),
+        EditCancelOutcome::Ambiguous { reason } => {
+            tracing::warn!(parent: &span, reason = %reason, "edit_cancel: ambiguous outcome");
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::Ambiguous { reason }))
+        }
+        EditCancelOutcome::AbortedBeforeWrite { reason } => {
+            tracing::info!(parent: &span, reason = %reason, "edit_cancel: aborted before write, nothing changed");
+            Ok(EditCancelRunOutcome::SeamOutcome(EditCancelOutcome::AbortedBeforeWrite { reason }))
+        }
     }
 }
 

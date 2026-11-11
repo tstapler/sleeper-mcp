@@ -207,6 +207,14 @@ pub(crate) async fn persist_league_transactions(
 
     tx.commit().await?;
 
+    tracing::info!(
+        league_id,
+        season,
+        rows_fetched,
+        rows_changed,
+        "persist_league_transactions: sync complete"
+    );
+
     Ok((rows_fetched, rows_changed))
 }
 
@@ -412,7 +420,22 @@ fn needs_refresh(
                 || cached
                     .iter()
                     .filter(|t| !is_terminal_status(t.status.as_deref()))
-                    .any(|t| !tolerance.is_fresh(t.fetched_at, now))
+                    .any(|t| {
+                        let fresh = tolerance.is_fresh(t.fetched_at, now);
+                        // Gap: log the row's actual age at the point the
+                        // staleness decision is made, so a later
+                        // investigation can tell "tolerance technically
+                        // satisfied but row still old" apart from
+                        // "genuinely fresh" (plan.md Observability Plan).
+                        tracing::debug!(
+                            transaction_id = t.transaction_id.as_str(),
+                            status = t.status.as_deref().unwrap_or("unknown"),
+                            age_secs = (now - t.fetched_at).num_seconds(),
+                            fresh,
+                            "needs_refresh: pending row staleness decision"
+                        );
+                        !fresh
+                    })
         }
     }
 }
@@ -453,19 +476,14 @@ pub(crate) async fn read_through(
 ) -> Result<Vec<CachedTransaction>> {
     let cached = analysis.db.list_transactions(league_id, kind_filter).await?;
     let now = chrono::Utc::now();
+    let refresh_needed = needs_refresh(&cached, &tolerance, force_refresh, now);
 
-    if !needs_refresh(&cached, &tolerance, force_refresh, now) {
-        if cached.is_empty() {
-            tracing::debug!(
-                %league_id,
-                ?kind_filter,
-                "transactions.read_through: cache_miss, no_live_call (CachedOnly)"
-            );
-        }
-        return Ok(cached);
-    }
-
-    let outcome = if force_refresh {
+    // Outcome (and the span naming it) computed once, up front, so the
+    // common warm-cache path ("cache_hit") is named by the same span as
+    // every refresh outcome, not a separate untracked branch.
+    let outcome = if !refresh_needed {
+        "cache_hit"
+    } else if force_refresh {
         "force_refresh"
     } else if cached.is_empty() {
         "cache_miss"
@@ -478,6 +496,30 @@ pub(crate) async fn read_through(
         ?kind_filter,
         outcome,
     );
+
+    if !refresh_needed {
+        // Entered only within this synchronous branch — dropped before any
+        // `.await`, so the guard's non-`Send`-ness (see the `.instrument`
+        // note below) never crosses a suspension point here.
+        let _enter = span.enter();
+        if cached.is_empty() {
+            tracing::debug!(
+                %league_id,
+                ?kind_filter,
+                "transactions.read_through: cache_miss, no_live_call (CachedOnly)"
+            );
+        } else {
+            // Gap: the actual common case — a warm, within-tolerance cache
+            // read — previously emitted nothing at all.
+            tracing::debug!(
+                %league_id,
+                ?kind_filter,
+                rows = cached.len(),
+                "transactions.read_through: cache_hit"
+            );
+        }
+        return Ok(cached);
+    }
     // `.instrument(span)` rather than `span.entered()`: the latter's guard
     // (`EnteredSpan`) isn't `Send` and this function now also runs behind
     // the MCP `#[tool]` macro's `tool_box`, which requires every tool

@@ -214,6 +214,17 @@ pub(crate) fn parse_league_transactions(raw: &str) -> Result<Vec<LeagueTransacti
             )
         })?;
 
+    // Gap: log the first non-empty entry's top-level key set once per sync
+    // run, so a silent Sleeper GraphQL schema change shows up as a diffable
+    // log line before it trips a hard assertion elsewhere.
+    if let Some(keys) = entries
+        .iter()
+        .find_map(|e| e.as_object().filter(|o| !o.is_empty()))
+        .map(|o| o.keys().map(String::as_str).collect::<Vec<&str>>())
+    {
+        tracing::debug!(?keys, "parse_league_transactions: first entry top-level key set");
+    }
+
     Ok(entries.iter().map(parse_league_transaction_entry).collect())
 }
 
