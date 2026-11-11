@@ -179,8 +179,15 @@ pub async fn pending_transactions_via_seam(
     let _enter = start.enter();
 
     let types_json = serde_json::to_string(type_filters).map_err(other)?;
+    // Security review (Phase 6): league_id is GraphQL/JSON-string-escaped via
+    // serde_json rather than wrapped in literal quotes — a league_id
+    // containing a `"` could otherwise break out of the string literal and
+    // inject GraphQL syntax. No actual attacker-controlled path exists today
+    // (league_id always originates from this tool's own trusted CLI/MCP
+    // params), but the escaping is free and removes the assumption.
+    let league_id_json = serde_json::to_string(league_id).map_err(other)?;
     let query = format!(
-        r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: "{league_id}", roster_id_filters: [{roster_id}], type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
+        r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: {league_id_json}, roster_id_filters: [{roster_id}], type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
     );
     let body = serde_json::json!({
         "operationName": "league_transactions_filtered",
@@ -236,8 +243,12 @@ fn build_league_transactions_query(
 ) -> Result<String> {
     let roster_ids_json = serde_json::to_string(roster_id_filters).map_err(other)?;
     let types_json = serde_json::to_string(type_filters).map_err(other)?;
+    // Security review (Phase 6): see pending_transactions_via_seam's matching
+    // comment — league_id is escaped via serde_json, not wrapped in literal
+    // quotes, so a `"` in it can't break out of the GraphQL string literal.
+    let league_id_json = serde_json::to_string(league_id).map_err(other)?;
     Ok(format!(
-        r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: "{league_id}", roster_id_filters: {roster_ids_json}, type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
+        r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: {league_id_json}, roster_id_filters: {roster_ids_json}, type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
     ))
 }
 
