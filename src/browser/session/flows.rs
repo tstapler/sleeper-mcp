@@ -200,13 +200,18 @@ fn build_on_waivers_probe_js(search_needle: &str) -> Result<String> {
 /// resolved row via [`player_search_display_name`], the same name/row
 /// scoping discipline `click_in_row` already uses for the drop row and
 /// submit button below.
+/// Returns `on_waivers`: `true` means this submitted a *pending* waiver
+/// claim (the add has not happened yet), `false` means the player was a
+/// free agent and the add/drop is already instant/final — callers use this
+/// to decide whether an optimistic roster-cache patch is even valid (see
+/// `src/cli/browser/actions.rs`'s `apply_instant_add_patch`).
 pub async fn claim_player_via_seam(
     session: &dyn BrowserSession,
     league_id: &str,
     player_name: &str,
     bid_amount: u32,
     drop_player_name: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     use claim_selectors::*;
 
     let start = tracing::info_span!("claim.start", league = league_id, player = player_name);
@@ -246,7 +251,7 @@ pub async fn claim_player_via_seam(
         session.click_in_row(SUBMIT_BUTTON, SUBMIT_ADD_TEXT, "").await?;
     }
     tracing::info!("claim submitted");
-    Ok(())
+    Ok(on_waivers)
 }
 
 /// Story 4.1 seam-side lineup-swap flow, live-verified 2026-09-11 (plan.md

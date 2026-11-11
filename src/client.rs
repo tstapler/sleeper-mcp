@@ -270,6 +270,33 @@ impl SleeperClient {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// Optimistic cache update: after a write already confirmed via live-DOM
+    /// verification (never a guess — see callers in `src/cli/browser/actions.rs`),
+    /// patch the cached `/league/{league_id}/rosters` entry so the next
+    /// `roster_with_names` read reflects it immediately instead of asking
+    /// Sleeper's own REST layer, which this project has repeatedly found to lag
+    /// a real write by minutes (see [`get_json_fresh`]'s doc comment).
+    ///
+    /// `HttpCache::update_body` only bumps `cached_at`, never `ttl_secs` — so the
+    /// patch self-expires on the roster endpoint's own TTL and re-syncs with
+    /// truth on its own, rather than being a sticky override that could mask a
+    /// real divergence forever. No-ops if nothing is cached yet (the next real
+    /// read fetches fresh and gets the truth anyway).
+    pub async fn patch_cached_rosters(
+        &self,
+        league_id: &str,
+        mutate: impl FnOnce(&mut Vec<Roster>),
+    ) -> Result<()> {
+        let url = format!("{}/league/{league_id}/rosters", self.base_url);
+        let Some((cached, _)) = self.cache.get("GET", &url).await? else {
+            return Ok(());
+        };
+        let mut rosters: Vec<Roster> = serde_json::from_str(&cached.body)?;
+        mutate(&mut rosters);
+        let body = serde_json::to_string(&rosters)?;
+        self.cache.update_body("GET", &url, &body).await
+    }
+
     pub async fn get_league_users(&self, league_id: &str) -> Result<Vec<User>> {
         let v = self.get_json(&format!("/league/{league_id}/users")).await?;
         Ok(serde_json::from_value(v)?)
@@ -549,4 +576,52 @@ fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<String> {
     let i = s.find(start)? + start.len();
     let j = s[i..].find(end)?;
     Some(s[i..i + j].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_client(name: &str) -> SleeperClient {
+        let data_dir = crate::test_support::unique_temp_path(&format!("sleeper_client_{name}"));
+        let config = Config { data_dir, ..Config::default() };
+        SleeperClient::new(&config).await.expect("build client (no network at construction)")
+    }
+
+    #[tokio::test]
+    async fn patch_cached_rosters_should_apply_mutation_when_an_entry_is_already_cached() {
+        let client = test_client("patch_hit").await;
+        let league_id = "league1";
+        let url = format!("{}/league/{league_id}/rosters", client.base_url);
+        let seeded = serde_json::to_string(&vec![Roster {
+            roster_id: 5,
+            owner_id: Some("u1".to_string()),
+            league_id: league_id.to_string(),
+            players: vec!["100".to_string()],
+            starters: vec!["100".to_string()],
+            reserve: Vec::new(),
+            taxi: None,
+            settings: RosterSettings::default(),
+        }])
+        .unwrap();
+        client.cache.set("GET", &url, 200, &seeded, None, None, Some(300)).await.unwrap();
+
+        client.patch_cached_rosters(league_id, |rosters| rosters[0].starters[0] = "900".to_string())
+            .await
+            .unwrap();
+
+        let (cached, _) = client.cache.get("GET", &url).await.unwrap().unwrap();
+        let rosters: Vec<Roster> = serde_json::from_str(&cached.body).unwrap();
+        assert_eq!(rosters[0].starters, vec!["900".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn patch_cached_rosters_should_no_op_when_nothing_is_cached_yet() {
+        let client = test_client("patch_miss").await;
+        // Must not panic/error just because the mutation never runs.
+        client
+            .patch_cached_rosters("league1", |_rosters| panic!("mutate must not be called"))
+            .await
+            .unwrap();
+    }
 }
