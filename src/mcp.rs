@@ -223,6 +223,20 @@ struct PendingWaiversParams {
     roster_id: i64,
 }
 
+/// Read-only: transaction history served from the unified cache
+/// (Epic 2.1/2.2's `read_through`), refreshing live only when a row's
+/// status/age genuinely warrants it — never on a fixed interval. Not a
+/// write action.
+#[derive(Deserialize, JsonSchema)]
+struct TransactionHistoryParams {
+    league_id: String,
+    /// Restrict to one kind (`waiver`, `trade`, `free_agent`); omitted returns all three.
+    kind_filter: Option<String>,
+    /// Explicit cache tolerance in seconds; omitted uses the Tuesday-window-aware
+    /// default per row's status (ux.md §7). `0` forces a live refresh.
+    max_age_secs: Option<i64>,
+}
+
 /// LIVE WRITE ACTION: swaps a bench player into a started slot against
 /// sleeper.com through the stealth-browser backend (plan.md
 /// undetected-chromedriver-rust, Story 4.1) on the operator's own persisted,
@@ -562,6 +576,31 @@ impl SleeperMcpServer {
                 .await
                 .map_err(err)?;
         ok(serde_json::json!({ "league_id": p.league_id, "roster_id": p.roster_id, "pending_waivers": txns }))
+    }
+
+    #[tool(description = "Read-only: transaction history for a league (waiver claims, trades, free-agent adds) served from the local unified cache, refreshing live only when a row's status/age genuinely warrants it (a pending claim inside the league's Tuesday waiver-processing window, or a never-synced league) rather than on a fixed interval. Returns structured JSON per row, including `source` (\"rest\" or \"graphql\") and `fetched_at` (when this tool's own cache last wrote the row) — never a formatted sentence. Omit `max_age_secs` to use this per-row default; pass `max_age_secs: 0` to force a live refresh.")]
+    async fn get_transaction_history(
+        &self,
+        #[tool(aggr)] p: TransactionHistoryParams,
+    ) -> Result<CallToolResult, McpError> {
+        let league = self.svc.client.get_league(&p.league_id).await.map_err(err)?;
+        let (waiver_day_of_week, daily_waivers) =
+            crate::cli::browser::transactions::waiver_window_fields(&league);
+        let rows = crate::cli::browser::transactions::transactions_for_display(
+            &self.config,
+            &self.svc,
+            &p.league_id,
+            p.kind_filter.as_deref(),
+            p.max_age_secs,
+            false, // no separate "force" param at this surface — max_age_secs: 0 does the same job
+            waiver_day_of_week,
+            daily_waivers,
+        )
+        .await
+        .map_err(err)?;
+        let transactions: Vec<serde_json::Value> =
+            rows.iter().map(crate::cli::browser::transactions::transaction_to_json).collect();
+        ok(serde_json::json!({ "league_id": p.league_id, "transactions": transactions }))
     }
 }
 

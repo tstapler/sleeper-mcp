@@ -81,13 +81,36 @@ pub enum Commands {
         limit: usize,
     },
 
-    /// Show transactions for a week
-    Transactions {
+    /// Show transactions for a week (REST-only — never shows a pending
+    /// claim's status/bid; see `transactions` for the cache-backed command
+    /// that does)
+    #[command(name = "transactions-week")]
+    TransactionsWeek {
         league_id: String,
         #[arg(short, long)]
         week: i32,
         #[arg(short, long)]
         kind: Option<String>,
+    },
+
+    /// Epic 2.3 / Story 2.3.1: transaction history read through the unified
+    /// cache (`cli::browser::transactions::read_through`) — triggers a live
+    /// browser refresh only when a row's status/age genuinely warrants it,
+    /// never on a fixed interval. Unlike `transactions-week`, this also
+    /// surfaces `pending` claims and their FAAB bids.
+    Transactions {
+        #[arg(long)]
+        league: String,
+        /// Restrict to one kind (`waiver`, `trade`, `free_agent`); omitted returns all three.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Explicit cache tolerance in seconds; omitted uses the Tuesday-window-aware
+        /// default per row's status (ux.md §7).
+        #[arg(long = "max-age-secs")]
+        max_age_secs: Option<i64>,
+        /// Force a live refresh regardless of cache age or status.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show roster details for a team
@@ -312,7 +335,7 @@ impl Commands {
             | Commands::Matchups { league_id, .. }
             | Commands::Waivers { league_id, .. }
             | Commands::Lineup { league_id, .. }
-            | Commands::Transactions { league_id, .. }
+            | Commands::TransactionsWeek { league_id, .. }
             | Commands::Roster { league_id, .. }
             | Commands::Analyze { league_id, .. }
             | Commands::Available { league_id, .. }
@@ -323,6 +346,7 @@ impl Commands {
             | Commands::LeagueInfo { league_id }
             | Commands::LeagueSnapshot { league_id }
             | Commands::Sync { league_id, .. } => Some(league_id),
+            Commands::Transactions { league, .. } => Some(league),
             _ => None,
         }
     }
@@ -371,8 +395,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             roster_cmds::cmd_search(&svc, &query, position.as_deref(), limit).await?
         }
 
-        Commands::Transactions { league_id, week, kind } => {
+        Commands::TransactionsWeek { league_id, week, kind } => {
             roster_cmds::cmd_transactions(&svc, &league_id, week, kind.as_deref()).await?
+        }
+
+        Commands::Transactions { league, kind, max_age_secs, force } => {
+            browser::transactions::cmd_transactions(&config, &svc, &league, kind.as_deref(), max_age_secs, force)
+                .await?
         }
 
         Commands::Roster { league_id, roster_id } => {

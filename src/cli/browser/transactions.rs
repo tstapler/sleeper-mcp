@@ -25,9 +25,11 @@ use crate::browser::BrowserSession;
 use crate::config::Config;
 use crate::db::{CachedTransaction, StatsDb, TransactionRow, TransactionSyncRun};
 use crate::error::Result;
+use crate::models::League;
 
 use super::login::{
-    debug_detail, launch_failure_error, launch_session, triage_error, LaunchOptions,
+    debug_detail, exit_on_action_error, launch_failure_error, launch_session, triage_error,
+    LaunchOptions,
 };
 use super::pending::{parse_league_transactions, LeagueTransaction};
 
@@ -444,29 +446,244 @@ pub(crate) async fn read_through(
     } else {
         "stale_per_tolerance"
     };
-    let _span = tracing::info_span!(
+    let span = tracing::info_span!(
         "transactions.read_through",
         %league_id,
         ?kind_filter,
         outcome,
-    )
-    .entered();
-
-    match populator_for(kind_filter) {
-        Populator::Rest => {
-            // free_agent only: REST's existing data is already sufficient
-            // (see the decision table above), scoped to every week synced
-            // so far this season, same range `cmd_sync` uses.
-            let nfl_state = analysis.client.get_nfl_state().await?;
-            let weeks: Vec<i32> = (1..=nfl_state.week.max(1)).collect();
-            analysis.sync_transaction_history(league_id, &weeks).await?;
+    );
+    // `.instrument(span)` rather than `span.entered()`: the latter's guard
+    // (`EnteredSpan`) isn't `Send` and this function now also runs behind
+    // the MCP `#[tool]` macro's `tool_box`, which requires every tool
+    // future to be `Send` end to end — holding a non-`Send` guard across
+    // the `.await` points below broke that the moment a real caller
+    // (Epic 2.3's `get_transaction_history`) first reached this function
+    // through the MCP surface rather than only the CLI's single-threaded
+    // dispatch.
+    use tracing::Instrument;
+    async {
+        match populator_for(kind_filter) {
+            Populator::Rest => {
+                // free_agent only: REST's existing data is already
+                // sufficient (see the decision table above), scoped to
+                // every week synced so far this season, same range
+                // `cmd_sync` uses.
+                let nfl_state = analysis.client.get_nfl_state().await?;
+                let weeks: Vec<i32> = (1..=nfl_state.week.max(1)).collect();
+                analysis.sync_transaction_history(league_id, &weeks).await?;
+            }
+            Populator::Browser => {
+                run_league_transactions_sync(config, analysis, league_id).await?;
+            }
         }
-        Populator::Browser => {
-            run_league_transactions_sync(config, analysis, league_id).await?;
-        }
+        Ok::<(), crate::error::Error>(())
     }
+    .instrument(span)
+    .await?;
 
     analysis.db.list_transactions(league_id, kind_filter).await
+}
+
+// ---------------------------------------------------------------------------
+// Epic 2.3: CLI/MCP surface for unified cache reads
+// ---------------------------------------------------------------------------
+
+/// Extracts the two league-settings fields [`default_tolerance_for`] needs.
+/// Sleeper models them as untyped settings, so they ride in
+/// `LeagueSettings::extra`'s `#[serde(flatten)]` catch-all (`models.rs:25-36`),
+/// not as named fields. `daily_waivers` arrives as a JSON `0`/`1` integer in
+/// practice (confirmed by research/ux.md's own `daily_waivers: 0` sample),
+/// not a JSON bool, so both representations are accepted. Falls back to
+/// Sleeper's documented default (weekly waivers, processed Tuesday) when a
+/// league's settings haven't been synced at all yet.
+pub(crate) fn waiver_window_fields(league: &League) -> (u8, bool) {
+    let waiver_day_of_week =
+        league.settings.extra.get("waiver_day_of_week").and_then(|v| v.as_u64()).unwrap_or(2) as u8;
+    let daily_waivers = league
+        .settings
+        .extra
+        .get("daily_waivers")
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_i64().unwrap_or(0) != 0))
+        .unwrap_or(false);
+    (waiver_day_of_week, daily_waivers)
+}
+
+/// Task 2.3.1a/2.3.2a: the tolerance a caller gets when it supplies no
+/// explicit `max_age_secs`/`force`. Always evaluates [`default_tolerance_for`]
+/// against `"pending"`, never a per-row status loop — because
+/// [`needs_refresh`] already bypasses whatever tolerance a *terminal* row is
+/// given (its `is_terminal_status` short-circuit above, with no exception
+/// even for `force_refresh`), so `pending` is the only status for which this
+/// value actually changes `read_through`'s behavior.
+// kibitzer:ignore flag-argument -- `force` is the CLI's `--force` flag
+// passed straight through (ux.md Surface 1: "--force forces AlwaysLive"),
+// same rationale as `read_through`'s own `force_refresh` ignore above.
+fn resolve_display_tolerance(
+    max_age_secs: Option<i64>,
+    force: bool,
+    now: chrono::DateTime<chrono::Utc>,
+    waiver_day_of_week: u8,
+    daily_waivers: bool,
+) -> StalenessTolerance {
+    if force {
+        return StalenessTolerance::AlwaysLive;
+    }
+    match max_age_secs {
+        Some(secs) => StalenessTolerance::MaxAge(chrono::Duration::seconds(secs)),
+        None => default_tolerance_for("pending", now, waiver_day_of_week, daily_waivers),
+    }
+}
+
+/// Task 2.3.1a/2.3.2a shared core: both the CLI `sleeper transactions`
+/// command and the MCP `get_transaction_history` tool call this directly, so
+/// neither surface duplicates tolerance resolution or ordering. Takes
+/// `waiver_day_of_week`/`daily_waivers` as plain args rather than fetching
+/// them itself, because the two callers get them from different places (CLI:
+/// the already-`maybe_sync`'d local `StatsDb`; MCP: a live `get_league` call,
+/// since the MCP server has no auto-sync step) — mirroring
+/// `persist_league_transactions`'s existing already-fetched-context pattern,
+/// which keeps this function testable against a temp `StatsDb` with zero
+/// network/browser calls whenever the cache is already warm enough.
+///
+/// Rows come back newest-first (ux.md Surface 1 AC) — `list_transactions`
+/// itself orders `created ASC`, so this reverses it rather than duplicating
+/// a sort.
+// kibitzer:ignore long-parameter-list -- mirrors `read_through`'s own
+// ignore just above: each param is independent, already-resolved context
+// (two CLI/MCP-supplied overrides, two already-fetched league-settings
+// fields) that both call sites already have on hand; a config struct would
+// add a layer of indirection without reducing what either caller supplies.
+pub(crate) async fn transactions_for_display(
+    config: &Config,
+    analysis: &AnalysisService,
+    league_id: &str,
+    kind_filter: Option<&str>,
+    max_age_secs: Option<i64>,
+    force: bool,
+    waiver_day_of_week: u8,
+    daily_waivers: bool,
+) -> Result<Vec<CachedTransaction>> {
+    let now = chrono::Utc::now();
+    let tolerance = resolve_display_tolerance(max_age_secs, force, now, waiver_day_of_week, daily_waivers);
+    let mut rows = read_through(config, analysis, league_id, kind_filter, tolerance, force).await?;
+    rows.reverse();
+    Ok(rows)
+}
+
+/// Flattens one `adds`/`drops` JSON array (the `resolve_side`-enriched shape:
+/// `{player_id, name, position, roster_id, owner}` per entry, `roster.rs:24-41`)
+/// into display strings. Only `name`/`position` are shown — unlike
+/// `PendingTransaction::render()`'s `(POS - TEAM)`, this enriched shape
+/// carries the owning roster, not the player's NFL team, so there's no team
+/// to show.
+fn display_side_names(side: &serde_json::Value) -> Vec<String> {
+    side.as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|p| {
+                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let pos = p.get("position").and_then(|v| v.as_str()).unwrap_or("?");
+                    format!("{name} ({pos})")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Task 2.3.1a: `render()` for a unified-cache row, matching
+/// `PendingTransaction::render()`'s compact one-line convention
+/// (`pending.rs:33-43`) field-for-field — status, kind, leg, adds (bid),
+/// drops — modulo the adds/drops formatting difference noted on
+/// [`display_side_names`].
+pub(crate) trait RenderTransaction {
+    fn render(&self) -> String;
+}
+
+impl RenderTransaction for CachedTransaction {
+    fn render(&self) -> String {
+        let adds = display_side_names(&self.adds);
+        let drops = display_side_names(&self.drops);
+        let adds = if adds.is_empty() { "—".to_string() } else { adds.join(", ") };
+        let drops = if drops.is_empty() { "none".to_string() } else { drops.join(", ") };
+        let status = self.status.as_deref().unwrap_or("unknown");
+        match self.waiver_bid {
+            Some(bid) => {
+                format!("[{status}] {} leg {} — add {adds} (bid ${bid}), drop {drops}", self.kind, self.week)
+            }
+            None => format!("[{status}] {} leg {} — add {adds}, drop {drops}", self.kind, self.week),
+        }
+    }
+}
+
+/// ux.md Surface 1's exact empty-state string (matches `pending.rs`'s `no
+/// pending waiver claims` convention) — factored out as a pure function,
+/// independent of `println!`, so it's unit-testable without capturing
+/// stdout.
+pub(crate) fn render_transactions(rows: &[CachedTransaction]) -> String {
+    if rows.is_empty() {
+        return "no cached transactions".to_string();
+    }
+    rows.iter().map(RenderTransaction::render).collect::<Vec<_>>().join("\n")
+}
+
+/// Task 2.3.2a: one row's MCP JSON shape — carries `source`/`fetched_at`
+/// per ux.md §1's structured-not-prose requirement, never a formatted
+/// sentence. `fetched_at` is this tool's own cache-write clock (RFC3339);
+/// `status_updated` is the distinct raw GraphQL epoch field for when Sleeper
+/// itself last changed the status (ux.md Surface 2's "Clock note") — kept
+/// as two separate fields rather than collapsed into one.
+pub(crate) fn transaction_to_json(t: &CachedTransaction) -> serde_json::Value {
+    serde_json::json!({
+        "transaction_id": t.transaction_id,
+        "kind": t.kind,
+        "status": t.status,
+        "leg": t.week,
+        "waiver_bid": t.waiver_bid,
+        "adds": display_side_names(&t.adds),
+        "drops": display_side_names(&t.drops),
+        "source": t.source,
+        "fetched_at": t.fetched_at.to_rfc3339(),
+        "status_updated": t.status_updated,
+    })
+}
+
+/// Task 2.3.1a core: `sleeper transactions` — resolves tolerance, reads
+/// through the cache, prints every row via `render()` or the empty-state
+/// string, newest-leg-first. Mirrors `cmd_pending_waivers`'s triage-on-error
+/// convention (`pending.rs:258-272`) exactly.
+// kibitzer:ignore long-parameter-list -- each param is an independent CLI
+// flag/handle the `sleeper transactions` call site already has; same
+// rationale as `transactions_for_display`'s own ignore above.
+pub(crate) async fn cmd_transactions(
+    config: &Config,
+    analysis: &AnalysisService,
+    league_id: &str,
+    kind_filter: Option<&str>,
+    max_age_secs: Option<i64>,
+    force: bool,
+) -> Result<()> {
+    let (waiver_day_of_week, daily_waivers) = match analysis.db.get_league(league_id).await? {
+        Some(league) => waiver_window_fields(&league),
+        None => (2, false), // never synced yet — Sleeper's documented default (Tuesday, weekly)
+    };
+    match transactions_for_display(
+        config,
+        analysis,
+        league_id,
+        kind_filter,
+        max_age_secs,
+        force,
+        waiver_day_of_week,
+        daily_waivers,
+    )
+    .await
+    {
+        Ok(rows) => {
+            println!("{}", render_transactions(&rows));
+            Ok(())
+        }
+        Err(e) => exit_on_action_error(e),
+    }
 }
 
 #[cfg(test)]
@@ -953,5 +1170,244 @@ mod tests {
             .await
             .expect("CachedOnly on an empty cache must not error");
         assert!(result.is_empty(), "expected no cached rows, got {result:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // Epic 2.3 / Story 2.3.1 + 2.3.2: CLI/MCP shared-core tests.
+    // -------------------------------------------------------------------
+
+    use super::{
+        render_transactions, resolve_display_tolerance, transaction_to_json, transactions_for_display,
+        waiver_window_fields, RenderTransaction,
+    };
+    use crate::db::TransactionRow;
+    use crate::models::League;
+
+    /// Deliberately outside Sleeper's real `0..=6` weekday range so
+    /// `is_waiver_day` can never match whatever real-world weekday `cargo
+    /// test` happens to run on — the tolerance tests need a day that's
+    /// provably *not* the league's waiver day, without hardcoding a date.
+    const NEVER_WAIVER_DAY: u8 = 9;
+
+    /// Builds a fixture `League` whose `settings` is exactly `extra` (plus
+    /// the two `LeagueSettings` fields with no `#[serde(default)]` filled
+    /// in as explicit `null`, since serde treats a genuinely-missing field
+    /// as an error, not an implicit `None`, even for `Option<T>`).
+    fn league_with_extra(extra: serde_json::Value) -> League {
+        let mut settings = extra.as_object().cloned().unwrap_or_default();
+        settings.entry("playoff_teams".to_string()).or_insert(serde_json::Value::Null);
+        settings.entry("draft_rounds".to_string()).or_insert(serde_json::Value::Null);
+        serde_json::from_value(serde_json::json!({
+            "league_id": LEAGUE_ID,
+            "name": "test league",
+            "season": "2026",
+            "status": "in_season",
+            "sport": "nfl",
+            "settings": serde_json::Value::Object(settings),
+            "total_rosters": 10,
+            "draft_id": null,
+            "avatar": null,
+            "scoring_settings": null,
+            "roster_positions": [],
+        }))
+        .expect("construct fixture League")
+    }
+
+    #[test]
+    fn waiver_window_fields_should_read_integer_daily_waivers_flag() {
+        let league = league_with_extra(serde_json::json!({"waiver_day_of_week": 2, "daily_waivers": 0}));
+        assert_eq!(waiver_window_fields(&league), (2, false));
+
+        let league = league_with_extra(serde_json::json!({"waiver_day_of_week": 3, "daily_waivers": 1}));
+        assert_eq!(waiver_window_fields(&league), (3, true));
+    }
+
+    #[test]
+    fn waiver_window_fields_should_read_boolean_daily_waivers_flag() {
+        let league = league_with_extra(serde_json::json!({"waiver_day_of_week": 4, "daily_waivers": true}));
+        assert_eq!(waiver_window_fields(&league), (4, true));
+    }
+
+    #[test]
+    fn waiver_window_fields_should_default_to_tuesday_weekly_when_settings_missing() {
+        let league = league_with_extra(serde_json::json!({}));
+        assert_eq!(waiver_window_fields(&league), (2, false));
+    }
+
+    #[test]
+    fn resolve_display_tolerance_should_return_always_live_when_forced_even_with_explicit_max_age() {
+        let now = dt("2026-11-10T12:00:00Z");
+        assert_eq!(resolve_display_tolerance(Some(3600), true, now, 2, false), StalenessTolerance::AlwaysLive);
+    }
+
+    #[test]
+    fn resolve_display_tolerance_should_return_max_age_when_explicit_seconds_supplied() {
+        let now = dt("2026-11-10T12:00:00Z");
+        assert_eq!(
+            resolve_display_tolerance(Some(3600), false, now, 2, false),
+            StalenessTolerance::MaxAge(chrono::Duration::seconds(3600))
+        );
+    }
+
+    /// When nothing explicit is supplied, the resolved tolerance must agree
+    /// with `default_tolerance_for("pending", ...)` exactly — this is the
+    /// one status whose tolerance value `needs_refresh` actually consults
+    /// (see `resolve_display_tolerance`'s doc comment).
+    #[test]
+    fn resolve_display_tolerance_should_match_default_tolerance_for_pending_when_nothing_explicit() {
+        let tuesday = dt("2026-11-10T12:00:00Z");
+        assert_eq!(
+            resolve_display_tolerance(None, false, tuesday, 2, false),
+            default_tolerance_for("pending", tuesday, 2, false),
+        );
+        assert_eq!(resolve_display_tolerance(None, false, tuesday, 2, false), StalenessTolerance::AlwaysLive);
+    }
+
+    #[test]
+    fn render_transactions_should_print_exact_empty_state_string_when_no_rows() {
+        assert_eq!(render_transactions(&[]), "no cached transactions");
+    }
+
+    // kibitzer:ignore long-parameter-list -- test fixture builder; each
+    // param is an independent field the calling test wants to vary, same
+    // rationale as this file's other test-only fixtures (e.g. `entry()`).
+    fn cached_row_with(
+        id: &str,
+        kind: &str,
+        status: &str,
+        week: i32,
+        waiver_bid: Option<i64>,
+        adds: serde_json::Value,
+        drops: serde_json::Value,
+    ) -> CachedTransaction {
+        CachedTransaction {
+            transaction_id: id.to_string(),
+            season: "2026".to_string(),
+            week,
+            kind: kind.to_string(),
+            status: Some(status.to_string()),
+            created: 1_781_000_000,
+            adds,
+            drops,
+            roster_ids: serde_json::json!([5]),
+            waiver_bid,
+            fetched_at: chrono::Utc::now(),
+            status_updated: Some(1_781_850_000),
+            source: Some("graphql".to_string()),
+        }
+    }
+
+    /// `render()`'s shape must match `PendingTransaction::render()`'s
+    /// (`pending.rs:33-43`) field-for-field, modulo the documented
+    /// adds/drops formatting difference.
+    #[test]
+    fn render_should_match_pending_transaction_shape_when_bid_present() {
+        let brissett = serde_json::json!(
+            [{"player_id":"3257","name":"Jacoby Brissett","position":"QB","roster_id":5,"owner":"Tyler"}]
+        );
+        let row = cached_row_with("1", "waiver", "pending", 9, Some(78), brissett, serde_json::json!([]));
+        assert_eq!(row.render(), "[pending] waiver leg 9 — add Jacoby Brissett (QB) (bid $78), drop none");
+    }
+
+    #[test]
+    fn transaction_to_json_should_carry_source_and_fetched_at_fields_when_cache_warm() {
+        let row = cached_row_with("1", "waiver", "pending", 9, Some(78), serde_json::json!([]), serde_json::json!([]));
+        let json = transaction_to_json(&row);
+        assert_eq!(json["source"], serde_json::json!("graphql"));
+        assert_eq!(json["leg"], serde_json::json!(9));
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(json["fetched_at"].as_str().expect("fetched_at must be a string"))
+                .is_ok(),
+            "fetched_at must be RFC3339, got {json}"
+        );
+    }
+
+    /// Story 2.3.1 AC, happy path: a warm cache — one `pending` row within
+    /// its `MaxAge` tolerance, one terminal row `needs_refresh` always
+    /// bypasses regardless of tolerance — is served entirely from the DB,
+    /// newest-leg-first, with zero live calls. Proven the same way Epic
+    /// 2.1's own `read_through_should_return_empty_with_no_live_call_when_cached_only_and_cache_is_empty`
+    /// test proves it: this sandbox has no Chrome, so an attempted browser
+    /// launch would surface as an `Err` (`launch_failure_error`), never
+    /// silently succeed — `Ok` with both rows back is itself the proof no
+    /// launch was attempted (the literal `FakeSession::eval_calls()` spy
+    /// the task asked for isn't reachable at this layer: `run_league_
+    /// transactions_sync` has no injectable session seam, the same
+    /// pre-existing gap this file's own module doc comment already notes
+    /// for `run_pending_transactions`/`run_claim`).
+    #[tokio::test]
+    // kibitzer:ignore long-function -- two DB seed calls plus the
+    // assertions proving each (count, order, rendered content); splitting
+    // the seeding into its own helper would just move the length, not
+    // reduce what this one test has to set up and check.
+    async fn transactions_for_display_should_return_every_row_with_no_live_call_when_cache_warm_and_within_tolerance(
+    ) {
+        let (config, analysis) = test_analysis_service("display_warm_cache").await;
+
+        let empty = serde_json::json!([]);
+        let brissett = serde_json::json!(
+            [{"player_id":"3257","name":"Jacoby Brissett","position":"QB","roster_id":5,"owner":"Tyler"}]
+        );
+        let roster_ids = serde_json::json!([5]);
+
+        analysis
+            .db
+            .upsert_transaction(TransactionRow {
+                transaction_id: "1",
+                league_id: LEAGUE_ID,
+                season: "2026",
+                week: 9,
+                kind: "waiver",
+                status: Some("pending"),
+                created: 1_781_000_000,
+                adds: &brissett,
+                drops: &empty,
+                roster_ids: &roster_ids,
+                waiver_bid: Some(78),
+                status_updated: Some(1_781_850_000),
+                source: "graphql",
+            })
+            .await
+            .expect("seed pending row");
+        analysis
+            .db
+            .upsert_transaction(TransactionRow {
+                transaction_id: "2",
+                league_id: LEAGUE_ID,
+                season: "2026",
+                week: 8,
+                kind: "waiver",
+                status: Some("complete"),
+                created: 1_780_000_000,
+                adds: &empty,
+                drops: &empty,
+                roster_ids: &roster_ids,
+                waiver_bid: Some(12),
+                status_updated: Some(1_780_500_000),
+                source: "graphql",
+            })
+            .await
+            .expect("seed complete row");
+
+        let rows = transactions_for_display(
+            &config,
+            &analysis,
+            LEAGUE_ID,
+            None,
+            None,  // no explicit --max-age-secs
+            false, // no --force
+            NEVER_WAIVER_DAY,
+            false,
+        )
+        .await
+        .expect("a warm, within-tolerance cache must not attempt a live call");
+
+        assert_eq!(rows.len(), 2, "both cached rows must be returned, got {rows:?}");
+        assert_eq!(rows[0].transaction_id, "1", "newest-created row must come first");
+        assert_eq!(rows[1].transaction_id, "2");
+
+        let rendered = render_transactions(&rows);
+        assert!(rendered.contains("Jacoby Brissett") && rendered.contains("$78"), "got {rendered}");
+        assert!(rendered.contains("[complete]"), "got {rendered}");
     }
 }
