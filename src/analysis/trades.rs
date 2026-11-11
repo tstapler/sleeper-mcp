@@ -7,8 +7,84 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::models::Roster;
 
-use super::dynasty::enrich_player_full;
+use super::dynasty::{enrich_player, enrich_player_full};
 use super::{best_cached_season, AnalysisService};
+
+/// Median FantasyCalc value within each `dynasty_tier` bucket (1-4), computed
+/// fresh from the live FantasyCalc dataset itself rather than hardcoded
+/// constants that would drift as the market moves. Used as the heuristic
+/// value for a player FantasyCalc doesn't cover — not an IDP-specific
+/// branch: any uncovered player (IDP, or an obscure offensive player) falls
+/// back the same way, keyed only on which tier their own age/experience/
+/// position curve already places them in.
+fn tier_value_medians(all_values: &[Value], all_players: &HashMap<String, Value>) -> HashMap<i64, f64> {
+    let mut by_tier: HashMap<i64, Vec<f64>> = HashMap::new();
+    for v in all_values {
+        let Some(sleeper_id) = v["player"]["sleeperId"].as_str() else { continue };
+        let Some(value) = v["value"].as_f64() else { continue };
+        let tier = enrich_player(sleeper_id, all_players)["dynasty_tier"].as_i64().unwrap_or(4);
+        by_tier.entry(tier).or_default().push(value);
+    }
+    by_tier
+        .into_iter()
+        .map(|(tier, mut values)| {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (tier, values[values.len() / 2])
+        })
+        .collect()
+}
+
+/// Nearest tier (searching outward, cheaper first) that actually has a
+/// median — guards the rare case a tier bucket comes up empty (e.g. a thin
+/// FantasyCalc snapshot), rather than silently returning no value at all.
+fn nearest_tier_median(medians: &HashMap<i64, f64>, tier: i64) -> Option<f64> {
+    (0..4).find_map(|offset| {
+        medians.get(&(tier + offset)).or_else(|| medians.get(&(tier - offset))).copied()
+    })
+}
+
+/// One player's row in `trade_value_check`'s output: a real FantasyCalc
+/// price when it has one, else the tier-median heuristic (see
+/// `tier_value_medians`'s doc comment for why — no source prices IDP).
+fn summarize_trade_value(
+    pid: &str,
+    all_players: &HashMap<String, Value>,
+    by_sleeper_id: &HashMap<&str, &Value>,
+    tier_medians: &HashMap<i64, f64>,
+) -> serde_json::Value {
+    let name = all_players
+        .get(pid)
+        .and_then(|p| p.get("full_name"))
+        .and_then(Value::as_str)
+        .unwrap_or(pid);
+    match by_sleeper_id.get(pid) {
+        Some(v) => serde_json::json!({
+            "player_id": pid,
+            "name": name,
+            "position": v["player"]["position"],
+            "value": v["value"],
+            "value_source": "fantasycalc",
+            "overall_rank": v["overallRank"],
+            "position_rank": v["positionRank"],
+            "found": true,
+        }),
+        None => {
+            let enriched = enrich_player(pid, all_players);
+            let tier = enriched["dynasty_tier"].as_i64().unwrap_or(4);
+            let heuristic_value = nearest_tier_median(tier_medians, tier);
+            serde_json::json!({
+                "player_id": pid,
+                "name": name,
+                "position": enriched["position"],
+                "value": heuristic_value,
+                "value_source": "heuristic_tier_median",
+                "dynasty_tier": tier,
+                "search_rank": enriched["search_rank"],
+                "found": false,
+            })
+        }
+    }
+}
 
 impl AnalysisService {
     // -----------------------------------------------------------------------
@@ -80,8 +156,13 @@ impl AnalysisService {
     /// players. Auto-derives numQbs/ppr from the league's actual settings so values match its
     /// format (e.g. superflex leagues value QBs much higher than 1-QB leagues).
     ///
-    /// IDP is not covered by FantasyCalc — requested IDP players come back with `found: false`
-    /// and a `null` value; fall back to `dynasty_tier`/`search_rank` reasoning for those.
+    /// No major dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut — all checked
+    /// directly) prices IDP players at all; there is no market-consensus number to fall back
+    /// to. For any player FantasyCalc doesn't cover (IDP, or an obscure offensive player),
+    /// `value` is instead this project's own heuristic: the median FantasyCalc value of
+    /// offensive players sharing that player's `dynasty_tier`, computed live from the same
+    /// fetch rather than hardcoded. `found: false` still means "not in FantasyCalc's own
+    /// dataset" — `value_source` distinguishes a real market price from this estimate.
     pub async fn trade_value_check(
         &self,
         league_id: &str,
@@ -96,6 +177,7 @@ impl AnalysisService {
             .get_trade_values(true, num_qbs, 12, ppr)
             .await?;
         let all_players = self.client.get_all_players("nfl").await?;
+        let tier_medians = tier_value_medians(&all_values, &all_players);
 
         let by_sleeper_id: HashMap<&str, &Value> = all_values
             .iter()
@@ -105,28 +187,7 @@ impl AnalysisService {
         let players: Vec<_> = player_ids
             .iter()
             .map(|pid| {
-                let name = all_players
-                    .get(pid)
-                    .and_then(|p| p.get("full_name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(pid);
-                match by_sleeper_id.get(pid.as_str()) {
-                    Some(v) => serde_json::json!({
-                        "player_id": pid,
-                        "name": name,
-                        "position": v["player"]["position"],
-                        "value": v["value"],
-                        "overall_rank": v["overallRank"],
-                        "position_rank": v["positionRank"],
-                        "found": true,
-                    }),
-                    None => serde_json::json!({
-                        "player_id": pid,
-                        "name": name,
-                        "value": null,
-                        "found": false,
-                    }),
-                }
+                summarize_trade_value(pid, &all_players, &by_sleeper_id, &tier_medians)
             })
             .collect();
 
@@ -135,7 +196,9 @@ impl AnalysisService {
             "is_dynasty": true,
             "num_qbs": num_qbs,
             "ppr": ppr,
-            "note": "IDP players are not covered by FantasyCalc and will show found:false",
+            "note": "value_source \"fantasycalc\" is a real market price; \"heuristic_tier_median\" \
+                     is this project's own estimate (no dynasty value source prices IDP at all) — \
+                     treat it as a rough same-tier comparison, not a market consensus",
             "players": players,
         }))
     }
@@ -401,5 +464,90 @@ impl AnalysisService {
             "my_offerables": my_offerables,
             "trade_proposals": proposals,
         }))
+    }
+}
+
+#[cfg(test)]
+mod idp_heuristic_value_tests {
+    use super::{nearest_tier_median, summarize_trade_value, tier_value_medians};
+    use std::collections::HashMap;
+
+    fn player(name: &str, age: i64, years_exp: i64, team: &str, position: &str, search_rank: i64) -> serde_json::Value {
+        serde_json::json!({
+            "full_name": name, "age": age, "years_exp": years_exp,
+            "team": team, "position": position, "search_rank": search_rank,
+        })
+    }
+
+    fn fantasycalc_entry(sleeper_id: &str, position: &str, value: f64, overall_rank: i64) -> serde_json::Value {
+        serde_json::json!({
+            "player": {"sleeperId": sleeper_id, "position": position},
+            "value": value, "overallRank": overall_rank, "positionRank": 1,
+        })
+    }
+
+    #[test]
+    fn tier_value_medians_should_bucket_offensive_players_by_their_own_dynasty_tier() {
+        let mut all_players = HashMap::new();
+        // Two aging RBs (years_exp high enough to land in tier 4 regardless of age)
+        // land in the same tier bucket as each other, not mixed with a tier-1 rookie.
+        all_players.insert("1".to_string(), player("Old RB", 30, 10, "KC", "RB", 500));
+        all_players.insert("2".to_string(), player("Older RB", 32, 12, "KC", "RB", 600));
+        all_players.insert("3".to_string(), player("Rookie WR", 22, 0, "KC", "WR", 5));
+        let all_values = vec![
+            fantasycalc_entry("1", "RB", 100.0, 200),
+            fantasycalc_entry("2", "RB", 200.0, 150),
+            fantasycalc_entry("3", "WR", 8000.0, 1),
+        ];
+        let medians = tier_value_medians(&all_values, &all_players);
+        // Both tier-4 RBs' median must come from each other, not the tier-1 rookie.
+        let tier4 = medians.get(&4).copied().expect("tier 4 bucket populated");
+        assert!(
+            (90.0..=200.0).contains(&tier4),
+            "tier-4 median should sit between the two tier-4 values, got {tier4}"
+        );
+        assert_eq!(medians.get(&1).copied(), Some(8000.0), "tier-1 bucket must not blend with tier 4");
+    }
+
+    #[test]
+    fn nearest_tier_median_should_fall_back_to_the_closest_populated_tier() {
+        let mut medians = HashMap::new();
+        medians.insert(2, 500.0);
+        // Tier 3 has no data at all — must fall back to the nearest tier (2), not vanish.
+        assert_eq!(nearest_tier_median(&medians, 3), Some(500.0));
+        assert_eq!(nearest_tier_median(&medians, 7), None, "no tier within range should return None, not panic");
+    }
+
+    #[test]
+    fn summarize_trade_value_should_give_an_idp_player_a_heuristic_value_not_null() {
+        let mut all_players = HashMap::new();
+        // IDP player: FantasyCalc has no entry for them at all.
+        all_players.insert("idp1".to_string(), player("Sample LB", 26, 5, "KC", "LB", 166));
+        all_players.insert("1".to_string(), player("Old RB", 30, 10, "KC", "RB", 500));
+        let all_values = vec![fantasycalc_entry("1", "RB", 150.0, 200)];
+        let by_sleeper_id: HashMap<&str, &serde_json::Value> =
+            all_values.iter().map(|v| (v["player"]["sleeperId"].as_str().unwrap(), v)).collect();
+        let tier_medians = tier_value_medians(&all_values, &all_players);
+
+        let row = summarize_trade_value("idp1", &all_players, &by_sleeper_id, &tier_medians);
+        assert_eq!(row["found"], false, "IDP player is still not in FantasyCalc's own dataset");
+        assert_eq!(row["value_source"], "heuristic_tier_median");
+        assert!(!row["value"].is_null(), "IDP player must get a usable value, not null, got {row}");
+        assert_eq!(row["value"], 150.0, "a lone tier-4 RB's value becomes the tier-4 median the LB shares");
+    }
+
+    #[test]
+    fn summarize_trade_value_should_use_the_real_fantasycalc_price_when_found() {
+        let mut all_players = HashMap::new();
+        all_players.insert("1".to_string(), player("Found RB", 25, 3, "KC", "RB", 50));
+        let all_values = vec![fantasycalc_entry("1", "RB", 777.0, 10)];
+        let by_sleeper_id: HashMap<&str, &serde_json::Value> =
+            all_values.iter().map(|v| (v["player"]["sleeperId"].as_str().unwrap(), v)).collect();
+        let tier_medians = tier_value_medians(&all_values, &all_players);
+
+        let row = summarize_trade_value("1", &all_players, &by_sleeper_id, &tier_medians);
+        assert_eq!(row["found"], true);
+        assert_eq!(row["value_source"], "fantasycalc");
+        assert_eq!(row["value"], 777.0, "a found player's value must be FantasyCalc's own number, not the heuristic");
     }
 }

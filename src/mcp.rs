@@ -499,7 +499,7 @@ impl SleeperMcpServer {
         ).await.map_err(err)?)
     }
 
-    #[tool(description = "Look up real dynasty trade values (FantasyCalc, market-consensus) for a list of Sleeper player IDs — pass both sides of a proposed trade in one call to compare. Values auto-adjust for the league's actual superflex/PPR settings. Does NOT cover IDP players (they return found:false) — use dynasty_tier/search_rank reasoning for those instead.")]
+    #[tool(description = "Look up real dynasty trade values (FantasyCalc, market-consensus) for a list of Sleeper player IDs — pass both sides of a proposed trade in one call to compare. Values auto-adjust for the league's actual superflex/PPR settings. No dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut) prices IDP players — for a player not in FantasyCalc's own dataset (found:false), value is instead this project's own heuristic (value_source:heuristic_tier_median): the median FantasyCalc value of offensive players sharing that player's dynasty_tier. Check value_source per player — a heuristic estimate, not a market price.")]
     async fn get_trade_value(
         &self,
         #[tool(aggr)] p: TradeValueParams,
