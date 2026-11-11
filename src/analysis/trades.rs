@@ -35,6 +35,63 @@ fn tier_value_medians(all_values: &[Value], all_players: &HashMap<String, Value>
         .collect()
 }
 
+/// How many times more real-production value one side of a `find_win_win_trades`
+/// proposal can receive than it gives, in ppg, before the proposal is dropped as
+/// unrealistic. 2.5x comfortably allows a real "sell declining value for a better
+/// starter" swap (e.g. ~1.5x in the Kittle/Kelce-for-Diggs/Deebo case) while
+/// rejecting a near-total giveaway (observed ratios on the two rejected trades
+/// were ~8x and effectively infinite — see `ppg_imbalance_ratio`'s doc comment).
+const PPG_IMBALANCE_THRESHOLD: f64 = 2.5;
+
+/// A position already has enough total roster depth that acquiring more there
+/// has no practical benefit, regardless of tier-1/2 "keeper" count — e.g. a
+/// roster with 5 TEs has nowhere to put a 6th and 7th no matter how aging
+/// those 5 are. Root-cause fix, 2026-11-11: a real proposal offered a partner
+/// more TEs/QBs they had no use for, since they were "needy" by keeper-tier
+/// count alone while already 5 deep at TE and 3 deep at QB in total spots.
+fn position_has_redundant_depth(total_rostered: usize, league_avg_total: f64) -> bool {
+    const REDUNDANCY_FACTOR: f64 = 1.25;
+    (total_rostered as f64) >= league_avg_total * REDUNDANCY_FACTOR
+}
+
+/// Whether the real-production (ppg) value changing hands is too lopsided for
+/// either side to plausibly accept, independent of `dynasty_tier` — a tier
+/// label spans both "declining ex-stud still a weekly starter" (e.g. Courtland
+/// Sutton, Travis Kelce) and "has no real role" (e.g. a QB4 with zero games
+/// played) in the same bucket, so tier arithmetic alone can't tell a fair swap
+/// from a one-sided giveaway. `give`/`receive` are each side's summed recent
+/// ppg across the players changing hands. Returns `None` when reasonably
+/// balanced, `Some(ratio)` (always >= 1, whichever side has more) when one
+/// side's real value is at least `threshold`x the other's — including the
+/// degenerate case of giving away real production for a player with ~0 ppg,
+/// which is maximally lopsided regardless of the raw ratio.
+fn ppg_imbalance_ratio(give: f64, receive: f64, threshold: f64) -> Option<f64> {
+    let (lo, hi) = if give <= receive { (give, receive) } else { (receive, give) };
+    if lo <= 0.01 {
+        return if hi > 0.01 { Some(f64::INFINITY) } else { None };
+    }
+    let ratio = hi / lo;
+    if ratio >= threshold { Some(ratio) } else { None }
+}
+
+/// Short human-readable injury notes for any player (on either side of a
+/// proposal) carrying a non-null `injury_status` — surfaced directly on the
+/// proposal rather than left buried in each player's full JSON, so a
+/// specifically-injured piece (e.g. a WR out weeks on a hamstring, still
+/// unconfirmed to return) isn't missed on a quick read. This doesn't replace
+/// grounding a real trade in a live injury-report search (this project's own
+/// recommendation-discipline policy still applies) — it just makes sure the
+/// signal this tool already has isn't silently dropped.
+fn injury_risk_notes<'a>(players: impl Iterator<Item = &'a serde_json::Value>) -> Vec<String> {
+    players
+        .filter_map(|p| {
+            let status = p["injury_status"].as_str()?;
+            let name = p["name"].as_str().unwrap_or("?");
+            Some(format!("{name} — {status}"))
+        })
+        .collect()
+}
+
 /// Nearest tier (searching outward, cheaper first) that actually has a
 /// median — guards the rare case a tier bucket comes up empty (e.g. a thin
 /// FantasyCalc snapshot), rather than silently returning no value at all.
@@ -264,10 +321,23 @@ impl AnalysisService {
     ///
     /// Logic:
     ///   - Build a positional need/surplus profile for every team.
-    ///   - "Need" = fewer than ideal keepers (tier ≤2) at a position.
+    ///   - "Need" = fewer than ideal keepers (tier ≤2) at a position, UNLESS the
+    ///     roster already carries above-average total depth there (see
+    ///     [`position_has_redundant_depth`]) — a team can be "keeper-thin" at a
+    ///     position while already holding 5 bench bodies at it, and more of that
+    ///     position helps them not at all.
     ///   - "Can offer" = tier 3/4 players at positions they don't need depth.
     ///   - Win-win pair: I have what they need AND they have what I need.
-    ///   - Score = sum of dynasty tier improvement on each side.
+    ///   - Score = sum of dynasty tier improvement on each side, but a proposal
+    ///     is dropped entirely if the real-production (ppg) value changing
+    ///     hands is too lopsided for either side to plausibly accept — see
+    ///     [`ppg_imbalance_ratio`]. Root-cause fix, 2026-11-11: three
+    ///     algorithmically-generated proposals turned out to be unrealistic on
+    ///     manual review (a partner flagged "needy" at a position they already
+    ///     had 5 deep, and two trades that gave away a real weekly starter for
+    ///     a roster-filler scrap) — `dynasty_tier` alone can't distinguish
+    ///     "declining ex-stud still a starter" from "no real role," so it was
+    ///     scoring both the same.
     pub async fn find_win_win_trades(
         &self,
         league_id: &str,
@@ -283,15 +353,15 @@ impl AnalysisService {
             .map(|u| (u.user_id.clone(), u.display_name.clone()))
             .collect();
 
-        let count_keepers = |roster: &Roster| -> HashMap<String, usize> {
-            let mut keepers_by_pos: HashMap<String, usize> = HashMap::new();
+        let count_by_pos = |roster: &Roster, min_tier: i64| -> HashMap<String, usize> {
+            let mut by_pos: HashMap<String, usize> = HashMap::new();
             for pid in &roster.players {
                 let p = enrich_player_full(pid, &all_players, &stats_ctx);
-                if p["dynasty_tier"].as_i64().unwrap_or(4) <= 2 {
-                    *keepers_by_pos.entry(p["position"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+                if p["dynasty_tier"].as_i64().unwrap_or(4) <= min_tier {
+                    *by_pos.entry(p["position"].as_str().unwrap_or("?").to_string()).or_default() += 1;
                 }
             }
-            keepers_by_pos
+            by_pos
         };
 
         // League-average tier-1/2 depth per position, used as the "need" baseline instead
@@ -301,7 +371,7 @@ impl AnalysisService {
         // leagues) or always triggers (shallow ones).
         const NEED_POSITIONS: &[&str] = &["QB", "RB", "WR", "TE"];
         let all_keeper_counts: Vec<HashMap<String, usize>> =
-            rosters.iter().map(&count_keepers).collect();
+            rosters.iter().map(|r| count_by_pos(r, 2)).collect();
         let league_avg: HashMap<&str, f64> = NEED_POSITIONS
             .iter()
             .map(|pos| {
@@ -310,17 +380,38 @@ impl AnalysisService {
             })
             .collect();
 
+        // League-average TOTAL (any tier) depth per position — the redundancy check
+        // below needs this separately from `league_avg`, since a roster can be
+        // keeper-thin and roster-spot-full at the same position simultaneously (the
+        // galphonse case: tier<=2 "keeper" count low at TE, but 5 TEs rostered total).
+        let all_total_counts: Vec<HashMap<String, usize>> =
+            rosters.iter().map(|r| count_by_pos(r, 4)).collect();
+        let league_avg_total: HashMap<&str, f64> = NEED_POSITIONS
+            .iter()
+            .map(|pos| {
+                let total: usize = all_total_counts.iter().map(|m| m.get(*pos).copied().unwrap_or(0)).sum();
+                (*pos, total as f64 / rosters.len().max(1) as f64)
+            })
+            .collect();
+
         // For each roster, build:
-        //   needs:    positions meaningfully below the league-average keeper depth
+        //   needs:    positions meaningfully below the league-average keeper depth,
+        //             and not already redundantly deep in total roster spots
         //   offerables: tier 3/4 players (this roster's own trade bait)
         let profile_roster = |roster: &Roster| -> (Vec<String>, Vec<serde_json::Value>) {
-            let keepers_by_pos = count_keepers(roster);
+            let keepers_by_pos = count_by_pos(roster, 2);
+            let total_by_pos = count_by_pos(roster, 4);
             let needs: Vec<String> = NEED_POSITIONS
                 .iter()
                 .filter_map(|pos| {
                     let have = keepers_by_pos.get(*pos).copied().unwrap_or(0);
                     let threshold = (league_avg[pos] * 0.75).floor().max(1.0) as usize;
-                    if have < threshold { Some(pos.to_string()) } else { None }
+                    let total = total_by_pos.get(*pos).copied().unwrap_or(0);
+                    if have < threshold && !position_has_redundant_depth(total, league_avg_total[pos]) {
+                        Some(pos.to_string())
+                    } else {
+                        None
+                    }
                 })
                 .collect();
 
@@ -474,6 +565,17 @@ impl AnalysisService {
             let they_give_top: Vec<_> = they_give_sorted.into_iter().take(3).collect();
             let i_give_top: Vec<_> = i_give_sorted.into_iter().take(3).collect();
 
+            // Real-production value check, independent of dynasty_tier (root-cause
+            // fix, 2026-11-11 — see this fn's doc comment): drop any proposal where
+            // one side's actual recent ppg given away dwarfs the other's. Tier alone
+            // called a Tyrod-Taylor-for-Courtland-Sutton swap and a
+            // Kamara/Pollard/Hill-for-two-non-contributors swap both "win-win."
+            let give_ppg: f64 = i_give_top.iter().map(|p| p["ppg"].as_f64().unwrap_or(0.0)).sum();
+            let receive_ppg: f64 = they_give_top.iter().map(|p| p["ppg"].as_f64().unwrap_or(0.0)).sum();
+            if ppg_imbalance_ratio(give_ppg, receive_ppg, PPG_IMBALANCE_THRESHOLD).is_some() {
+                continue;
+            }
+
             let my_needs_filled: Vec<_> = they_give_top
                 .iter()
                 .map(|p| p["position"].as_str().unwrap_or("?"))
@@ -482,6 +584,9 @@ impl AnalysisService {
                 .iter()
                 .map(|p| p["position"].as_str().unwrap_or("?"))
                 .collect();
+
+            let risk_notes =
+                injury_risk_notes(i_give_top.iter().copied().chain(they_give_top.iter().copied()));
 
             proposals.push(serde_json::json!({
                 "kind": "need_match",
@@ -492,6 +597,9 @@ impl AnalysisService {
                 "their_needs": their_needs,
                 "you_give": i_give_top,
                 "you_receive": they_give_top,
+                "ppg_given": give_ppg,
+                "ppg_received": receive_ppg,
+                "risk_notes": risk_notes,
                 "summary": format!(
                     "Give {} {} → fills their {:?} need. Receive {} {} → fills your {:?} need.",
                     i_give_top.first().and_then(|p| p["name"].as_str()).unwrap_or("?"),
@@ -602,5 +710,54 @@ mod idp_heuristic_value_tests {
         assert_eq!(row["found"], true);
         assert_eq!(row["value_source"], "fantasycalc");
         assert_eq!(row["value"], 777.0, "a found player's value must be FantasyCalc's own number, not the heuristic");
+    }
+}
+
+#[cfg(test)]
+mod win_win_trade_guard_tests {
+    use super::{injury_risk_notes, position_has_redundant_depth, ppg_imbalance_ratio};
+
+    #[test]
+    fn position_has_redundant_depth_should_be_false_when_total_rostered_is_at_league_average() {
+        assert!(!position_has_redundant_depth(4, 4.0));
+    }
+
+    #[test]
+    fn position_has_redundant_depth_should_be_true_when_total_rostered_is_well_above_average() {
+        // galphonse's real TE count (5) vs. a modest league average (3.5) — the
+        // exact shape of the bug this guards against.
+        assert!(position_has_redundant_depth(5, 3.5));
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_return_none_when_reasonably_balanced() {
+        // The Kittle+Kelce+Taylor-for-Deebo+Diggs case: ~1.47x, inside the 2.5x bar.
+        assert_eq!(ppg_imbalance_ratio(19.4, 28.6, 2.5), None);
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_flag_a_near_total_giveaway() {
+        // The Taylor-for-Sutton case: give away 0 ppg, receive a real producer.
+        assert_eq!(ppg_imbalance_ratio(0.0, 10.55, 2.5), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_flag_a_lopsided_real_production_gap() {
+        // The Kamara+Pollard+Hill-for-Raymond+Hollins case: ~8x, well past the bar.
+        let ratio = ppg_imbalance_ratio(21.05, 2.6, 2.5).expect("must flag as lopsided");
+        assert!((ratio - 8.096).abs() < 0.01);
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_return_none_when_both_sides_are_zero() {
+        assert_eq!(ppg_imbalance_ratio(0.0, 0.0, 2.5), None);
+    }
+
+    #[test]
+    fn injury_risk_notes_should_include_only_players_with_a_non_null_injury_status() {
+        let healthy = serde_json::json!({"name": "Healthy Guy", "injury_status": null});
+        let hurt = serde_json::json!({"name": "Deebo Samuel Sr.", "injury_status": "Questionable"});
+        let notes = injury_risk_notes([&healthy, &hurt].into_iter());
+        assert_eq!(notes, vec!["Deebo Samuel Sr. — Questionable".to_string()]);
     }
 }
