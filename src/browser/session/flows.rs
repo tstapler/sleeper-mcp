@@ -43,6 +43,52 @@ mod lineup_selectors {
     pub const VALID_TARGET_ROW: &str = ".team-roster-item.valid";
 }
 
+/// Team roster page's own display convention: first-initial + last name
+/// ("Mike Evans" -> "M Evans", "DK Metcalf" -> "D Metcalf" — the first
+/// *character*, not the whole first token, since some players' resolved
+/// first names are already multi-letter abbreviations). A resolved name
+/// with no space (single-token) is returned unchanged — nothing to split.
+fn roster_row_display_name(full_name: &str) -> String {
+    let mut parts = full_name.split_whitespace();
+    let Some(first) = parts.next() else { return full_name.to_string() };
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return full_name.to_string();
+    }
+    let initial = first.chars().next().map(|c| c.to_string()).unwrap_or_default();
+    format!("{initial} {}", rest.join(" "))
+}
+
+#[cfg(test)]
+mod roster_row_display_name_tests {
+    use super::roster_row_display_name;
+
+    #[test]
+    fn roster_row_display_name_should_abbreviate_first_name_to_initial() {
+        assert_eq!(roster_row_display_name("Mike Evans"), "M Evans");
+        assert_eq!(roster_row_display_name("Alvin Kamara"), "A Kamara");
+        assert_eq!(roster_row_display_name("Tyler Allgeier"), "T Allgeier");
+    }
+
+    #[test]
+    fn roster_row_display_name_should_use_first_character_when_first_name_is_already_abbreviated() {
+        // "DK Metcalf" is the resolved display name itself (DK Metcalf's
+        // real Sleeper full_name), not a derived initial — confirmed live
+        // the roster row still truncates to the first *character* only.
+        assert_eq!(roster_row_display_name("DK Metcalf"), "D Metcalf");
+    }
+
+    #[test]
+    fn roster_row_display_name_should_preserve_multi_word_last_names_and_suffixes() {
+        assert_eq!(roster_row_display_name("KC Concepcion Jr."), "K Concepcion Jr.");
+    }
+
+    #[test]
+    fn roster_row_display_name_should_return_unchanged_when_single_token() {
+        assert_eq!(roster_row_display_name("BAL"), "BAL");
+    }
+}
+
 /// Story 3.2 seam-side claim flow, live-verified 2026-09-11 (plan.md Epic 3,
 /// Story 3.1 selector bundle). `player_name`/`drop_player_name` are the
 /// resolved Sleeper display names (callers resolve player_id -> full_name
@@ -116,15 +162,59 @@ pub async fn lineup_set_via_seam(
 
     session.goto(&format!("https://sleeper.com/leagues/{league_id}/team")).await?;
     session.wait_for_selector(ROSTER_ROW, 10_000).await?;
+    // The team roster page renders names as first-initial + last name (e.g.
+    // "Mike Evans" -> "M Evans"), unlike the add/claim modal's search list —
+    // confirmed live 2026-11-10 by dumping `.team-roster-item` textContent.
+    // Matching the full first name here never finds a row.
+    let out_needle = roster_row_display_name(out_player_name);
+    let in_needle = roster_row_display_name(in_player_name);
     // Enter select mode: click the currently-started player's position link.
-    session.click_in_row(ROSTER_ROW, out_player_name, ROW_LINK).await?;
+    session.click_in_row(ROSTER_ROW, &out_needle, ROW_LINK).await?;
     // Only an eligible bench row carries `.valid` — an ineligible in_player
     // simply won't match here, failing closed instead of clicking the wrong row.
     session.wait_for_selector(VALID_TARGET_ROW, 5_000).await?;
 
     let confirm = tracing::info_span!("lineup.confirm", out = out_player_name, r#in = in_player_name);
     let _enter_confirm = confirm.enter();
-    session.click_in_row(VALID_TARGET_ROW, in_player_name, ROW_LINK).await?;
+    session.click_in_row(VALID_TARGET_ROW, &in_needle, ROW_LINK).await?;
+
+    // The swap is a client-side React state change — the confirming click
+    // returns before Sleeper's debounced auto-save network call completes.
+    // Closing the session immediately after (the pre-fix behavior) raced
+    // that save and silently discarded it: confirmed live 2026-11-10 by
+    // re-navigating a fresh session right after a "successful" run and
+    // finding the roster unchanged. Poll the target row's own slot-square
+    // text (not the concatenated row text, which has no stable separator)
+    // until it reads a real starting slot rather than "BN", instead of a
+    // blind sleep — this also catches a swap that silently didn't take.
+    let verify_js = format!(
+        r#"(function(){{
+            const needle = {in_needle_json};
+            const row = Array.from(document.querySelectorAll('.team-roster-item'))
+                .find(e => e.textContent && e.textContent.includes(needle));
+            if (!row) return 'MISSING';
+            const slotEl = row.querySelector('.league-slot-position-square > div');
+            const slot = slotEl ? slotEl.textContent.trim() : '';
+            return slot;
+        }})()"#,
+        in_needle_json = serde_json::to_string(&in_needle).map_err(other)?
+    );
+    let mut verified = false;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let slot = session.eval_string(&verify_js).await?;
+        if slot != "BN" && slot != "MISSING" {
+            verified = true;
+            break;
+        }
+    }
+    if !verified {
+        return Err(other(
+            "lineup swap click succeeded but the target player's slot never left the bench \
+             — the save likely did not persist; re-run `sleeper browser status` and verify \
+             the live lineup by hand before retrying",
+        ));
+    }
     tracing::info!("lineup saved");
     Ok(())
 }
