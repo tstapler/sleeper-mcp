@@ -1,3 +1,7 @@
+// kibitzer:ignore file-size -- every MCP tool/params-struct pair lives here
+// by established convention (one surface, one file); Epic 3.2's addition
+// (one params struct, one tool method, two tests) is the same grain as
+// every existing entry, not a new module's worth of code.
 /// MCP server tools exposing Sleeper analytics via the rmcp stdio transport.
 use std::sync::Arc;
 
@@ -251,6 +255,18 @@ struct LineupSetParams {
     out_player_id: String,
     /// Sleeper player_id of the bench player to start in their place.
     in_player_id: String,
+}
+
+/// Read-only: Epic 3.1's five-signal FAAB bid-projection model ("what
+/// should I bid"). Never launches a browser — pure analysis over
+/// already-cached data.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BidProjectionParams {
+    league_id: String,
+    /// Sleeper player_id of the waiver target.
+    player_id: String,
+    /// Your numeric Sleeper roster_id in this league.
+    roster_id: i64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -602,6 +618,14 @@ impl SleeperMcpServer {
             rows.iter().map(crate::cli::browser::transactions::transaction_to_json).collect();
         ok(serde_json::json!({ "league_id": p.league_id, "transactions": transactions }))
     }
+
+    #[tool(description = "FAAB bid-projection: the five-signal model (perceived value, league demand, this league's own bid history, target-roster claim frequency, FAAB remaining) for \"what should I bid\" on a waiver target. Returns the full BidProjection object verbatim — every signal and its sample size/confidence, never a single opaque score or a pre-rendered sentence — so the caller can defend the number rather than re-derive it. Reads cached signals only; never launches a browser.")]
+    async fn project_waiver_bid(
+        &self,
+        #[tool(aggr)] p: BidProjectionParams,
+    ) -> Result<CallToolResult, McpError> {
+        ok(self.svc.project_waiver_bid(&p.league_id, &p.player_id, p.roster_id).await.map_err(err)?)
+    }
 }
 
 #[tool(tool_box)]
@@ -617,5 +641,124 @@ impl ServerHandler for SleeperMcpServer {
             },
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::bid_projection::{
+        BidHistorySignal, BidProjection, ClaimFrequencySignal, CoverageConfidence, FaabRemaining,
+        LeagueDemandSignal, PerceivedValueSignal,
+    };
+    use std::collections::BTreeMap;
+
+    /// Hand-built `BidProjection`, matching ux.md §4's sample shape.
+    /// `project_waiver_bid` itself wraps `AnalysisService::project_waiver_bid`
+    /// — a REST-fetching wrapper (bid_projection.rs's own testability note)
+    /// this sandbox has no network for — so this proves the one
+    /// network-independent part of that tool: `ok::<BidProjection>`'s
+    /// serialization, the exact call this tool's body makes.
+    // kibitzer:ignore long-function -- one flat struct literal, one field
+    // per line (test fixture, same shape as bid_projection.rs's own
+    // `sample_projection`); splitting it would only move the field count
+    // around, not reduce it.
+    fn sample_projection() -> BidProjection {
+        // kibitzer:ignore duplicate-code-cross-file -- a private per-module
+        // `#[cfg(test)]` fixture, same as bid_projection.rs's own
+        // `sample_projection`/dynasty_cmds.rs's copy; each module's test
+        // code is its own compilation unit, and a shared `pub(crate)`
+        // test-fixtures module is out of this task's file scope
+        // (src/cli/mod.rs, src/cli/dynasty_cmds.rs, this file).
+        BidProjection {
+            player_id: "3257".to_string(),
+            roster_id: 5,
+            perceived_value: PerceivedValueSignal {
+                player_id: "3257".to_string(),
+                position: "QB".to_string(),
+                dynasty_tier: 2,
+                search_rank: Some(48),
+            },
+            league_demand: LeagueDemandSignal {
+                position: "QB".to_string(),
+                pull_by_roster: BTreeMap::from([(5, 0), (9, 2)]),
+            },
+            bid_history: BidHistorySignal {
+                mean_winning_bid: 22.0,
+                sample_size: 11,
+                position: "QB".to_string(),
+            },
+            claim_frequency: ClaimFrequencySignal {
+                roster_id: 5,
+                claims_this_season: 6,
+                position: Some("QB".to_string()),
+            },
+            faab_remaining: FaabRemaining {
+                amount: 142,
+                confidence: CoverageConfidence::Verified { as_of: chrono::Utc::now() },
+            },
+            competing_roster_faab: vec![(
+                9,
+                FaabRemaining {
+                    amount: 34,
+                    confidence: CoverageConfidence::Verified { as_of: chrono::Utc::now() },
+                },
+            )],
+            suggested_bid: 23,
+            suggested_bid_pct_of_remaining: 23.0 / 142.0,
+            low_confidence: false,
+        }
+    }
+
+    /// Story 3.2.2 AC: the JSON result must carry every `BidProjection`
+    /// field, never the pre-rendered `render_short()` string (ux.md §2 —
+    /// "don't hide the breakdown from the assistant that might need to
+    /// defend the number").
+    #[test]
+    fn project_waiver_bid_tool_should_return_full_structured_object_when_called_via_mcp() {
+        let projection = sample_projection();
+        let short_line = projection.render_short();
+
+        let result = ok(projection).expect("serializing a BidProjection must succeed");
+        let text = result.content[0]
+            .as_text()
+            .expect("tool result must carry a text content block")
+            .text
+            .clone();
+        let json: serde_json::Value = serde_json::from_str(&text).expect("content must be valid JSON");
+
+        for field in [
+            "player_id",
+            "roster_id",
+            "perceived_value",
+            "league_demand",
+            "bid_history",
+            "claim_frequency",
+            "faab_remaining",
+            "competing_roster_faab",
+            "suggested_bid",
+            "suggested_bid_pct_of_remaining",
+            "low_confidence",
+        ] {
+            assert!(json.get(field).is_some(), "missing field `{field}` in {json}");
+        }
+        assert_ne!(
+            text, short_line,
+            "the MCP tool must never return the pre-rendered short-line string"
+        );
+    }
+
+    /// Story 3.2.2 AC, error path: a missing required `player_id` must fail
+    /// parameter deserialization — the same mechanism `#[tool(aggr)]` uses
+    /// to build `p` before the tool body (and any DB/analysis call) runs —
+    /// never reach `AnalysisService::project_waiver_bid`.
+    #[test]
+    fn bid_projection_params_should_fail_deserialization_when_player_id_param_missing() {
+        let value = serde_json::json!({ "league_id": "1352883872131481600", "roster_id": 5 });
+        let result: std::result::Result<BidProjectionParams, _> = serde_json::from_value(value);
+        assert!(
+            result.is_err(),
+            "missing player_id must be a validation Err before any DB/analysis call, got {result:?}"
+        );
     }
 }

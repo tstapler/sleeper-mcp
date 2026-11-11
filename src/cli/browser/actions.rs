@@ -46,6 +46,12 @@ pub(crate) async fn cmd_waiver(config: &Config, client: &SleeperClient, action: 
         WaiverAction::Pending { league, roster } => {
             super::pending::cmd_pending_waivers(config, &league, roster).await
         }
+        // Epic 3.2: intercepted in `cli::run` before dispatch reaches this
+        // function — bid-projection is pure AnalysisService analysis, not a
+        // browser action, and this function only has `client`, not `svc`.
+        WaiverAction::BidProjection { .. } => {
+            unreachable!("BidProjection is handled in cli::run before reaching cmd_waiver")
+        }
     }
 }
 

@@ -315,6 +315,22 @@ pub enum WaiverAction {
         #[arg(long)]
         roster: i64,
     },
+    /// Epic 3.2 / Story 3.2.1: FAAB bid-projection ("what should I bid") —
+    /// pure analysis over already-cached data (Epic 3.1's five-signal
+    /// model); never launches a browser. Default output is the one-line
+    /// `render_short()`; `--full` prints the full structured object.
+    BidProjection {
+        #[arg(long)]
+        league: String,
+        #[arg(long)]
+        player: String,
+        #[arg(long)]
+        roster: i64,
+        /// Print the full structured object (drill-down) instead of the
+        /// default one-line render.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 /// Resolve a username/display_name/user_id/numeric string to a roster_id.
@@ -456,6 +472,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Browser { action } => browser::cmd_browser(&config, action).await?,
+
+        // BidProjection is pure analysis over AnalysisService (`svc`), unlike
+        // Claim/Pending which run through the browser backend — intercepted
+        // here rather than threaded into `browser::cmd_waiver`, which only
+        // has `client`, not `svc`.
+        Commands::Waiver { action: WaiverAction::BidProjection { league, player, roster, full } } => {
+            dynasty_cmds::cmd_waiver_bid_projection(&svc, &league, &player, roster, full).await?
+        }
 
         Commands::Waiver { action } => browser::cmd_waiver(&config, &client, action).await?,
 

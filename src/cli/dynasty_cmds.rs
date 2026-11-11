@@ -2,7 +2,7 @@
 //! the win-win trade finder's table rendering.
 use console::style;
 
-use crate::analysis::AnalysisService;
+use crate::analysis::{AnalysisService, BidProjection};
 use crate::error::Result;
 
 pub(super) async fn cmd_dynasty(svc: &AnalysisService, league_id: &str, roster_id: i32) -> Result<()> {
@@ -155,6 +155,136 @@ pub(super) async fn cmd_dynasty_scout(
         );
     }
     Ok(())
+}
+
+/// Task 3.2.1a core: the string `sleeper waiver bid-projection` prints for a
+/// given `BidProjection` — pulled out as a pure function (no I/O) so both
+/// the default short-line and `--full` JSON shapes are unit-testable
+/// without a network call. `project_waiver_bid` itself (the REST-fetching
+/// wrapper that produces the `BidProjection`) is the one untestable-without-
+/// network leg, same split bid_projection.rs's own testability note
+/// describes for `project_waiver_bid`/`project_waiver_bid_with`.
+// kibitzer:ignore flag-argument -- `full` is the CLI's own `--full` flag
+// passed straight through (ux.md §3: default short line vs. full object),
+// same rationale as transactions.rs's `force`/`force_refresh` ignores.
+fn render_bid_projection(projection: &BidProjection, full: bool) -> Result<String> {
+    if full {
+        Ok(serde_json::to_string_pretty(projection)?)
+    } else {
+        Ok(projection.render_short())
+    }
+}
+
+/// Task 3.2.1a: `sleeper waiver bid-projection` — prints `BidProjection`'s
+/// one-line `render_short()` by default; `--full` prints the full
+/// structured object instead, never a second, differently-worded prose
+/// summary (ux.md §3's AC).
+pub(super) async fn cmd_waiver_bid_projection(
+    svc: &AnalysisService,
+    league_id: &str,
+    player_id: &str,
+    roster_id: i64,
+    full: bool,
+) -> Result<()> {
+    let projection = svc.project_waiver_bid(league_id, player_id, roster_id).await?;
+    println!("{}", render_bid_projection(&projection, full)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod bid_projection_cmd_tests {
+    use super::*;
+    use crate::analysis::bid_projection::{
+        BidHistorySignal, ClaimFrequencySignal, CoverageConfidence, FaabRemaining, LeagueDemandSignal,
+        PerceivedValueSignal,
+    };
+    use std::collections::BTreeMap;
+
+    fn sample_projection() -> BidProjection {
+        // kibitzer:ignore duplicate-code-cross-file -- a private per-module
+        // `#[cfg(test)]` fixture, same as bid_projection.rs's own
+        // `sample_projection`/mcp.rs's copy; each module's test code is its
+        // own compilation unit, and a shared `pub(crate)` test-fixtures
+        // module is out of this task's file scope (src/cli/mod.rs, this
+        // file, src/mcp.rs).
+        BidProjection {
+            player_id: "3257".to_string(),
+            roster_id: 5,
+            perceived_value: PerceivedValueSignal {
+                player_id: "3257".to_string(),
+                position: "QB".to_string(),
+                dynasty_tier: 2,
+                search_rank: Some(48),
+            },
+            league_demand: LeagueDemandSignal { position: "QB".to_string(), pull_by_roster: BTreeMap::new() },
+            bid_history: BidHistorySignal { mean_winning_bid: 22.0, sample_size: 11, position: "QB".to_string() },
+            claim_frequency: ClaimFrequencySignal {
+                roster_id: 5,
+                claims_this_season: 6,
+                position: Some("QB".to_string()),
+            },
+            faab_remaining: FaabRemaining {
+                amount: 142,
+                confidence: CoverageConfidence::Verified { as_of: chrono::Utc::now() },
+            },
+            competing_roster_faab: vec![],
+            suggested_bid: 23,
+            suggested_bid_pct_of_remaining: 23.0 / 142.0,
+            low_confidence: false,
+        }
+    }
+
+    /// Story 3.2.1 AC: the default (non-`--full`) output must be exactly
+    /// `render_short()`'s one line — never a second, differently-worded
+    /// summary.
+    #[test]
+    fn cmd_waiver_bid_projection_should_print_short_line_by_default_when_run_against_warm_cache() {
+        let projection = sample_projection();
+        let out = render_bid_projection(&projection, false).expect("render must succeed");
+        assert_eq!(out, projection.render_short());
+        assert!(!out.contains('\n'), "default output must be one line, got: {out}");
+    }
+
+    /// Story 3.2.1 AC: `--full` must print every `BidProjection` field, not
+    /// a second prose summary.
+    #[test]
+    fn cmd_waiver_bid_projection_should_print_every_field_when_full_flag_set() {
+        let projection = sample_projection();
+        let out = render_bid_projection(&projection, true).expect("render must succeed");
+        let json: serde_json::Value = serde_json::from_str(&out).expect("--full output must be valid JSON");
+        for field in [
+            "player_id",
+            "roster_id",
+            "perceived_value",
+            "league_demand",
+            "bid_history",
+            "claim_frequency",
+            "faab_remaining",
+            "competing_roster_faab",
+            "suggested_bid",
+            "suggested_bid_pct_of_remaining",
+            "low_confidence",
+        ] {
+            assert!(json.get(field).is_some(), "missing field `{field}` in {json}");
+        }
+    }
+
+    /// Story 3.2.1 AC: a target roster with zero cached bid history
+    /// (`bid_history.sample_size == 0`, `low_confidence == true`) still
+    /// prints a short line, with the visible caveat marker prepended —
+    /// never a crash or a silently confident number.
+    #[test]
+    fn cmd_waiver_bid_projection_should_print_degraded_signal_note_when_roster_has_zero_cached_history() {
+        let mut projection = sample_projection();
+        projection.bid_history = BidHistorySignal { mean_winning_bid: 0.0, sample_size: 0, position: "QB".to_string() };
+        projection.low_confidence = true;
+
+        let out = render_bid_projection(&projection, false).expect("render must succeed even with zero history");
+        assert!(
+            out.starts_with("low-confidence — suggested bid"),
+            "degraded signal must be a visible caveat marker, got: {out}"
+        );
+    }
 }
 
 pub(super) async fn cmd_find_trades(

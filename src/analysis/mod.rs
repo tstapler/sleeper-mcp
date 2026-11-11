@@ -16,7 +16,12 @@ use crate::db::StatsDb;
 use crate::error::Result;
 use crate::models::*;
 
-mod bid_projection;
+// Epic 3.2: `pub(crate)` (not `pub use`-only) so `mcp.rs`'s test module can
+// name the signal substructs directly to build a `BidProjection` fixture —
+// no `Deserialize` derive exists on these types to build one any other way.
+// Crate-internal only; the public surface is still just `BidProjection`
+// itself, re-exported below.
+pub(crate) mod bid_projection;
 mod dynasty;
 mod lineup;
 mod players;
