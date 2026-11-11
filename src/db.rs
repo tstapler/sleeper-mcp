@@ -54,6 +54,20 @@ pub struct TransactionRow<'a> {
     pub source: &'a str,
 }
 
+/// One row for `StatsDb::record_sync_run` — a ledger entry proving a sync
+/// attempt completed, so `has_full_league_graphql_coverage` can tell "never
+/// synced" apart from "synced via REST only" instead of silently treating
+/// both as a FAAB-remaining floor.
+pub struct TransactionSyncRun<'a> {
+    pub league_id: &'a str,
+    pub season: &'a str,
+    pub source: &'a str,
+    pub roster_scope: &'a str,
+    pub synced_at: chrono::DateTime<chrono::Utc>,
+    pub rows_fetched: i64,
+    pub rows_changed: i64,
+}
+
 /// Row shape returned by `StatsDb::list_transactions` — read from the local
 /// cache only, never triggers an API/browser call.
 #[derive(Debug, Clone)]
@@ -144,7 +158,16 @@ impl StatsDb {
                 fetched_at     TEXT    NOT NULL
             );
             CREATE INDEX IF NOT EXISTS transactions_league_week
-                ON transactions (league_id, season, week);",
+                ON transactions (league_id, season, week);
+            CREATE TABLE IF NOT EXISTS transaction_sync_runs (
+                league_id    TEXT    NOT NULL,
+                season       TEXT    NOT NULL,
+                source       TEXT    NOT NULL,
+                roster_scope TEXT    NOT NULL,
+                synced_at    TEXT    NOT NULL,
+                rows_fetched INTEGER NOT NULL,
+                rows_changed INTEGER NOT NULL
+            );",
         )
         .execute(&pool)
         .await?;
@@ -408,6 +431,53 @@ impl StatsDb {
                 .bind(league_id)
                 .fetch_optional(&self.pool)
                 .await?;
+        Ok(row.and_then(|(s,)| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }))
+    }
+
+    /// Record one completed sync attempt (REST or GraphQL) in the coverage
+    /// ledger. Append-only — every attempt gets a row, so
+    /// `has_full_league_graphql_coverage` can tell "never backfilled" apart
+    /// from "backfilled, just a while ago."
+    pub async fn record_sync_run(&self, row: TransactionSyncRun<'_>) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO transaction_sync_runs
+             (league_id, season, source, roster_scope, synced_at, rows_fetched, rows_changed)
+             VALUES (?,?,?,?,?,?,?)",
+        )
+        .bind(row.league_id)
+        .bind(row.season)
+        .bind(row.source)
+        .bind(row.roster_scope)
+        .bind(row.synced_at.to_rfc3339())
+        .bind(row.rows_fetched)
+        .bind(row.rows_changed)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Most recent `synced_at` among full-league GraphQL backfills for
+    /// `(league_id, season)`, or `None` if only REST/partial rows exist (or
+    /// none at all). Callers use this to label a FAAB-remaining figure a
+    /// verified total rather than a silent floor.
+    pub async fn has_full_league_graphql_coverage(
+        &self,
+        league_id: &str,
+        season: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT synced_at FROM transaction_sync_runs
+             WHERE league_id = ? AND season = ? AND source = 'graphql' AND roster_scope = 'all'
+             ORDER BY synced_at DESC LIMIT 1",
+        )
+        .bind(league_id)
+        .bind(season)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.and_then(|(s,)| {
             chrono::DateTime::parse_from_rfc3339(&s)
                 .ok()
@@ -803,5 +873,112 @@ mod tests {
         let (status, status_updated) = stored_status(&db, "1").await;
         assert_eq!(status, Some("pending".to_string()));
         assert_eq!(status_updated, Some(1_781_850_000));
+    }
+
+    // Epic 1.2 / Story 1.2.1 AC1: a successful sync completion records
+    // exactly one ledger row with the attempt's metadata.
+    #[tokio::test]
+    async fn record_sync_run_should_insert_one_ledger_row_when_sync_completes() {
+        let db = test_db("record_sync_run_single_row").await;
+        let synced_at = chrono::Utc::now();
+
+        db.record_sync_run(TransactionSyncRun {
+            league_id: "1352883872131481600",
+            season: "2026",
+            source: "graphql",
+            roster_scope: "all",
+            synced_at,
+            rows_fetched: 187,
+            rows_changed: 42,
+        })
+        .await
+        .expect("record sync run");
+
+        let rows: Vec<(String, String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT league_id, season, source, roster_scope, rows_fetched, rows_changed
+             FROM transaction_sync_runs",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("query ledger rows");
+
+        assert_eq!(rows.len(), 1);
+        let (league_id, season, source, roster_scope, rows_fetched, rows_changed) = &rows[0];
+        assert_eq!(league_id, "1352883872131481600");
+        assert_eq!(season, "2026");
+        assert_eq!(source, "graphql");
+        assert_eq!(roster_scope, "all");
+        assert_eq!(*rows_fetched, 187);
+        assert_eq!(*rows_changed, 42);
+    }
+
+    // Epic 1.2 / Story 1.2.1 AC2: only source='rest' ledger rows exist for
+    // this (league_id, season) — no full-league GraphQL backfill has ever
+    // completed, so coverage must report None rather than a false positive.
+    #[tokio::test]
+    async fn has_full_league_graphql_coverage_should_return_none_when_only_rest_rows_recorded() {
+        let db = test_db("coverage_none_when_rest_only").await;
+
+        db.record_sync_run(TransactionSyncRun {
+            league_id: "1352883872131481600",
+            season: "2026",
+            source: "rest",
+            roster_scope: "single",
+            synced_at: chrono::Utc::now(),
+            rows_fetched: 20,
+            rows_changed: 3,
+        })
+        .await
+        .expect("record rest sync run");
+
+        let coverage = db
+            .has_full_league_graphql_coverage("1352883872131481600", "2026")
+            .await
+            .expect("query coverage");
+
+        assert_eq!(coverage, None);
+    }
+
+    // Epic 1.2 / Story 1.2.1 AC2 (happy path): a source='graphql',
+    // roster_scope='all' row exists, so coverage returns its synced_at
+    // rather than None.
+    #[tokio::test]
+    async fn has_full_league_graphql_coverage_should_return_synced_at_when_graphql_all_row_exists()
+    {
+        let db = test_db("coverage_some_when_graphql_all").await;
+        let synced_at = chrono::Utc::now();
+
+        db.record_sync_run(TransactionSyncRun {
+            league_id: "1352883872131481600",
+            season: "2026",
+            source: "rest",
+            roster_scope: "single",
+            synced_at: synced_at - chrono::Duration::hours(1),
+            rows_fetched: 20,
+            rows_changed: 3,
+        })
+        .await
+        .expect("record rest sync run");
+        db.record_sync_run(TransactionSyncRun {
+            league_id: "1352883872131481600",
+            season: "2026",
+            source: "graphql",
+            roster_scope: "all",
+            synced_at,
+            rows_fetched: 187,
+            rows_changed: 187,
+        })
+        .await
+        .expect("record graphql sync run");
+
+        let coverage = db
+            .has_full_league_graphql_coverage("1352883872131481600", "2026")
+            .await
+            .expect("query coverage");
+
+        // RFC3339 round-trips through sub-second precision losslessly, so
+        // comparing the parsed DateTime (not a string) avoids a flaky
+        // format mismatch.
+        assert_eq!(coverage, Some(synced_at));
     }
 }
