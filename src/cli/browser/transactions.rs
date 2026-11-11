@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 
 use chrono::Datelike;
+use console::style;
 
 use crate::analysis::{resolve_side, AnalysisService};
 use crate::browser::BrowserSession;
@@ -647,6 +648,31 @@ pub(crate) fn transaction_to_json(t: &CachedTransaction) -> serde_json::Value {
     })
 }
 
+/// ux.md Surface 10's exact copy for the browser-launch progress notice —
+/// printed once, to stderr, dim, only when a live refresh is actually about
+/// to happen (never speculatively, never for a cache-served read).
+const LIVE_CHECK_NOTICE: &str = "Checking live claim status…";
+
+/// Whether `cmd_transactions` should print [`LIVE_CHECK_NOTICE`] before
+/// calling [`transactions_for_display`] — a thin, directly-testable wrapper
+/// over [`needs_refresh`]'s existing refresh decision (same cached rows,
+/// same tolerance, same force flag), so the CLI layer can know *ahead of*
+/// `read_through`'s own internal cache check whether a browser/REST call is
+/// about to happen.
+///
+/// Deliberately not pushed into `read_through`/`transactions_for_display`
+/// themselves: both are shared with the MCP `get_transaction_history` tool
+/// (`mcp.rs:628`), which per ux.md Surface 10's MCP acceptance criterion
+/// must never emit a mid-call progress line — only the CLI command prints.
+fn should_print_live_check_notice(
+    cached: &[CachedTransaction],
+    tolerance: &StalenessTolerance,
+    force_refresh: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    needs_refresh(cached, tolerance, force_refresh, now)
+}
+
 /// Task 2.3.1a core: `sleeper transactions` — resolves tolerance, reads
 /// through the cache, prints every row via `render()` or the empty-state
 /// string, newest-leg-first. Mirrors `cmd_pending_waivers`'s triage-on-error
@@ -654,6 +680,11 @@ pub(crate) fn transaction_to_json(t: &CachedTransaction) -> serde_json::Value {
 // kibitzer:ignore long-parameter-list -- each param is an independent CLI
 // flag/handle the `sleeper transactions` call site already has; same
 // rationale as `transactions_for_display`'s own ignore above.
+// kibitzer:ignore flag-argument -- `force` is the CLI's `--force` flag,
+// threaded straight through to `resolve_display_tolerance`/
+// `should_print_live_check_notice`/`transactions_for_display`, never a
+// branch this function invented itself; same rationale as `read_through`'s
+// own `force_refresh` ignore above.
 pub(crate) async fn cmd_transactions(
     config: &Config,
     analysis: &AnalysisService,
@@ -666,6 +697,17 @@ pub(crate) async fn cmd_transactions(
         Some(league) => waiver_window_fields(&league),
         None => (2, false), // never synced yet — Sleeper's documented default (Tuesday, weekly)
     };
+
+    // Surface 10: know ahead of `read_through`'s own cache check whether
+    // this call is about to launch a browser/REST populator, so the notice
+    // prints before the multi-second wait rather than not at all.
+    let now = chrono::Utc::now();
+    let tolerance = resolve_display_tolerance(max_age_secs, force, now, waiver_day_of_week, daily_waivers);
+    let cached = analysis.db.list_transactions(league_id, kind_filter).await?;
+    if should_print_live_check_notice(&cached, &tolerance, force, now) {
+        eprintln!("{}", style(LIVE_CHECK_NOTICE).dim());
+    }
+
     match transactions_for_display(
         config,
         analysis,
@@ -1409,5 +1451,91 @@ mod tests {
         let rendered = render_transactions(&rows);
         assert!(rendered.contains("Jacoby Brissett") && rendered.contains("$78"), "got {rendered}");
         assert!(rendered.contains("[complete]"), "got {rendered}");
+    }
+
+    // -------------------------------------------------------------------
+    // Fix: ux.md Surface 1/10's browser-launch progress notice —
+    // `cmd_transactions` must print `LIVE_CHECK_NOTICE` to stderr exactly
+    // when a live refresh is about to happen, never for a cache-served
+    // read. The real `eprintln!` call site isn't capturable in-process
+    // without a stderr-capture dependency this repo doesn't have (no
+    // `gag`/`assert_cmd` in `Cargo.toml`), so — per this file's own
+    // established fallback for an I/O path a sandboxed test can't exercise
+    // end-to-end (see `read_through`'s `FakeSession`-gap note above) —
+    // these tests prove the pure decision function `cmd_transactions` gates
+    // the `eprintln!` on, directly.
+    // -------------------------------------------------------------------
+
+    use super::{should_print_live_check_notice, LIVE_CHECK_NOTICE};
+
+    #[test]
+    fn live_check_notice_should_match_ux_md_surface_10_copy_exactly() {
+        assert_eq!(LIVE_CHECK_NOTICE, "Checking live claim status…");
+    }
+
+    /// (a) Cache warm, no live call needed -> nothing is printed.
+    #[test]
+    fn should_print_live_check_notice_should_return_false_when_cache_warm_and_within_tolerance() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("pending", now - chrono::Duration::minutes(5));
+        let tolerance = StalenessTolerance::MaxAge(chrono::Duration::hours(1));
+        assert!(
+            !should_print_live_check_notice(&[row], &tolerance, false, now),
+            "a warm, within-tolerance cache must not trigger the live-check notice"
+        );
+    }
+
+    /// (b) `--force` always triggers a live call -> the notice is printed,
+    /// even against an otherwise-fresh cache.
+    #[test]
+    fn should_print_live_check_notice_should_return_true_when_force_refresh_requested() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("pending", now - chrono::Duration::seconds(1));
+        assert!(
+            should_print_live_check_notice(
+                &[row],
+                &StalenessTolerance::MaxAge(chrono::Duration::hours(1)),
+                true,
+                now
+            ),
+            "--force must always trigger the live-check notice, even on a fresh cache"
+        );
+    }
+
+    /// (b) A cache past its tolerance also triggers a live call -> printed,
+    /// with no explicit `--force` involved.
+    #[test]
+    fn should_print_live_check_notice_should_return_true_when_cache_is_stale_per_tolerance() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("pending", now - chrono::Duration::hours(2));
+        let tolerance = StalenessTolerance::MaxAge(chrono::Duration::hours(1));
+        assert!(
+            should_print_live_check_notice(&[row], &tolerance, false, now),
+            "a stale pending row past its tolerance must trigger the live-check notice"
+        );
+    }
+
+    /// A terminal-status row is cache-valid forever (ux.md §1/§7) — never
+    /// triggers a live call, so never triggers the notice, even under
+    /// `--force`.
+    #[test]
+    fn should_print_live_check_notice_should_return_false_for_terminal_status_even_with_force() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("complete", now - chrono::Duration::days(30));
+        assert!(
+            !should_print_live_check_notice(&[row], &StalenessTolerance::CachedOnly, true, now),
+            "a terminal-status row must never trigger the notice, even under --force"
+        );
+    }
+
+    /// An empty cache (first-ever read) always needs a live backfill ->
+    /// the notice must print rather than staying silent on a cache miss.
+    #[test]
+    fn should_print_live_check_notice_should_return_true_when_cache_is_empty() {
+        let now = dt("2026-11-10T12:00:00Z");
+        assert!(
+            should_print_live_check_notice(&[], &StalenessTolerance::MaxAge(chrono::Duration::hours(1)), false, now),
+            "an empty cache must trigger the live-check notice"
+        );
     }
 }
