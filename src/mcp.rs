@@ -242,6 +242,15 @@ struct PendingWaiversParams {
     roster_id: i64,
 }
 
+/// Read-only: the league's real Trade Block. Discovery (2026-11-11):
+/// Sleeper has no dedicated trade-block query — it's `settings.otb` on the
+/// existing `league_players` GraphQL query, same auth path as pending
+/// waivers above. Not a write action.
+#[derive(Deserialize, JsonSchema)]
+struct TradeBlockParams {
+    league_id: String,
+}
+
 /// Read-only: transaction history served from the unified cache
 /// (Epic 2.1/2.2's `read_through`), refreshing live only when a row's
 /// status/age genuinely warrants it — never on a fixed interval. Not a
@@ -639,6 +648,17 @@ impl SleeperMcpServer {
                 .await
                 .map_err(err)?;
         ok(serde_json::json!({ "league_id": p.league_id, "roster_id": p.roster_id, "pending_waivers": txns }))
+    }
+
+    #[tool(description = "Read-only: every player currently on another manager's Trade Block in this league (player, position, team, which roster flagged them, when). The public REST API exposes no trade-block data at all — this reads through the operator's authenticated browser session, same mechanism as get_pending_waivers. Requires `sleeper browser login` to have been run by hand at least once first. Not a write action — does not propose or accept any trade.")]
+    async fn get_trade_block(
+        &self,
+        #[tool(aggr)] p: TradeBlockParams,
+    ) -> Result<CallToolResult, McpError> {
+        let players = crate::cli::browser::run_trade_block(&self.config, &self.svc, &p.league_id)
+            .await
+            .map_err(err)?;
+        ok(serde_json::json!({ "league_id": p.league_id, "trade_block": players }))
     }
 
     #[tool(description = "Read-only: transaction history for a league (waiver claims, trades, free-agent adds) served from the local unified cache, refreshing live only when a row's status/age genuinely warrants it (a pending claim inside the league's Tuesday waiver-processing window, or a never-synced league) rather than on a fixed interval. Returns structured JSON per row, including `source` (\"rest\" or \"graphql\") and `fetched_at` (when this tool's own cache last wrote the row) — never a formatted sentence. Omit `max_age_secs` to use this per-row default; pass `max_age_secs: 0` to force a live refresh.")]

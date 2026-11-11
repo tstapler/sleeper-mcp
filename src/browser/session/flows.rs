@@ -279,14 +279,7 @@ pub async fn pending_transactions_via_seam(
     let query = format!(
         r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: {league_id_json}, roster_id_filters: [{roster_id}], type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
     );
-    let body = serde_json::json!({
-        "operationName": "league_transactions_filtered",
-        "variables": {},
-        "query": query,
-    })
-    .to_string();
-    let body_json = serde_json::to_string(&body).map_err(other)?;
-    let raw = graphql_post_via_seam(session, &body_json).await?;
+    let raw = post_named_query(session, "league_transactions_filtered", &query).await?;
     tracing::info!("pending_transactions fetched");
     Ok(raw)
 }
@@ -314,6 +307,21 @@ async fn graphql_post_via_seam(session: &dyn BrowserSession, body_json: &str) ->
         }})()"#
     );
     session.eval_string(&js).await
+}
+
+/// Builds the `{operationName, variables: {}, query}` envelope every
+/// caller in this file sends and posts it via [`graphql_post_via_seam`] —
+/// extracted (2026-11-11) once a third caller ([`league_players_via_seam`])
+/// would have repeated the same four lines a third time.
+async fn post_named_query(session: &dyn BrowserSession, operation_name: &str, query: &str) -> Result<String> {
+    let body = serde_json::json!({
+        "operationName": operation_name,
+        "variables": {},
+        "query": query,
+    })
+    .to_string();
+    let body_json = serde_json::to_string(&body).map_err(other)?;
+    graphql_post_via_seam(session, &body_json).await
 }
 
 /// Epic 2.2 / Task 2.2.1a: default `type_filters` for a whole-league
@@ -367,15 +375,39 @@ pub async fn league_transactions_via_seam(
         roster_id_filters,
         LEAGUE_TRANSACTION_TYPE_FILTERS,
     )?;
-    let body = serde_json::json!({
-        "operationName": "league_transactions_filtered",
-        "variables": {},
-        "query": query,
-    })
-    .to_string();
-    let body_json = serde_json::to_string(&body).map_err(other)?;
-    let raw = graphql_post_via_seam(session, &body_json).await?;
+    let raw = post_named_query(session, "league_transactions_filtered", &query).await?;
     tracing::info!("league_transactions fetched");
+    Ok(raw)
+}
+
+/// Root-cause discovery (2026-11-11): Sleeper's in-app Trade Block has no
+/// dedicated query at all. Captured the real GraphQL traffic the `/trades`
+/// page fires on a cold load (an injected `window.fetch`/`XMLHttpRequest`
+/// interceptor installed via `evaluate_on_new_document` so it survives the
+/// navigation) and found the block is just `settings.otb` /
+/// `settings.otb_added_at` on this existing `league_players` query — `otb`
+/// is the roster_id that flagged the player, `otb_added_at` an epoch-ms
+/// timestamp. Same `localStorage`-token-read-entirely-in-page-JS auth path
+/// as every other GraphQL flow in this file — no new auth surface.
+///
+/// Live-verified against this exact league: 21 rows carry an `otb` flag,
+/// but the real `/trades` page only displays 17 of them — the other 4 are
+/// stale (the player has since been traded or dropped) and Sleeper's own
+/// API does **not** filter them out. The caller must cross-reference each
+/// row's `otb` roster_id against that player's actual current roster_id
+/// (from `get_league_rosters`, a public REST call — no second authenticated
+/// fetch needed) to reproduce what the live UI shows, exactly as confirmed
+/// by checking all 21 rows against this league's real current rosters.
+pub async fn league_players_via_seam(session: &dyn BrowserSession, league_id: &str) -> Result<String> {
+    let start = tracing::info_span!("league_players.start", league = league_id);
+    let _enter = start.enter();
+
+    let league_id_json = serde_json::to_string(league_id).map_err(other)?;
+    let query = format!(
+        r#"query league_players {{ league_players(league_id: {league_id_json}) {{ player_id settings }} }}"#
+    );
+    let raw = post_named_query(session, "league_players", &query).await?;
+    tracing::info!("league_players fetched");
     Ok(raw)
 }
 
