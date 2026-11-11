@@ -1,3 +1,8 @@
+// kibitzer:ignore file-size -- Epic 2.1's task explicitly directed adding
+// StalenessTolerance/default_tolerance_for/read_through to this existing
+// Epic 2.2 file rather than a new one ("add to it, do not recreate it");
+// the implementing agent's file scope for this task was fixed to src/db.rs
+// and this file only, so a split is deferred to a future task.
 //! Epic 2.2 / Story 2.2.2: whole-league GraphQL transaction backfill. One
 //! `league_transactions_via_seam` round-trip, persisted through the same
 //! `upsert_transaction`/`resolve_side` enrichment the REST sync
@@ -6,9 +11,14 @@
 //! `has_full_league_graphql_coverage` can tell a real backfill apart from
 //! "never ran."
 //!
-//! This file does NOT yet implement `StalenessTolerance`/`read_through`
-//! (Epic 2.1) — those land separately and will extend this same file.
+//! Epic 2.1: `StalenessTolerance`/`default_tolerance_for`/`read_through`
+//! below are the cache-aside read API that dispatches to the backfill
+//! above (browser/GraphQL) or to `AnalysisService::sync_transaction_history`
+//! (REST), per kind — see `read_through`'s doc comment for the decision
+//! table.
 use std::collections::HashMap;
+
+use chrono::Datelike;
 
 use crate::analysis::{resolve_side, AnalysisService};
 use crate::browser::BrowserSession;
@@ -236,6 +246,229 @@ pub(crate) async fn run_league_transactions_sync(
         .await
 }
 
+// ---------------------------------------------------------------------------
+// Epic 2.1: staleness-tolerance type and cache read API
+// ---------------------------------------------------------------------------
+
+/// Task 2.1.1b: how stale an answer a `read_through` caller will accept,
+/// decided at read time — contrast `HttpCache`'s write-time TTL, which is
+/// the other freshness idiom already in this codebase (Step 0.5 fork #1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StalenessTolerance {
+    /// Never trust the cache — every read triggers a refresh, no matter how
+    /// recently the row was fetched.
+    AlwaysLive,
+    /// Trust the cache up to this age; past it, refresh.
+    MaxAge(chrono::Duration),
+    /// Trust the cache no matter how old — never makes a live call.
+    CachedOnly,
+}
+
+impl StalenessTolerance {
+    /// Whether a row fetched at `fetched_at` is still fresh enough, as of
+    /// `now`, to skip a live refresh. The one comparison every `read_through`
+    /// call site needs.
+    pub(crate) fn is_fresh(
+        &self,
+        fetched_at: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        match self {
+            StalenessTolerance::AlwaysLive => false,
+            StalenessTolerance::CachedOnly => true,
+            StalenessTolerance::MaxAge(max_age) => now - fetched_at < *max_age,
+        }
+    }
+}
+
+/// Sleeper's `waiver_day_of_week` setting is `0=Sunday .. 6=Saturday`
+/// (verified against plan.md's own example: `waiver_day_of_week=2` means
+/// Tuesday) — chrono's `Weekday` has no such numbering built in, so this
+/// maps explicitly rather than guessing at an offset.
+fn is_waiver_day(now: chrono::DateTime<chrono::Utc>, waiver_day_of_week: u8) -> bool {
+    let sleeper_day = match now.weekday() {
+        chrono::Weekday::Sun => 0,
+        chrono::Weekday::Mon => 1,
+        chrono::Weekday::Tue => 2,
+        chrono::Weekday::Wed => 3,
+        chrono::Weekday::Thu => 4,
+        chrono::Weekday::Fri => 5,
+        chrono::Weekday::Sat => 6,
+    };
+    sleeper_day == waiver_day_of_week
+}
+
+/// Task 2.1.1c: the Tuesday-window-aware default a caller gets when it
+/// supplies no explicit tolerance (requirements.md's resolved Open
+/// Question; ux.md §7). Pure — no DB/browser I/O — so it's unit-testable
+/// directly without a database or browser. Terminal statuses are
+/// cache-valid forever regardless of day; a `pending` row gets `AlwaysLive`
+/// only on the league's actual waiver-processing day (or always, for
+/// daily-waiver leagues) and a long-but-not-infinite `MaxAge` otherwise.
+///
+/// Wiring this into CLI/MCP call sites that supply no explicit tolerance is
+/// Epic 2.3's job (Tasks 2.3.1a/2.3.2a), not this one's.
+// kibitzer:ignore flag-argument -- signature fixed by plan.md Task 2.1.1c /
+// architecture.md §3: `daily_waivers` mirrors the Sleeper league-settings
+// field verbatim, matching the plan's AC examples exactly.
+pub(crate) fn default_tolerance_for(
+    status: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    waiver_day_of_week: u8,
+    daily_waivers: bool,
+) -> StalenessTolerance {
+    if matches!(status, "complete" | "rejected" | "cancelled") {
+        return StalenessTolerance::CachedOnly;
+    }
+    if daily_waivers || is_waiver_day(now, waiver_day_of_week) {
+        StalenessTolerance::AlwaysLive
+    } else {
+        StalenessTolerance::MaxAge(chrono::Duration::hours(24))
+    }
+}
+
+/// Which backend `read_through` dispatches a triggered refresh to — the
+/// Strategy-pattern choice named in Step 0.5 fork #1, made concrete by the
+/// decision table on [`read_through`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Populator {
+    Rest,
+    Browser,
+}
+
+/// Task 2.1.2a's populator-dispatch decision, pulled out as its own pure
+/// function (no I/O) so the one case that matters — `free_agent` goes to
+/// REST, everything else goes to the browser — is unit-testable without a
+/// network or a browser. See [`read_through`]'s decision table for the why.
+fn populator_for(kind_filter: Option<&str>) -> Populator {
+    match kind_filter {
+        Some("free_agent") => Populator::Rest,
+        _ => Populator::Browser,
+    }
+}
+
+/// Whether `status` is a terminal (resolved) transaction status — cache-valid
+/// forever, per ux.md §1, regardless of any `StalenessTolerance`.
+fn is_terminal_status(status: Option<&str>) -> bool {
+    matches!(status, Some("complete") | Some("rejected") | Some("cancelled"))
+}
+
+/// Task 2.1.2a's refresh decision, pulled out as its own pure function (no
+/// I/O) so each of Story 2.1.2's four acceptance criteria can be proven
+/// directly against it, without needing a live browser or network call to
+/// exercise `read_through` end-to-end:
+/// - Terminal-status rows, if *every* cached row is terminal, bypass
+///   `tolerance` entirely and never trigger a refresh — not even on
+///   `force_refresh` (the decision table's "Never" has no exception for it;
+///   a resolved transaction has nothing left to re-fetch).
+/// - Otherwise (a `pending` row is present, or there's no row at all),
+///   `tolerance`/`force_refresh` decide: `CachedOnly` never refreshes,
+///   `force_refresh` or an empty cache always does, and otherwise any
+///   non-terminal row that `tolerance.is_fresh` rejects does.
+fn needs_refresh(
+    cached: &[CachedTransaction],
+    tolerance: &StalenessTolerance,
+    force_refresh: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let all_terminal = !cached.is_empty() && cached.iter().all(|t| is_terminal_status(t.status.as_deref()));
+    if all_terminal {
+        return false;
+    }
+
+    match tolerance {
+        StalenessTolerance::CachedOnly => false,
+        _ => {
+            force_refresh
+                || cached.is_empty()
+                || cached
+                    .iter()
+                    .filter(|t| !is_terminal_status(t.status.as_deref()))
+                    .any(|t| !tolerance.is_fresh(t.fetched_at, now))
+        }
+    }
+}
+
+/// Task 2.1.2a: the cache-aside read-through entry point for transaction
+/// history. Reads the cache once; if [`needs_refresh`] says a live call is
+/// warranted, dispatches to exactly one populator per [`populator_for`]'s
+/// decision table, then re-reads the cache before returning (every live
+/// read refreshes the cache for the next reader):
+///
+/// | Row state after cache lookup | `kind_filter` | Refresh? | Populator |
+/// |---|---|---|---|
+/// | Terminal status present | any | Never | — |
+/// | `pending`/no row, `Some("free_agent")` | — | Per tolerance/force | REST (`sync_transaction_history`) |
+/// | `pending`/no row, other/`None` | — | Per tolerance/force | browser (`run_league_transactions_sync`) |
+///
+/// REST is sufficient for `free_agent` because those pickups never carry a
+/// FAAB bid and Sleeper processes them immediately (never `pending`) — see
+/// plan.md's "Honest note on reachability" for why the REST populator is
+/// otherwise unreached by this dispatch.
+// kibitzer:ignore long-function -- cache read, needs_refresh gate,
+// populator dispatch, cache re-read: one atomic read-through operation
+// (plan.md Task 2.1.2a); splitting further would fragment it across more
+// indirection than it saves, the same rationale as this file's existing
+// persist_league_transactions.
+// kibitzer:ignore long-parameter-list -- signature fixed verbatim by
+// plan.md Task 2.1.2a / architecture.md §3.
+// kibitzer:ignore flag-argument -- `force_refresh` is part of the same
+// plan-mandated signature; it is the CLI's `--force` flag passed straight
+// through, not an internal branch this function invented.
+pub(crate) async fn read_through(
+    config: &Config,
+    analysis: &AnalysisService,
+    league_id: &str,
+    kind_filter: Option<&str>,
+    tolerance: StalenessTolerance,
+    force_refresh: bool,
+) -> Result<Vec<CachedTransaction>> {
+    let cached = analysis.db.list_transactions(league_id, kind_filter).await?;
+    let now = chrono::Utc::now();
+
+    if !needs_refresh(&cached, &tolerance, force_refresh, now) {
+        if cached.is_empty() {
+            tracing::debug!(
+                %league_id,
+                ?kind_filter,
+                "transactions.read_through: cache_miss, no_live_call (CachedOnly)"
+            );
+        }
+        return Ok(cached);
+    }
+
+    let outcome = if force_refresh {
+        "force_refresh"
+    } else if cached.is_empty() {
+        "cache_miss"
+    } else {
+        "stale_per_tolerance"
+    };
+    let _span = tracing::info_span!(
+        "transactions.read_through",
+        %league_id,
+        ?kind_filter,
+        outcome,
+    )
+    .entered();
+
+    match populator_for(kind_filter) {
+        Populator::Rest => {
+            // free_agent only: REST's existing data is already sufficient
+            // (see the decision table above), scoped to every week synced
+            // so far this season, same range `cmd_sync` uses.
+            let nfl_state = analysis.client.get_nfl_state().await?;
+            let weeks: Vec<i32> = (1..=nfl_state.week.max(1)).collect();
+            analysis.sync_transaction_history(league_id, &weeks).await?;
+        }
+        Populator::Browser => {
+            run_league_transactions_sync(config, analysis, league_id).await?;
+        }
+    }
+
+    analysis.db.list_transactions(league_id, kind_filter).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::transaction_would_change;
@@ -293,6 +526,9 @@ mod tests {
             drops: drops.clone(),
             roster_ids: roster_ids.clone(),
             waiver_bid: e.waiver_bid,
+            fetched_at: chrono::Utc::now(),
+            status_updated: e.status_updated,
+            source: Some("graphql".to_string()),
         };
         assert!(!transaction_would_change(Some(&current), &e, &adds, &drops, &roster_ids));
     }
@@ -315,6 +551,9 @@ mod tests {
             drops: drops.clone(),
             roster_ids: roster_ids.clone(),
             waiver_bid: e.waiver_bid,
+            fetched_at: chrono::Utc::now(),
+            status_updated: e.status_updated,
+            source: Some("graphql".to_string()),
         };
         assert!(transaction_would_change(Some(&current), &e, &adds, &drops, &roster_ids));
     }
@@ -493,5 +732,226 @@ mod tests {
 
         let close_err = session.close().await.expect_err("session must already be closed");
         assert!(close_err.to_string().contains("already closed"));
+    }
+
+    // -------------------------------------------------------------------
+    // Epic 2.1 / Story 2.1.1: StalenessTolerance, default_tolerance_for.
+    // -------------------------------------------------------------------
+
+    use super::{default_tolerance_for, is_terminal_status, needs_refresh, populator_for, Populator, StalenessTolerance};
+
+    fn dt(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    /// Happy path: a row fetched well within the max age is fresh.
+    #[test]
+    fn staleness_tolerance_is_fresh_should_return_true_when_within_max_age() {
+        let tolerance = StalenessTolerance::MaxAge(chrono::Duration::hours(1));
+        let now = dt("2026-11-10T12:00:00Z");
+        let fetched_at = now - chrono::Duration::minutes(30);
+        assert!(tolerance.is_fresh(fetched_at, now));
+    }
+
+    /// Boundary path: one second past the max age is no longer fresh.
+    #[test]
+    fn staleness_tolerance_is_fresh_should_return_false_when_max_age_exceeded() {
+        let tolerance = StalenessTolerance::MaxAge(chrono::Duration::hours(1));
+        let now = dt("2026-11-10T12:00:00Z");
+        let fetched_at = now - chrono::Duration::hours(1) - chrono::Duration::seconds(1);
+        assert!(!tolerance.is_fresh(fetched_at, now));
+    }
+
+    /// `AlwaysLive` is never fresh, no matter how recent.
+    #[test]
+    fn staleness_tolerance_is_fresh_should_return_false_for_always_live_even_one_second_old() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let fetched_at = now - chrono::Duration::seconds(1);
+        assert!(!StalenessTolerance::AlwaysLive.is_fresh(fetched_at, now));
+    }
+
+    /// `CachedOnly` is always fresh, no matter how old.
+    #[test]
+    fn staleness_tolerance_is_fresh_should_return_true_for_cached_only_even_ninety_days_old() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let fetched_at = now - chrono::Duration::days(90);
+        assert!(StalenessTolerance::CachedOnly.is_fresh(fetched_at, now));
+    }
+
+    /// Terminal statuses always get `CachedOnly`, regardless of day.
+    #[test]
+    fn default_tolerance_for_should_return_cached_only_for_every_terminal_status() {
+        let now = dt("2026-11-10T12:00:00Z"); // a Tuesday
+        for status in ["complete", "rejected", "cancelled"] {
+            assert_eq!(
+                default_tolerance_for(status, now, 2, false),
+                StalenessTolerance::CachedOnly,
+                "status {status} must be CachedOnly"
+            );
+        }
+    }
+
+    /// Story 2.1.1 AC: pending, on the league's waiver day -> AlwaysLive.
+    #[test]
+    fn default_tolerance_for_should_return_always_live_when_pending_and_today_is_waiver_day() {
+        let tuesday = dt("2026-11-10T12:00:00Z"); // 2026-11-10 is a Tuesday
+        assert_eq!(
+            default_tolerance_for("pending", tuesday, 2, false),
+            StalenessTolerance::AlwaysLive
+        );
+    }
+
+    /// Story 2.1.1 AC: pending, off the league's waiver day -> a long but
+    /// finite MaxAge, not AlwaysLive and not CachedOnly.
+    #[test]
+    fn default_tolerance_for_should_return_long_max_age_when_pending_and_today_is_not_waiver_day() {
+        let wednesday = dt("2026-11-11T12:00:00Z");
+        assert_eq!(
+            default_tolerance_for("pending", wednesday, 2, false),
+            StalenessTolerance::MaxAge(chrono::Duration::hours(24))
+        );
+    }
+
+    /// `daily_waivers` leagues get AlwaysLive every day, not just the
+    /// nominal waiver day.
+    #[test]
+    fn default_tolerance_for_should_return_always_live_when_daily_waivers_even_off_waiver_day() {
+        let wednesday = dt("2026-11-11T12:00:00Z");
+        assert_eq!(
+            default_tolerance_for("pending", wednesday, 2, true),
+            StalenessTolerance::AlwaysLive
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Epic 2.1 / Story 2.1.2: read_through's populator-dispatch and
+    // refresh-decision logic, proven against the pure `populator_for` and
+    // `needs_refresh` functions `read_through` calls directly — a full
+    // end-to-end exercise of `read_through` for these three cases would
+    // require either a live browser (`run_league_transactions_sync`, which
+    // has no fake-session seam — the same gap `run_pending_transactions`/
+    // `run_claim` already have) or live network (`sync_transaction_history`
+    // via a real `SleeperClient`), neither available in this sandboxed test
+    // run. The fourth AC (CachedOnly + empty cache) genuinely needs no I/O
+    // at all, so it's additionally proven end-to-end below against the
+    // real `read_through`.
+    // -------------------------------------------------------------------
+
+    fn cached_row(status: &str, fetched_at: chrono::DateTime<chrono::Utc>) -> CachedTransaction {
+        CachedTransaction {
+            transaction_id: "1".to_string(),
+            season: "2026".to_string(),
+            week: 9,
+            kind: "waiver".to_string(),
+            status: Some(status.to_string()),
+            created: 1_781_000_000,
+            adds: serde_json::json!([]),
+            drops: serde_json::json!([]),
+            roster_ids: serde_json::json!([5]),
+            waiver_bid: Some(78),
+            fetched_at,
+            status_updated: Some(1_781_850_000),
+            source: Some("graphql".to_string()),
+        }
+    }
+
+    /// Story 2.1.2 AC: an `AlwaysLive` read on a `pending` row always
+    /// triggers a refresh, even one fetched a single second ago.
+    #[test]
+    fn needs_refresh_should_return_true_when_always_live_even_for_recently_cached_pending_row() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("pending", now - chrono::Duration::seconds(1));
+        assert!(needs_refresh(&[row], &StalenessTolerance::AlwaysLive, false, now));
+    }
+
+    /// Story 2.1.2 AC: a `MaxAge` read on a `complete` (terminal) row never
+    /// triggers a refresh, no matter how old — terminal rows bypass
+    /// `tolerance` entirely.
+    #[test]
+    fn needs_refresh_should_return_false_when_terminal_status_regardless_of_max_age_tolerance() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("complete", now - chrono::Duration::days(90));
+        assert!(!needs_refresh(&[row], &StalenessTolerance::MaxAge(chrono::Duration::hours(1)), false, now));
+    }
+
+    /// Terminal rows bypass `tolerance` even under `force_refresh` — a
+    /// resolved transaction has nothing left to re-fetch (decision table's
+    /// "Never" has no force exception).
+    #[test]
+    fn needs_refresh_should_return_false_when_terminal_status_even_with_force_refresh() {
+        let now = dt("2026-11-10T12:00:00Z");
+        let row = cached_row("complete", now - chrono::Duration::days(90));
+        assert!(!needs_refresh(&[row], &StalenessTolerance::CachedOnly, true, now));
+    }
+
+    /// Story 2.1.2 AC (the `CachedOnly` half, expressed on the pure
+    /// decision function): an empty cache under `CachedOnly` never
+    /// refreshes.
+    #[test]
+    fn needs_refresh_should_return_false_when_cached_only_and_cache_is_empty() {
+        let now = dt("2026-11-10T12:00:00Z");
+        assert!(!needs_refresh(&[], &StalenessTolerance::CachedOnly, false, now));
+    }
+
+    /// An empty cache under any non-`CachedOnly` tolerance always refreshes
+    /// — there's nothing to judge freshness against.
+    #[test]
+    fn needs_refresh_should_return_true_when_max_age_and_cache_is_empty() {
+        let now = dt("2026-11-10T12:00:00Z");
+        assert!(needs_refresh(&[], &StalenessTolerance::MaxAge(chrono::Duration::hours(1)), false, now));
+    }
+
+    /// Story 2.1.2 AC: `free_agent` dispatches to REST, every other
+    /// `kind_filter` (including unfiltered) dispatches to the browser.
+    #[test]
+    fn populator_for_should_dispatch_to_rest_only_when_kind_filter_is_free_agent() {
+        assert_eq!(populator_for(Some("free_agent")), Populator::Rest);
+        assert_eq!(populator_for(Some("waiver")), Populator::Browser);
+        assert_eq!(populator_for(Some("trade")), Populator::Browser);
+        assert_eq!(populator_for(None), Populator::Browser);
+    }
+
+    #[test]
+    fn is_terminal_status_should_distinguish_terminal_from_pending() {
+        assert!(is_terminal_status(Some("complete")));
+        assert!(is_terminal_status(Some("rejected")));
+        assert!(is_terminal_status(Some("cancelled")));
+        assert!(!is_terminal_status(Some("pending")));
+        assert!(!is_terminal_status(None));
+    }
+
+    // -------------------------------------------------------------------
+    // Epic 2.1 / Story 2.1.2: one genuine end-to-end exercise of
+    // `read_through` itself — the `CachedOnly` + empty-cache path needs no
+    // populator call at all, so it's the one case this sandbox can run
+    // against the real function without a browser or network.
+    // -------------------------------------------------------------------
+
+    use super::{read_through, AnalysisService};
+    use crate::client::SleeperClient;
+    use crate::config::Config;
+
+    async fn test_analysis_service(name: &str) -> (Config, AnalysisService) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!(
+            "sleeper_read_through_test_{name}_{}_{nanos}",
+            std::process::id()
+        ));
+        let config = Config { data_dir, ..Config::default() };
+        let client = SleeperClient::new(&config).await.expect("build client (no network at construction)");
+        let db = StatsDb::open(&config.stats_db_path()).await.expect("open test db");
+        (config.clone(), AnalysisService::new(client, db))
+    }
+
+    #[tokio::test]
+    async fn read_through_should_return_empty_with_no_live_call_when_cached_only_and_cache_is_empty() {
+        let (config, analysis) = test_analysis_service("cached_only_empty").await;
+        let result = read_through(&config, &analysis, LEAGUE_ID, None, StalenessTolerance::CachedOnly, false)
+            .await
+            .expect("CachedOnly on an empty cache must not error");
+        assert!(result.is_empty(), "expected no cached rows, got {result:?}");
     }
 }

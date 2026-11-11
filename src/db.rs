@@ -1,3 +1,7 @@
+// kibitzer:ignore file-size -- pre-existing condition (already ~1105 lines
+// before Epic 2.1's additions); this task's file scope is fixed to
+// src/db.rs and src/cli/browser/transactions.rs only, so a split is
+// deferred to a future task.
 /// SQLite-backed permanent stats store.
 ///
 /// Completed NFL weeks never change, so stats are stored permanently here
@@ -70,6 +74,10 @@ pub struct TransactionSyncRun<'a> {
 
 /// Row shape returned by `StatsDb::list_transactions` — read from the local
 /// cache only, never triggers an API/browser call.
+///
+/// `fetched_at`/`status_updated`/`source` (Epic 2.1, Task 2.1.1a) let a
+/// staleness decision (`StalenessTolerance::is_fresh`) be made from this
+/// struct alone, without a second query back into `StatsDb`.
 #[derive(Debug, Clone)]
 pub struct CachedTransaction {
     pub transaction_id: String,
@@ -82,6 +90,9 @@ pub struct CachedTransaction {
     pub drops: serde_json::Value,
     pub roster_ids: serde_json::Value,
     pub waiver_bid: Option<i64>,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub status_updated: Option<i64>,
+    pub source: Option<String>,
 }
 
 impl StatsDb {
@@ -632,36 +643,75 @@ impl StatsDb {
         league_id: &str,
         kind_filter: Option<&str>,
     ) -> Result<Vec<CachedTransaction>> {
-        let rows: Vec<(String, String, i32, String, Option<String>, i64, String, String, Option<String>, Option<i64>)> =
-            sqlx::query_as(
-                "SELECT transaction_id, season, week, type, status, created, adds, drops, roster_ids, waiver_bid
-                 FROM transactions
-                 WHERE league_id = ? AND (? IS NULL OR type = ?)
-                 ORDER BY created ASC",
-            )
-            .bind(league_id)
-            .bind(kind_filter)
-            .bind(kind_filter)
-            .fetch_all(&self.pool)
-            .await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            String,
+            i32,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT transaction_id, season, week, type, status, created, adds, drops, roster_ids, waiver_bid, fetched_at, status_updated, source
+             FROM transactions
+             WHERE league_id = ? AND (? IS NULL OR type = ?)
+             ORDER BY created ASC",
+        )
+        .bind(league_id)
+        .bind(kind_filter)
+        .bind(kind_filter)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter()
-            .map(|(transaction_id, season, week, kind, status, created, adds, drops, roster_ids, waiver_bid)| {
-                Ok(CachedTransaction {
+            .map(
+                |(
                     transaction_id,
                     season,
                     week,
                     kind,
                     status,
                     created,
-                    adds: serde_json::from_str(&adds)?,
-                    drops: serde_json::from_str(&drops)?,
-                    roster_ids: roster_ids
-                        .map(|s| serde_json::from_str(&s))
-                        .transpose()?
-                        .unwrap_or(serde_json::Value::Array(Vec::new())),
+                    adds,
+                    drops,
+                    roster_ids,
                     waiver_bid,
-                })
-            })
+                    fetched_at,
+                    status_updated,
+                    source,
+                )| {
+                    Ok(CachedTransaction {
+                        transaction_id,
+                        season,
+                        week,
+                        kind,
+                        status,
+                        created,
+                        adds: serde_json::from_str(&adds)?,
+                        drops: serde_json::from_str(&drops)?,
+                        roster_ids: roster_ids
+                            .map(|s| serde_json::from_str(&s))
+                            .transpose()?
+                            .unwrap_or(serde_json::Value::Array(Vec::new())),
+                        waiver_bid,
+                        // Written via `to_rfc3339()` in `upsert_transaction`;
+                        // `NOT NULL` since the original `CREATE TABLE`, so
+                        // every row has one (unlike `status_updated`/`source`,
+                        // added later via `ALTER TABLE` with no backfill).
+                        fetched_at: chrono::DateTime::parse_from_rfc3339(&fetched_at)
+                            .map_err(|e| crate::error::Error::Other(e.into()))?
+                            .with_timezone(&chrono::Utc),
+                        status_updated,
+                        source,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -1055,5 +1105,40 @@ mod tests {
         result.expect(
             "upsert_transaction should block on busy_timeout and succeed, not return SQLITE_BUSY",
         );
+    }
+
+    // Epic 2.1 / Task 2.1.1a (happy path): `list_transactions` must surface
+    // `fetched_at`/`status_updated`/`source` on the returned
+    // `CachedTransaction` — today it has no `fetched_at` field at all, a
+    // read-side gap this task closes so a staleness decision
+    // (`StalenessTolerance::is_fresh`) can be made without a second query.
+    #[tokio::test]
+    async fn list_transactions_should_include_fetched_at_status_updated_and_source_when_row_persisted(
+    ) {
+        let db = test_db("list_transactions_fetched_at").await;
+        let empty = serde_json::json!({});
+        let roster_ids = serde_json::json!([5]);
+        let mut row = base_row("1", &empty, &roster_ids);
+        row.league_id = "1352883872131481600";
+        row.status_updated = Some(1_781_850_000);
+        row.source = "graphql";
+
+        let before = chrono::Utc::now();
+        db.upsert_transaction(row).await.expect("upsert transaction");
+        let after = chrono::Utc::now();
+
+        let rows = db
+            .list_transactions("1352883872131481600", Some("waiver"))
+            .await
+            .expect("list cached transactions");
+        let cached = rows.iter().find(|t| t.transaction_id == "1").expect("transaction 1 present");
+
+        assert!(
+            cached.fetched_at >= before && cached.fetched_at <= after,
+            "fetched_at {:?} must fall within [{before:?}, {after:?}]",
+            cached.fetched_at
+        );
+        assert_eq!(cached.status_updated, Some(1_781_850_000));
+        assert_eq!(cached.source.as_deref(), Some("graphql"));
     }
 }
