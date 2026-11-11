@@ -18,6 +18,12 @@ pub struct FakeSession {
     /// once) keep their prior behavior unchanged.
     eval_string_responses: tokio::sync::Mutex<Vec<String>>,
     eval_string_call_count: AtomicUsize,
+    /// When set, any `eval_string` call at or past this index errors
+    /// instead of returning a canned response (Epic 4.2 regression: proves
+    /// a transport failure between the write click and its confirmation
+    /// read is typed `Ambiguous`, never a bare `Err`) — distinct from
+    /// `transport_error`, which fails every call including the first.
+    eval_string_fail_from: Option<usize>,
     closed: bool,
 }
 
@@ -33,6 +39,7 @@ impl FakeSession {
             ),
             eval_string_responses: tokio::sync::Mutex::new(vec![r#"{"data":{}}"#.to_string()]),
             eval_string_call_count: AtomicUsize::new(0),
+            eval_string_fail_from: None,
             closed: false,
         }
     }
@@ -65,6 +72,17 @@ impl FakeSession {
     pub fn with_transport_error() -> Self {
         let mut s = Self::logged_in();
         s.transport_error = true;
+        s
+    }
+
+    /// Canned responses for the first `jsons.len()` `eval_string` calls,
+    /// then a transport error for every call after — e.g. the claims-panel
+    /// read (call 1) succeeds but the write call (call 2, click + confirm
+    /// combined) fails at the transport level, simulating a dropped
+    /// connection *after* the in-page `.click()` already fired.
+    pub fn with_eval_string_responses_then_transport_error(jsons: &[&str]) -> Self {
+        let mut s = Self::with_eval_string_responses(jsons);
+        s.eval_string_fail_from = Some(jsons.len());
         s
     }
 
@@ -108,8 +126,11 @@ impl BrowserSession for FakeSession {
             if self.transport_error {
                 return Err(other("fake transport error"));
             }
-            let responses = self.eval_string_responses.lock().await;
             let idx = self.eval_string_call_count.fetch_add(1, Ordering::SeqCst);
+            if self.eval_string_fail_from.is_some_and(|fail_from| idx >= fail_from) {
+                return Err(other("fake transport error"));
+            }
+            let responses = self.eval_string_responses.lock().await;
             Ok(responses
                 .get(idx)
                 .or_else(|| responses.last())

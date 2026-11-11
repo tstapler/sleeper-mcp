@@ -527,11 +527,22 @@ pub async fn edit_cancel_claim_via_seam(
     let confirm = tracing::info_span!("edit_cancel.confirm", resolved_index);
     let _enter_confirm = confirm.enter();
 
-    // Call 2: re-assert identity, write, and read back confirmation.
+    // Call 2: re-assert identity, write, and read back confirmation. A
+    // transport-level failure on THIS call (unlike call 1, above) can land
+    // after the in-page JS already fired `.click()` but before its response
+    // reaches us — so it must never propagate as a bare `Err` (which would
+    // misreport "nothing happened"); it's `Ambiguous`, the same as an
+    // unparseable response (Blocker 3 / adversarial review).
     let transaction_id_json = serde_json::to_string(transaction_id).map_err(other)?;
     let write_js = build_edit_cancel_write_js(resolved_index, &transaction_id_json, action);
-    let outcome_raw = session.eval_string(&write_js).await?;
-    let outcome = parse_edit_cancel_outcome(&outcome_raw);
+    let outcome = match session.eval_string(&write_js).await {
+        Ok(outcome_raw) => parse_edit_cancel_outcome(&outcome_raw),
+        Err(e) => EditCancelOutcome::Ambiguous {
+            reason: format!(
+                "transport error between the write click and its confirmation read: {e}"
+            ),
+        },
+    };
     tracing::info!(outcome = ?outcome, "edit_cancel resolved");
     Ok(outcome)
 }

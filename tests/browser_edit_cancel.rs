@@ -118,6 +118,29 @@ async fn edit_cancel_claim_via_seam_should_fail_closed_when_initial_resolution_i
     assert!(err.to_string().contains("ambiguous"), "got {err}");
 }
 
+/// Mid-flow transport failure (Blocker 3 / adversarial review): the
+/// claims-panel read (call 1) succeeds, but the write call (call 2 — click
+/// + confirmation combined) fails at the transport level, simulating a
+/// dropped connection *after* the in-page `.click()` already fired. This
+/// must surface as `Ambiguous`, never a bare `Err` that would misreport
+/// "nothing happened" when the click may well have landed.
+#[tokio::test]
+async fn edit_cancel_claim_via_seam_should_be_ambiguous_when_write_call_errors_at_transport_level() {
+    let session =
+        FakeSession::with_eval_string_responses_then_transport_error(&[TWO_CLAIM_ROWS_JSON]);
+
+    let outcome = edit_cancel_claim_via_seam(&session, LEAGUE_ID, "1", EditCancelAction::Cancel)
+        .await
+        .expect("a transport failure after the click may have fired must be a typed outcome, not Err");
+
+    match outcome {
+        EditCancelOutcome::Ambiguous { reason } => {
+            assert!(!reason.is_empty(), "reason must explain the transport failure");
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+}
+
 /// A dead/logged-out session surfaces the dead-session hint instead of
 /// attempting any DOM read or write.
 #[tokio::test]
