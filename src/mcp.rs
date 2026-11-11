@@ -114,6 +114,12 @@ struct RosterParams {
     league_id: String,
     /// Roster ID (number), username, or display name
     roster_id: String,
+    /// Bypass this process's own cache and ask Sleeper to skip its own caching too. Use
+    /// this right after a lineup/waiver write to confirm it actually landed — Sleeper's own
+    /// API can otherwise lag several minutes behind a real change. Leave false for normal
+    /// reads; forcing on every call defeats the point of caching.
+    #[serde(default)]
+    force_refresh: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -473,13 +479,13 @@ impl SleeperMcpServer {
         ok(self.svc.client.get_draft_picks(&p.draft_id).await.map_err(err)?)
     }
 
-    #[tool(description = "Get roster details with player names, positions, and injury status")]
+    #[tool(description = "Get roster details with player names, positions, and injury status. Set force_refresh:true right after a lineup/waiver write to confirm it actually landed — the normal cached read can otherwise show Sleeper's own stale server-side state for several minutes.")]
     async fn get_roster_with_names(
         &self,
         #[tool(aggr)] p: RosterParams,
     ) -> Result<CallToolResult, McpError> {
         let rid = resolve(&self.svc.db, &p.league_id, &p.roster_id).await?;
-        ok(self.svc.roster_with_names(&p.league_id, rid).await.map_err(err)?)
+        ok(self.svc.roster_with_names(&p.league_id, rid, p.force_refresh).await.map_err(err)?)
     }
 
     #[tool(description = "Analyze roster needs: positional strengths, weaknesses, injury risks, and priorities")]
@@ -488,7 +494,7 @@ impl SleeperMcpServer {
         #[tool(aggr)] p: RosterParams,
     ) -> Result<CallToolResult, McpError> {
         let rid = resolve(&self.svc.db, &p.league_id, &p.roster_id).await?;
-        ok(self.svc.analyze_roster_needs(&p.league_id, rid).await.map_err(err)?)
+        ok(self.svc.analyze_roster_needs(&p.league_id, rid, p.force_refresh).await.map_err(err)?)
     }
 
     #[tool(description = "Get unrostered players ranked by season fantasy points — useful for waivers and draft prep")]

@@ -119,6 +119,11 @@ pub enum Commands {
         /// Roster ID, username, or display name
         #[arg(short, long)]
         roster_id: String,
+        /// Bypass this process's own cache and ask Sleeper to skip its own caching too —
+        /// for checking a write (lineup/waiver) right after making it, since Sleeper's own
+        /// API can lag several minutes on an unforced read.
+        #[arg(long)]
+        fresh: bool,
     },
 
     /// Analyze roster needs and strengths
@@ -451,9 +456,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .await?
         }
 
-        Commands::Roster { league_id, roster_id } => {
+        Commands::Roster { league_id, roster_id, fresh } => {
             let rid = resolve_rid(&svc.db, &league_id, &roster_id).await?;
-            roster_cmds::cmd_roster(&svc, &league_id, rid).await?
+            roster_cmds::cmd_roster(&svc, &league_id, rid, fresh).await?
         }
 
         Commands::Analyze { league_id, roster_id } => {

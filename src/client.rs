@@ -15,6 +15,15 @@ const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_MS: u64 = 2000;
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; sleeper-mcp/1.0)";
 
+/// Whether a GET may be served from (or revalidated against) this process's own local
+/// cache, or must go straight to the network and ask the upstream to skip its own caching
+/// too. `ForceFresh` exists for read-after-write — see [`SleeperClient::get_json_fresh`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachePolicy {
+    PreferCache,
+    ForceFresh,
+}
+
 #[derive(Clone)]
 pub struct SleeperClient {
     http: reqwest::Client,
@@ -48,8 +57,23 @@ impl SleeperClient {
     }
 
     async fn get_json(&self, path: &str) -> Result<Value> {
+        self.get_json_with(path, CachePolicy::PreferCache).await
+    }
+
+    /// Bypasses both this process's own local cache AND asks the upstream
+    /// server to skip its own caching (`Cache-Control`/`Pragma: no-cache`) —
+    /// for the one real use case normal reads can't serve: confirming a
+    /// write actually landed, right after making it (read-after-write).
+    /// Normal reads should keep using [`get_json`]; forcing on every call
+    /// would defeat the point of caching and burn rate-limit budget for no
+    /// reason the vast majority of the time.
+    async fn get_json_fresh(&self, path: &str) -> Result<Value> {
+        self.get_json_with(path, CachePolicy::ForceFresh).await
+    }
+
+    async fn get_json_with(&self, path: &str, policy: CachePolicy) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
-        let body = self.get_cached_text(&url, self.cache_ttl).await?;
+        let body = self.get_cached_text(&url, self.cache_ttl, policy).await?;
         Ok(serde_json::from_str(&body)?)
     }
 
@@ -61,24 +85,38 @@ impl SleeperClient {
     /// Freshness comes from the response's own `Cache-Control: max-age`, falling back to
     /// `default_ttl_secs` only when the server doesn't send one — this is what makes it a real
     /// read-through cache rather than one that just ignores the site's own caching metadata.
-    async fn get_cached_text(&self, url: &str, default_ttl_secs: i64) -> Result<String> {
-        if let Some((cached, is_fresh)) = self.cache.get("GET", url).await? {
-            if is_fresh {
-                tracing::debug!(url, "cache_hit");
-                return Ok(cached.body);
+    ///
+    /// `CachePolicy::ForceFresh` skips the local-cache read entirely (straight to
+    /// [`fetch_fresh`]) — see [`get_json_fresh`]'s doc comment for when that's warranted.
+    async fn get_cached_text(&self, url: &str, default_ttl_secs: i64, policy: CachePolicy) -> Result<String> {
+        if policy == CachePolicy::PreferCache {
+            if let Some((cached, is_fresh)) = self.cache.get("GET", url).await? {
+                if is_fresh {
+                    tracing::debug!(url, "cache_hit");
+                    return Ok(cached.body);
+                }
+                return self
+                    .revalidate(url, cached.etag, cached.last_modified, default_ttl_secs)
+                    .await;
             }
-            return self
-                .revalidate(url, cached.etag, cached.last_modified, default_ttl_secs)
-                .await;
         }
-        self.fetch_fresh(url, default_ttl_secs).await
+        self.fetch_fresh(url, default_ttl_secs, policy).await
     }
 
-    async fn fetch_fresh(&self, url: &str, default_ttl_secs: i64) -> Result<String> {
+    /// `CachePolicy::ForceFresh` adds `Cache-Control`/`Pragma: no-cache` to the outbound
+    /// request — best-effort against any CDN/edge cache Sleeper's own API sits behind, which
+    /// this process has no other control over (confirmed live, 2026-11-11: a roster write can
+    /// take several minutes to show up even on a from-scratch GET with no local caching
+    /// involved at all — that lag is on Sleeper's side, not this cache layer's).
+    async fn fetch_fresh(&self, url: &str, default_ttl_secs: i64, policy: CachePolicy) -> Result<String> {
         self.rate_limiter.acquire().await;
 
         for attempt in 0..MAX_RETRIES {
-            match self.http.get(url).header("User-Agent", USER_AGENT).send().await {
+            let mut req = self.http.get(url).header("User-Agent", USER_AGENT);
+            if policy == CachePolicy::ForceFresh {
+                req = req.header("Cache-Control", "no-cache").header("Pragma", "no-cache");
+            }
+            match req.send().await {
                 Ok(resp) if resp.status().as_u16() == 429 => {
                     let retry_after = resp
                         .headers()
@@ -106,24 +144,9 @@ impl SleeperClient {
                         });
                     }
 
-                    let etag = header_str(resp.headers(), "etag");
-                    let last_modified = header_str(resp.headers(), "last-modified");
-                    let cache_control = header_str(resp.headers(), "cache-control");
-                    let ttl = HttpCache::parse_max_age(cache_control.as_deref())
-                        .unwrap_or(default_ttl_secs);
-
+                    let headers = resp.headers().clone();
                     let body = resp.text().await?;
-                    self.cache
-                        .set(
-                            "GET",
-                            url,
-                            status,
-                            &body,
-                            etag.as_deref(),
-                            last_modified.as_deref(),
-                            Some(ttl),
-                        )
-                        .await?;
+                    self.store_response(url, status, &body, &headers, default_ttl_secs).await?;
                     return Ok(body);
                 }
                 Err(e) if attempt < MAX_RETRIES - 1 => {
@@ -135,6 +158,26 @@ impl SleeperClient {
             }
         }
         Err(Error::RateLimited { retries: MAX_RETRIES })
+    }
+
+    /// Shared by [`fetch_fresh`] and [`revalidate`]'s success paths: derives the cache TTL
+    /// from the response's own `Cache-Control` (falling back to `default_ttl_secs`) and
+    /// persists the body plus validators.
+    async fn store_response(
+        &self,
+        url: &str,
+        status: u16,
+        body: &str,
+        headers: &reqwest::header::HeaderMap,
+        default_ttl_secs: i64,
+    ) -> Result<()> {
+        let etag = header_str(headers, "etag");
+        let last_modified = header_str(headers, "last-modified");
+        let cache_control = header_str(headers, "cache-control");
+        let ttl = HttpCache::parse_max_age(cache_control.as_deref()).unwrap_or(default_ttl_secs);
+        self.cache
+            .set("GET", url, status, body, etag.as_deref(), last_modified.as_deref(), Some(ttl))
+            .await
     }
 
     /// Conditional GET using ETag / Last-Modified validators.
@@ -216,6 +259,14 @@ impl SleeperClient {
 
     pub async fn get_league_rosters(&self, league_id: &str) -> Result<Vec<Roster>> {
         let v = self.get_json(&format!("/league/{league_id}/rosters")).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// Read-after-write escape hatch (see [`get_json_fresh`]'s doc comment) — the one read
+    /// this project has repeatedly needed right after a lineup/waiver write, to confirm it
+    /// actually landed rather than trusting the write call's own success message.
+    pub async fn get_league_rosters_fresh(&self, league_id: &str) -> Result<Vec<Roster>> {
+        let v = self.get_json_fresh(&format!("/league/{league_id}/rosters")).await?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -329,7 +380,7 @@ impl SleeperClient {
     /// read-through cache as `get_json` — `ttl_secs` is only the fallback used when the site
     /// doesn't send its own `Cache-Control`.
     async fn get_raw_html(&self, url: &str, ttl_secs: i64) -> Result<String> {
-        self.get_cached_text(url, ttl_secs).await
+        self.get_cached_text(url, ttl_secs, CachePolicy::PreferCache).await
     }
 
     /// RotowWire NFL player news page (25 most recent items). RotoWire sends

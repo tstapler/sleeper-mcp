@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::Result;
-use crate::models::League;
+use crate::models::{League, Roster, User};
 
 use super::dynasty::enrich_player;
 use super::AnalysisService;
@@ -60,12 +60,35 @@ impl AnalysisService {
     // Roster with player names
     // -----------------------------------------------------------------------
 
+    /// `force_refresh: true` bypasses both this process's own cache and Sleeper's own
+    /// upstream caching for the roster read specifically — the one field that actually
+    /// changes from a lineup/waiver write. Needed because this project has repeatedly hit
+    /// Sleeper's own server-side staleness (confirmed live, 2026-11-11: several minutes'
+    /// lag even on a from-scratch request) when checking a write's result right after
+    /// making it. Users/players rarely need that same freshness, so they stay on the
+    /// normal cached path even when `force_refresh` is set.
+    async fn fetch_rosters_users_players_honoring_freshness(
+        &self,
+        league_id: &str,
+        force_refresh: bool,
+    ) -> Result<(Vec<Roster>, Vec<User>, HashMap<String, Value>)> {
+        if !force_refresh {
+            return self.fetch_rosters_users_players(league_id).await;
+        }
+        let rosters = self.client.get_league_rosters_fresh(league_id).await?;
+        let users = self.client.get_league_users(league_id).await?;
+        let all_players = self.client.get_all_players("nfl").await?;
+        Ok((rosters, users, all_players))
+    }
+
     pub async fn roster_with_names(
         &self,
         league_id: &str,
         roster_id: i32,
+        force_refresh: bool,
     ) -> Result<serde_json::Value> {
-        let (rosters, users, all_players) = self.fetch_rosters_users_players(league_id).await?;
+        let (rosters, users, all_players) =
+            self.fetch_rosters_users_players_honoring_freshness(league_id, force_refresh).await?;
 
         let roster = rosters
             .iter()
@@ -266,9 +289,10 @@ impl AnalysisService {
         &self,
         league_id: &str,
         roster_id: i32,
+        force_refresh: bool,
     ) -> Result<serde_json::Value> {
         let league_h = self.spawn_league(league_id);
-        let data = self.roster_with_names(league_id, roster_id).await?;
+        let data = self.roster_with_names(league_id, roster_id, force_refresh).await?;
         let league = league_h.await??;
 
         let mut pos_counts: HashMap<String, usize> = HashMap::new();

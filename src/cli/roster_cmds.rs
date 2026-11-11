@@ -250,8 +250,13 @@ pub(super) async fn cmd_transactions(
     Ok(())
 }
 
-pub(super) async fn cmd_roster(svc: &AnalysisService, league_id: &str, roster_id: i32) -> Result<()> {
-    let data = svc.roster_with_names(league_id, roster_id).await?;
+pub(super) async fn cmd_roster(
+    svc: &AnalysisService,
+    league_id: &str,
+    roster_id: i32,
+    fresh: bool,
+) -> Result<()> {
+    let data = svc.roster_with_names(league_id, roster_id, fresh).await?;
     println!(
         "{} — {}",
         style(data["owner"].as_str().unwrap_or("?")).bold(),
@@ -276,7 +281,7 @@ pub(super) async fn cmd_roster(svc: &AnalysisService, league_id: &str, roster_id
 }
 
 pub(super) async fn cmd_analyze(svc: &AnalysisService, league_id: &str, roster_id: i32) -> Result<()> {
-    let data = svc.analyze_roster_needs(league_id, roster_id).await?;
+    let data = svc.analyze_roster_needs(league_id, roster_id, false).await?;
     println!("{}", style(format!("Roster Analysis — {}", data["owner"].as_str().unwrap_or("?"))).bold().underlined());
 
     if let Some(strengths) = data["strengths"].as_array() {
