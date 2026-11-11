@@ -824,6 +824,237 @@ mod tests {
         );
     }
 
+    /// Serializes `projection` the same way the tool body does (`ok(...)`)
+    /// and parses the result back into a `Value` for shape assertions.
+    fn projection_json(projection: BidProjection) -> serde_json::Value {
+        let result = ok(projection).expect("serializing a BidProjection must succeed");
+        let text = result.content[0]
+            .as_text()
+            .expect("tool result must carry a text content block")
+            .text
+            .clone();
+        serde_json::from_str(&text).expect("content must be valid JSON")
+    }
+
+    /// validation.md Surface 4, AC2: `coverage`/`confidence` fields must be a
+    /// tagged variant (`{"kind": "verified"|"floor", ...}`), never a bare
+    /// bool — the whole point of `CoverageConfidence` replacing a bare
+    /// `is_complete: bool` (plan.md Pattern Decisions: "FAAB-remaining
+    /// confidence representation").
+    #[test]
+    fn project_waiver_bid_tool_coverage_field_should_be_tagged_variant_not_bare_bool() {
+        let verified = sample_projection();
+        let json = projection_json(verified);
+        let confidence = &json["faab_remaining"]["confidence"];
+        assert!(
+            confidence.is_object(),
+            "confidence must be a tagged object, got {confidence}"
+        );
+        assert_eq!(confidence["kind"], "verified");
+        assert!(confidence.get("as_of").is_some());
+
+        let mut floor = sample_projection();
+        floor.faab_remaining = FaabRemaining {
+            amount: 58,
+            confidence: CoverageConfidence::Floor {
+                reason: "no full-league GraphQL backfill recorded for season 2026".to_string(),
+            },
+        };
+        let json = projection_json(floor);
+        let confidence = &json["faab_remaining"]["confidence"];
+        assert!(
+            confidence.is_object(),
+            "confidence must be a tagged object, got {confidence}"
+        );
+        assert_eq!(confidence["kind"], "floor");
+        assert!(confidence.get("reason").is_some());
+        assert_ne!(
+            confidence, &serde_json::json!(true),
+            "coverage must never collapse to a bare bool"
+        );
+        assert_ne!(confidence, &serde_json::json!(false));
+    }
+
+    /// validation.md Surface 4, AC3: walk the full JSON response and assert
+    /// no field named `confidence` anywhere (top-level or nested, including
+    /// `competing_roster_faab`) is a bare numeric value unaccompanied by a
+    /// sample/range — every `confidence` must be the tagged
+    /// `CoverageConfidence` object.
+    #[test]
+    fn project_waiver_bid_tool_should_never_emit_bare_confidence_float_in_response() {
+        fn assert_no_bare_confidence_number(value: &serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, v) in map {
+                        if key == "confidence" {
+                            assert!(
+                                !v.is_number(),
+                                "found a bare numeric `confidence` field: {v} (full value: {value})"
+                            );
+                        }
+                        assert_no_bare_confidence_number(v);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        assert_no_bare_confidence_number(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut projection = sample_projection();
+        projection.faab_remaining = FaabRemaining {
+            amount: 0,
+            confidence: CoverageConfidence::Floor { reason: "zero coverage".to_string() },
+        };
+        let json = projection_json(projection);
+        assert_no_bare_confidence_number(&json);
+    }
+
+    /// validation.md Surface 4, AC4: `bid_history.sample_size` names a
+    /// concrete count (an integer field), never folded into a vague
+    /// percentage/confidence description.
+    #[test]
+    fn project_waiver_bid_tool_sample_field_should_name_concrete_count_not_percentage() {
+        let mut projection = sample_projection();
+        projection.bid_history = BidHistorySignal {
+            mean_winning_bid: 22.0,
+            sample_size: 11,
+            position: "QB".to_string(),
+        };
+        let json = projection_json(projection);
+        let sample_size = &json["bid_history"]["sample_size"];
+        assert!(
+            sample_size.is_u64(),
+            "sample_size must be a concrete integer count, got {sample_size}"
+        );
+        assert_eq!(sample_size.as_u64(), Some(11));
+        // A percentage/score would be a fraction in [0.0, 1.0] or a float —
+        // the real field is a whole bid count, not a confidence score.
+        assert!(!sample_size.is_f64());
+    }
+
+    /// validation.md Surface 8, AC1, reworded: validation.md's literal name
+    /// (`..._should_report_null_remaining_with_floor_reason_when_zero_coverage`)
+    /// implied `faab_remaining.amount` should be `null`/absent under `Floor`
+    /// confidence. That contradicts plan.md's authoritative Story 3.1.3 AC
+    /// (`FaabRemaining { amount, confidence }`, `amount: i64` always a real
+    /// computed number) and the Pattern Decisions table's explicit "a bool
+    /// loses *why*" rationale for choosing an enum `confidence` field over
+    /// hiding the number — confirmed by reading `faab_remaining()`
+    /// (`src/analysis/bid_projection.rs:473-500`), which always returns
+    /// `Ok(FaabRemaining { amount: waiver_budget - spent, confidence })`
+    /// regardless of coverage. Renamed to assert the actual contract: under
+    /// `Floor`, `amount` is still a real `i64`, and `confidence` is a
+    /// `Floor { reason }` variant structurally distinguishable from
+    /// `Verified { as_of }` — a caller can't mistake a floor estimate for a
+    /// verified one even though the number itself is never hidden.
+    #[test]
+    fn project_waiver_bid_tool_floor_confidence_should_report_real_amount_not_null() {
+        let mut floor = sample_projection();
+        floor.faab_remaining = FaabRemaining {
+            amount: 58,
+            confidence: CoverageConfidence::Floor {
+                reason: "no full-league GraphQL backfill recorded for season 2026".to_string(),
+            },
+        };
+        let json = projection_json(floor);
+        let amount = &json["faab_remaining"]["amount"];
+        assert!(!amount.is_null(), "Floor confidence must never null out `amount`");
+        assert_eq!(amount.as_i64(), Some(58));
+        assert_eq!(json["faab_remaining"]["confidence"]["kind"], "floor");
+        assert!(json["faab_remaining"]["confidence"].get("reason").is_some());
+
+        let mut verified = sample_projection();
+        verified.faab_remaining = FaabRemaining {
+            amount: 58,
+            confidence: CoverageConfidence::Verified { as_of: chrono::Utc::now() },
+        };
+        let verified_json = projection_json(verified);
+        assert_ne!(
+            verified_json["faab_remaining"]["confidence"]["kind"],
+            json["faab_remaining"]["confidence"]["kind"],
+            "Floor and Verified must be structurally distinguishable by `kind`, not just by amount"
+        );
+    }
+
+    /// validation.md Surface 8, AC2: when `faab_remaining`'s coverage is
+    /// `Floor`, the other four signals (`perceived_value`, `league_demand`,
+    /// `bid_history`, `claim_frequency`) still render with their real
+    /// values — degradation is scoped to the one dependent signal, never the
+    /// whole output.
+    #[test]
+    fn project_waiver_bid_tool_should_render_other_signals_normally_when_only_faab_coverage_missing()
+    {
+        let mut projection = sample_projection();
+        projection.faab_remaining = FaabRemaining {
+            amount: 0,
+            confidence: CoverageConfidence::Floor {
+                reason: "no full-league GraphQL backfill recorded for season 2026".to_string(),
+            },
+        };
+        let json = projection_json(projection);
+
+        assert_eq!(json["perceived_value"]["dynasty_tier"], 2);
+        assert_eq!(json["perceived_value"]["search_rank"], 48);
+        assert_eq!(json["league_demand"]["pull_by_roster"]["9"], 2);
+        assert_eq!(json["bid_history"]["mean_winning_bid"], 22.0);
+        assert_eq!(json["bid_history"]["sample_size"], 11);
+        assert_eq!(json["claim_frequency"]["claims_this_season"], 6);
+        assert_eq!(json["faab_remaining"]["confidence"]["kind"], "floor");
+    }
+
+    /// validation.md Surface 8, AC3, reworded: validation.md's literal name
+    /// (`..._should_distinguish_partial_coverage_reason_from_zero_history_reason`)
+    /// implies `faab_remaining()` produces two different `Floor` reason
+    /// strings depending on whether a roster has partial vs. zero synced
+    /// history. Reading `faab_remaining()` in full
+    /// (`src/analysis/bid_projection.rs:473-500`) and plan.md's Story 3.1.3
+    /// AC (line 803-809) shows this distinction was never implemented or
+    /// specified there: the `Floor` reason is gated solely on
+    /// `has_full_league_graphql_coverage` returning `None`, and is always
+    /// exactly `"no full-league GraphQL backfill recorded for season
+    /// {season}"` regardless of partial vs. zero history — only ux.md §8
+    /// (design aspiration, not plan.md's authoritative AC) describes the
+    /// finer-grained distinction. This is the same category of validation.md
+    /// imprecision as the already-flagged null-remaining test, not a
+    /// bid_projection.rs logic bug, so per that same guidance I reworded this
+    /// test to the property this task's prompt actually asked for instead:
+    /// `low_confidence` and `faab_remaining.confidence` are two independent,
+    /// separately-inspectable fields, not the same value duplicated under
+    /// two names.
+    #[test]
+    fn project_waiver_bid_tool_low_confidence_flag_and_faab_confidence_should_be_independent_fields()
+    {
+        // low_confidence: false, faab_remaining.confidence: Floor — proves
+        // `low_confidence` isn't just a mirror of `confidence.is_floor()`.
+        let mut floor_but_not_low_confidence = sample_projection();
+        floor_but_not_low_confidence.faab_remaining = FaabRemaining {
+            amount: 58,
+            confidence: CoverageConfidence::Floor { reason: "no backfill".to_string() },
+        };
+        floor_but_not_low_confidence.low_confidence = false;
+        let json = projection_json(floor_but_not_low_confidence);
+        assert_eq!(json["low_confidence"], false);
+        assert_eq!(json["faab_remaining"]["confidence"]["kind"], "floor");
+
+        // low_confidence: true, faab_remaining.confidence: Verified — proves
+        // the inverse: `low_confidence` can be driven by a different signal
+        // entirely (e.g. a thin `bid_history.sample_size`), independent of
+        // FAAB coverage.
+        let mut low_confidence_but_verified_faab = sample_projection();
+        low_confidence_but_verified_faab.faab_remaining = FaabRemaining {
+            amount: 58,
+            confidence: CoverageConfidence::Verified { as_of: chrono::Utc::now() },
+        };
+        low_confidence_but_verified_faab.low_confidence = true;
+        let json = projection_json(low_confidence_but_verified_faab);
+        assert_eq!(json["low_confidence"], true);
+        assert_eq!(json["faab_remaining"]["confidence"]["kind"], "verified");
+    }
+
     // -----------------------------------------------------------------
     // Epic 4.3 / Task 4.3.2a: `edit_waiver_claim`/`cancel_waiver_claim`'s
     // outcome mapping — proven against the shared renderer
