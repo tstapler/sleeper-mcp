@@ -224,6 +224,15 @@ impl SleeperClient {
         Ok(serde_json::from_value(v)?)
     }
 
+    /// Only picks that have changed hands at least once appear in the
+    /// response (an untraded pick has no row) — see `TradedPick`'s doc
+    /// comment for the field meanings, live-verified against this exact
+    /// league (22 rows, 2026-11-11).
+    pub async fn get_traded_picks(&self, league_id: &str) -> Result<Vec<TradedPick>> {
+        let v = self.get_json(&format!("/league/{league_id}/traded_picks")).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     pub async fn get_nfl_state(&self) -> Result<NflState> {
         let v = self.get_json("/state/nfl").await?;
         Ok(serde_json::from_value(v)?)

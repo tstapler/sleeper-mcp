@@ -189,10 +189,25 @@ fn default_26() -> u32 { 26 }
 fn default_30_usize() -> usize { 30 }
 
 #[derive(Deserialize, JsonSchema)]
+struct PickParam {
+    /// e.g. "2027"
+    season: String,
+    /// 1-indexed (round 1 = first round)
+    round: i32,
+    /// The roster_id this pick originally belonged to — NOT the current owner;
+    /// ownership (after any trades) is resolved internally via `traded_picks`.
+    original_roster_id: i32,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct TradeValueParams {
     league_id: String,
     /// Sleeper player IDs to look up (mix both sides of a proposed trade in one call)
+    #[serde(default)]
     player_ids: Vec<String>,
+    /// Draft picks to look up alongside (or instead of) players
+    #[serde(default)]
+    picks: Vec<PickParam>,
 }
 
 /// LIVE WRITE ACTION: submits a real waiver claim/free-agent add against
@@ -499,12 +514,21 @@ impl SleeperMcpServer {
         ).await.map_err(err)?)
     }
 
-    #[tool(description = "Look up real dynasty trade values (FantasyCalc, market-consensus) for a list of Sleeper player IDs — pass both sides of a proposed trade in one call to compare. Values auto-adjust for the league's actual superflex/PPR settings. No dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut) prices IDP players — for a player not in FantasyCalc's own dataset (found:false), value is instead this project's own heuristic (value_source:heuristic_tier_median): the median FantasyCalc value of offensive players sharing that player's dynasty_tier. Check value_source per player — a heuristic estimate, not a market price.")]
+    #[tool(description = "Look up real dynasty trade values (FantasyCalc, market-consensus) for Sleeper player IDs and/or draft picks — pass both sides of a proposed trade in one call to compare. Values auto-adjust for the league's actual superflex/PPR settings. Players: no dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut) prices IDP players — for a player not in FantasyCalc's own dataset (found:false), value is instead this project's own heuristic (value_source:heuristic_tier_median): the median FantasyCalc value of offensive players sharing that player's dynasty_tier. Picks: identify by season/round/original_roster_id (the pick's original owner, NOT necessarily who holds it now — ownership after trades is resolved internally). FantasyCalc only prices a generic year+round slot, not a specific team's pick, so for the one upcoming draft year it splits into Early/Mid/Late terciles, value_source:pick_slot_projection means this project projected which tercile the current owner's pick lands in from this league's own current standings (a projection that will move as standings change, and carries extra caveats if that roster is still playoff-eligible — read the `note` field); value_source:pick_slot_generic means it's too far out to project a slot, just the plain year+round value; value_source:unpriced means outside FantasyCalc's coverage entirely. Check value_source on every row — never assume a market price.")]
     async fn get_trade_value(
         &self,
         #[tool(aggr)] p: TradeValueParams,
     ) -> Result<CallToolResult, McpError> {
-        ok(self.svc.trade_value_check(&p.league_id, &p.player_ids).await.map_err(err)?)
+        let picks: Vec<crate::analysis::PickDescriptor> = p
+            .picks
+            .into_iter()
+            .map(|pp| crate::analysis::PickDescriptor {
+                season: pp.season,
+                round: pp.round,
+                original_roster_id: pp.original_roster_id,
+            })
+            .collect();
+        ok(self.svc.trade_value_check(&p.league_id, &p.player_ids, &picks).await.map_err(err)?)
     }
 
     #[tool(description = "Full report for specific players: current Sleeper status/injury/practice-participation fields, aggregated recent news (RotoWire + ESPN), dynasty tier, and season production trend (PPG, games played, trend arrow). League-agnostic. Use search_players first if you only have a name, not a player_id.")]

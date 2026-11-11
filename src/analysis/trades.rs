@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::models::Roster;
 
 use super::dynasty::{enrich_player, enrich_player_full};
+use super::picks::{self, PickDescriptor, PickValuationContext};
 use super::{best_cached_season, AnalysisService};
 
 /// Median FantasyCalc value within each `dynasty_tier` bucket (1-4), computed
@@ -87,6 +88,36 @@ fn summarize_trade_value(
 }
 
 impl AnalysisService {
+    /// Resolves and values every requested pick, extracted out of
+    /// `trade_value_check` so that function stays focused on the
+    /// player-pricing path it already had.
+    async fn resolve_pick_values(
+        &self,
+        league_id: &str,
+        playoff_teams: Option<i32>,
+        all_values: &[Value],
+        by_sleeper_id: &HashMap<&str, &Value>,
+        picks_requested: &[PickDescriptor],
+    ) -> Result<Vec<Value>> {
+        if picks_requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (rosters, _users) = self.fetch_rosters_and_users(league_id).await?;
+        let traded_picks = self.client.get_traded_picks(league_id).await?;
+        let state = self.client.get_nfl_state().await?;
+        let draft_order = picks::project_draft_order(&rosters);
+        let tercile_year = picks::tercile_year(all_values);
+        let ctx = PickValuationContext {
+            traded_picks: &traded_picks,
+            draft_order: &draft_order,
+            by_sleeper_id,
+            tercile_year: tercile_year.as_deref(),
+            playoff_teams,
+            standings_snapshot_week: state.week,
+        };
+        Ok(picks_requested.iter().map(|pd| picks::summarize_pick_value(pd, &ctx)).collect())
+    }
+
     // -----------------------------------------------------------------------
     // Trade analysis
     // -----------------------------------------------------------------------
@@ -153,8 +184,8 @@ impl AnalysisService {
     }
 
     /// Look up real dynasty trade values (FantasyCalc, sleeperId-keyed) for a specific list of
-    /// players. Auto-derives numQbs/ppr from the league's actual settings so values match its
-    /// format (e.g. superflex leagues value QBs much higher than 1-QB leagues).
+    /// players and/or draft picks. Auto-derives numQbs/ppr from the league's actual settings so
+    /// values match its format (e.g. superflex leagues value QBs much higher than 1-QB leagues).
     ///
     /// No major dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut — all checked
     /// directly) prices IDP players at all; there is no market-consensus number to fall back
@@ -163,10 +194,18 @@ impl AnalysisService {
     /// offensive players sharing that player's `dynasty_tier`, computed live from the same
     /// fetch rather than hardcoded. `found: false` still means "not in FantasyCalc's own
     /// dataset" — `value_source` distinguishes a real market price from this estimate.
+    ///
+    /// Picks get the analogous treatment: FantasyCalc prices a generic "2027 2nd (Mid)" slot,
+    /// not a specific team's pick, so `picks.rs` resolves current ownership (trades already
+    /// made) and projects which third of the round the owning roster will likely land in from
+    /// this league's own current standings — only for the one upcoming draft year FantasyCalc
+    /// splits into Early/Mid/Late at all; further-out years get the plain generic value instead.
+    /// Rosters/traded-picks/NFL-state are only fetched when `picks` is non-empty.
     pub async fn trade_value_check(
         &self,
         league_id: &str,
         player_ids: &[String],
+        picks_requested: &[PickDescriptor],
     ) -> Result<serde_json::Value> {
         let league = self.client.get_league(league_id).await?;
         let num_qbs: u32 = if league.is_superflex() { 2 } else { 1 };
@@ -191,6 +230,16 @@ impl AnalysisService {
             })
             .collect();
 
+        let pick_rows = self
+            .resolve_pick_values(
+                league_id,
+                league.settings.playoff_teams,
+                &all_values,
+                &by_sleeper_id,
+                picks_requested,
+            )
+            .await?;
+
         Ok(serde_json::json!({
             "source": "fantasycalc.com",
             "is_dynasty": true,
@@ -198,8 +247,12 @@ impl AnalysisService {
             "ppr": ppr,
             "note": "value_source \"fantasycalc\" is a real market price; \"heuristic_tier_median\" \
                      is this project's own estimate (no dynasty value source prices IDP at all) — \
-                     treat it as a rough same-tier comparison, not a market consensus",
+                     treat it as a rough same-tier comparison, not a market consensus. For picks, \
+                     \"pick_slot_projection\" is this league's own standings-based slot estimate (will \
+                     move as standings change), \"pick_slot_generic\" is a year+round value too far out \
+                     to project a slot for, and \"unpriced\" is outside FantasyCalc's coverage entirely.",
             "players": players,
+            "picks": pick_rows,
         }))
     }
 
