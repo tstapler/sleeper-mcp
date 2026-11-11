@@ -89,7 +89,17 @@ impl BrowserSession for SleeperBrowser {
                             visible: b.offsetParent !== null,
                         })),
                         ua: navigator.userAgent,
-                        webdriver: navigator.webdriver,
+                        // `navigator.webdriver === undefined` is the
+                        // cleanest possible stealth reading, but
+                        // JSON.stringify drops a key whose value is
+                        // `undefined` entirely — stringify it explicitly so
+                        // the key always survives for stealth_health's
+                        // substring check (confirmed live 2026-11-10: a
+                        // probe taken before any navigation reads genuinely
+                        // `undefined` and the bare `webdriver: navigator.
+                        // webdriver` form silently dropped it, misreporting
+                        // a clean signal as "missing/tampered").
+                        webdriver: typeof navigator.webdriver === 'undefined' ? 'undefined' : navigator.webdriver,
                         languages: navigator.languages,
                         plugins: navigator.plugins.length,
                     })"#,
