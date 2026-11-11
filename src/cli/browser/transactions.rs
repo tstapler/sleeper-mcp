@@ -97,7 +97,11 @@ struct SyncContext<'a> {
 /// Resolves one entry's `adds`/`drops` via the shared `resolve_side` (Task
 /// 2.2.1c), upserts it, and reports whether the write actually changed
 /// anything (for the caller's `rows_changed` tally).
-async fn persist_one_entry(ctx: &SyncContext<'_>, entry: &LeagueTransaction) -> Result<bool> {
+async fn persist_one_entry(
+    ctx: &SyncContext<'_>,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    entry: &LeagueTransaction,
+) -> Result<bool> {
     let adds = resolve_side(&entry.raw_adds, ctx.all_players, ctx.owner_by_roster);
     let drops = resolve_side(&entry.raw_drops, ctx.all_players, ctx.owner_by_roster);
     let roster_ids_json = serde_json::json!(entry.roster_ids);
@@ -105,21 +109,24 @@ async fn persist_one_entry(ctx: &SyncContext<'_>, entry: &LeagueTransaction) -> 
     let changed = transaction_would_change(existing, entry, &adds, &drops, &roster_ids_json);
 
     ctx.db
-        .upsert_transaction(TransactionRow {
-            transaction_id: &entry.transaction_id,
-            league_id: ctx.league_id,
-            season: ctx.season,
-            week: entry.leg as i32,
-            kind: &entry.kind,
-            status: Some(entry.status.as_str()),
-            created: entry.created,
-            adds: &adds,
-            drops: &drops,
-            roster_ids: &roster_ids_json,
-            waiver_bid: entry.waiver_bid,
-            status_updated: entry.status_updated,
-            source: "graphql",
-        })
+        .upsert_transaction_in_tx(
+            tx,
+            TransactionRow {
+                transaction_id: &entry.transaction_id,
+                league_id: ctx.league_id,
+                season: ctx.season,
+                week: entry.leg as i32,
+                kind: &entry.kind,
+                status: Some(entry.status.as_str()),
+                created: entry.created,
+                adds: &adds,
+                drops: &drops,
+                roster_ids: &roster_ids_json,
+                waiver_bid: entry.waiver_bid,
+                status_updated: entry.status_updated,
+                source: "graphql",
+            },
+        )
         .await?;
     Ok(changed)
 }
@@ -170,24 +177,35 @@ pub(crate) async fn persist_league_transactions(
         existing_by_id: &existing_by_id,
     };
 
+    // Fix 2 (Phase 6 review): every upsert in this backfill plus the
+    // trailing coverage-ledger row commit as one SQL transaction, so a
+    // mid-backfill crash can't leave a partially-updated `transactions`
+    // table with no ledger row to reveal the backfill never finished.
+    let mut tx = db.begin_transaction().await?;
+
     let rows_fetched = entries.len();
     let mut rows_changed = 0usize;
     for entry in entries {
-        if persist_one_entry(&ctx, entry).await? {
+        if persist_one_entry(&ctx, &mut tx, entry).await? {
             rows_changed += 1;
         }
     }
 
-    db.record_sync_run(TransactionSyncRun {
-        league_id,
-        season,
-        source: "graphql",
-        roster_scope: "all",
-        synced_at: chrono::Utc::now(),
-        rows_fetched: rows_fetched as i64,
-        rows_changed: rows_changed as i64,
-    })
+    db.record_sync_run_in_tx(
+        &mut tx,
+        TransactionSyncRun {
+            league_id,
+            season,
+            source: "graphql",
+            roster_scope: "all",
+            synced_at: chrono::Utc::now(),
+            rows_fetched: rows_fetched as i64,
+            rows_changed: rows_changed as i64,
+        },
+    )
     .await?;
+
+    tx.commit().await?;
 
     Ok((rows_fetched, rows_changed))
 }
@@ -207,7 +225,10 @@ async fn fetch_league_transactions(
     use crate::browser::session::{league_transactions_via_seam, DEAD_SESSION_HINT};
 
     let outcome = league_transactions_via_seam(session, league_id, &[]).await;
-    session.close().await?;
+    // Fix 1 (Phase 6 review): capture the close result separately and only
+    // surface it once `outcome` is known to be `Ok` — a `close()` error must
+    // never shadow the seam call's own, more actionable error.
+    let close_result = session.close().await;
     let raw = match outcome {
         Ok(raw) => raw,
         Err(e) if e.to_string() == DEAD_SESSION_HINT => return Err(e),
@@ -218,6 +239,7 @@ async fn fetch_league_transactions(
             )))
         }
     };
+    close_result?;
     parse_league_transactions(&raw)
 }
 
@@ -237,8 +259,11 @@ pub(crate) async fn run_league_transactions_sync(
         Err(e) => return Err(launch_failure_error(&e)),
     };
     let result = fetch_league_transactions(&mut *session, league_id).await;
-    launched.close().await?;
+    // Fix 1 (Phase 6 review): same close-result-after-original-result
+    // discipline as `fetch_league_transactions` above.
+    let close_result = launched.close().await;
     let entries = result?;
+    close_result?;
 
     let season = analysis.client.get_league(league_id).await?.season;
     let all_players = analysis.client.get_all_players("nfl").await?;
@@ -827,24 +852,10 @@ mod tests {
     use super::{fetch_league_transactions, persist_league_transactions};
     use crate::browser::session::FakeSession;
     use crate::browser::BrowserSession;
-    use crate::db::StatsDb;
+    use crate::test_support::test_db;
     use std::collections::HashMap;
 
     const LEAGUE_ID: &str = "1352883872131481600";
-
-    /// `StatsDb::open` takes a file path (no in-memory mode, same as
-    /// `db.rs`'s own test helper) — each test gets its own scratch file.
-    async fn test_db(name: &str) -> StatsDb {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "sleeper_transactions_test_{name}_{}_{nanos}.db",
-            std::process::id()
-        ));
-        StatsDb::open(&path).await.expect("open test db")
-    }
 
     fn fixture_all_players() -> HashMap<String, serde_json::Value> {
         let mut m = HashMap::new();
@@ -1186,24 +1197,8 @@ mod tests {
     // against the real function without a browser or network.
     // -------------------------------------------------------------------
 
-    use super::{read_through, AnalysisService};
-    use crate::client::SleeperClient;
-    use crate::config::Config;
-
-    async fn test_analysis_service(name: &str) -> (Config, AnalysisService) {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let data_dir = std::env::temp_dir().join(format!(
-            "sleeper_read_through_test_{name}_{}_{nanos}",
-            std::process::id()
-        ));
-        let config = Config { data_dir, ..Config::default() };
-        let client = SleeperClient::new(&config).await.expect("build client (no network at construction)");
-        let db = StatsDb::open(&config.stats_db_path()).await.expect("open test db");
-        (config.clone(), AnalysisService::new(client, db))
-    }
+    use super::read_through;
+    use crate::test_support::test_analysis_service;
 
     #[tokio::test]
     async fn read_through_should_return_empty_with_no_live_call_when_cached_only_and_cache_is_empty() {

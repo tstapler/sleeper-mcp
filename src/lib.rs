@@ -9,3 +9,5 @@ pub mod error;
 pub mod mcp;
 pub mod models;
 pub mod rate_limit;
+#[cfg(test)]
+pub(crate) mod test_support;

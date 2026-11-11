@@ -460,6 +460,24 @@ impl StatsDb {
     /// `has_full_league_graphql_coverage` can tell "never backfilled" apart
     /// from "backfilled, just a while ago."
     pub async fn record_sync_run(&self, row: TransactionSyncRun<'_>) -> Result<()> {
+        Self::exec_record_sync_run(&self.pool, &row).await
+    }
+
+    /// Fix 2 (Phase 6 review): transaction-scoped variant of
+    /// [`Self::record_sync_run`] — see [`Self::upsert_transaction_in_tx`]'s
+    /// doc comment for why `persist_league_transactions` needs this.
+    pub(crate) async fn record_sync_run_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        row: TransactionSyncRun<'_>,
+    ) -> Result<()> {
+        Self::exec_record_sync_run(&mut **tx, &row).await
+    }
+
+    async fn exec_record_sync_run<'e, E>(executor: E, row: &TransactionSyncRun<'_>) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         sqlx::query(
             "INSERT INTO transaction_sync_runs
              (league_id, season, source, roster_scope, synced_at, rows_fetched, rows_changed)
@@ -472,9 +490,18 @@ impl StatsDb {
         .bind(row.synced_at.to_rfc3339())
         .bind(row.rows_fetched)
         .bind(row.rows_changed)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
+    }
+
+    /// Fix 2 (Phase 6 review): begins a SQL transaction against the shared
+    /// pool. `'static` because `SqlitePool::begin` hands back an owned pooled
+    /// connection, not a borrow of the pool — the same reason callers can
+    /// hold this across `.await` points and commit it independently of
+    /// `self`.
+    pub(crate) async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        Ok(self.pool.begin().await?)
     }
 
     /// Most recent `synced_at` among full-league GraphQL backfills for
@@ -570,11 +597,32 @@ impl StatsDb {
     /// `adds`/`drops` are pre-resolved JSON (player name/position/owner, not
     /// bare IDs) so a `sqlite3 stats.db` query can filter by position/owner
     /// directly without a second lookup pass.
-    // kibitzer:ignore long-function -- body is one atomic SQL upsert statement; the line
-    // count is the query text itself, splitting it further would fragment one operation.
     pub async fn upsert_transaction(&self, row: TransactionRow<'_>) -> Result<()> {
         self.warn_if_stale_status_write(&row).await?;
+        Self::exec_upsert_transaction(&self.pool, &row).await
+    }
 
+    /// Fix 2 (Phase 6 review of the GraphQL backfill): transaction-scoped
+    /// variant of [`Self::upsert_transaction`], so `persist_league_transactions`
+    /// can run every upsert in the backfill plus the trailing
+    /// `record_sync_run_in_tx` coverage row as one SQL transaction — a
+    /// mid-backfill crash then can't leave a partially-updated `transactions`
+    /// table with no ledger row to reveal the backfill never finished.
+    pub(crate) async fn upsert_transaction_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        row: TransactionRow<'_>,
+    ) -> Result<()> {
+        self.warn_if_stale_status_write(&row).await?;
+        Self::exec_upsert_transaction(&mut **tx, &row).await
+    }
+
+    // kibitzer:ignore long-function -- body is one atomic SQL upsert statement; the line
+    // count is the query text itself, splitting it further would fragment one operation.
+    async fn exec_upsert_transaction<'e, E>(executor: E, row: &TransactionRow<'_>) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         // `waiver_bid` is COALESCEd on conflict rather than overwritten: the
         // public-REST sync path never knows a bid amount, and a re-sync from
         // there must not erase a bid the authenticated-browser sync path
@@ -629,7 +677,7 @@ impl StatsDb {
         .bind(row.status_updated)
         .bind(row.source)
         .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -765,21 +813,8 @@ impl StatsDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_db;
     use std::sync::{Arc, Mutex};
-
-    /// `StatsDb::open` takes a file path (no in-memory mode), so each test
-    /// gets its own scratch file under the OS temp dir rather than sharing state.
-    async fn test_db(name: &str) -> StatsDb {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "sleeper_test_{name}_{}_{nanos}.db",
-            std::process::id()
-        ));
-        StatsDb::open(&path).await.expect("open test db")
-    }
 
     fn base_row<'a>(
         transaction_id: &'a str,

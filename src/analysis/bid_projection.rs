@@ -28,6 +28,7 @@ use crate::error::{Error, Result};
 use crate::models::{League, Roster};
 
 use super::dynasty::enrich_player;
+use super::roster::IDEAL_ROSTER_SHAPE;
 use super::AnalysisService;
 
 // ---------------------------------------------------------------------------
@@ -241,12 +242,14 @@ pub(super) fn league_demand_signal(
     all_players: &HashMap<String, Value>,
     position: &str,
 ) -> LeagueDemandSignal {
-    const IDEAL_LOW: &[(&str, usize)] =
-        &[("QB", 1), ("RB", 4), ("WR", 4), ("TE", 1), ("K", 0), ("DEF", 0)];
-    let low = IDEAL_LOW
+    // Fix 3 (Phase 6 review): shares `roster.rs`'s `IDEAL_ROSTER_SHAPE`
+    // table rather than keeping a second, driftable copy of the same
+    // position -> target-count domain knowledge — only its `low` floor is
+    // used here.
+    let low = IDEAL_ROSTER_SHAPE
         .iter()
-        .find(|(p, _)| *p == position)
-        .map(|(_, l)| *l)
+        .find(|(p, _, _)| *p == position)
+        .map(|(_, low, _)| *low)
         .unwrap_or(0);
 
     let mut pull_by_roster = BTreeMap::new();
@@ -518,34 +521,19 @@ impl AnalysisService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::SleeperClient;
-    use crate::config::Config;
     use crate::db::{StatsDb, TransactionRow, TransactionSyncRun};
     use crate::models::{LeagueSettings, RosterSettings};
+    use crate::test_support::test_analysis_service;
 
     // -----------------------------------------------------------------------
     // Test fixtures
     // -----------------------------------------------------------------------
 
-    /// Same construction as `cli/browser/transactions.rs`'s
-    /// `test_analysis_service` helper: a scratch-dir `Config` per test (no
-    /// in-memory DB mode), a `SleeperClient` built but never asked to make a
-    /// network call, and a fresh `StatsDb` file. None of this module's tests
-    /// exercise `AnalysisService::client` — `project_waiver_bid_with` (the
-    /// tested core) takes `rosters`/`all_players`/`league` as parameters —
-    /// so the client is only here to satisfy `AnalysisService`'s shape.
-    async fn test_analysis_service(name: &str) -> AnalysisService {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let data_dir = std::env::temp_dir()
-            .join(format!("sleeper_bid_projection_test_{name}_{}_{nanos}", std::process::id()));
-        let config = Config { data_dir, ..Config::default() };
-        let client = SleeperClient::new(&config).await.expect("build client (no network at construction)");
-        let db = StatsDb::open(&config.stats_db_path()).await.expect("open test db");
-        AnalysisService::new(client, db)
-    }
+    // None of this module's tests exercise `AnalysisService::client` —
+    // `project_waiver_bid_with` (the tested core) takes
+    // `rosters`/`all_players`/`league` as parameters — so each call below
+    // discards the shared `test_analysis_service` helper's `Config` half and
+    // keeps only the `AnalysisService`.
 
     fn brissett_players() -> HashMap<String, Value> {
         let mut m = HashMap::new();
@@ -694,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn bid_history_signal_should_report_mean_and_sample_size_together_when_four_qb_bids_cached(
     ) {
-        let service = test_analysis_service("bid_history_mean").await;
+        let (_, service) = test_analysis_service("bid_history_mean").await;
         let league_id = "1352883872131481600";
         for (i, bid) in [12i64, 8, 15, 5].into_iter().enumerate() {
             seed_waiver(&service.db, &i.to_string(), league_id, "2026", "complete", vec![5], Some(bid), "QB")
@@ -711,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn bid_history_signal_should_aggregate_separately_per_season_when_multiple_seasons_cached()
     {
-        let service = test_analysis_service("bid_history_per_season").await;
+        let (_, service) = test_analysis_service("bid_history_per_season").await;
         let league_id = "1352883872131481600";
         seed_waiver(&service.db, "s2025-a", league_id, "2025", "complete", vec![5], Some(100), "QB").await;
         seed_waiver(&service.db, "s2026-a", league_id, "2026", "complete", vec![5], Some(12), "QB").await;
@@ -731,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn claim_frequency_signal_should_count_seven_claims_when_roster_has_seven_waiver_transactions(
     ) {
-        let service = test_analysis_service("claim_frequency_count").await;
+        let (_, service) = test_analysis_service("claim_frequency_count").await;
         let league_id = "1352883872131481600";
         for i in 0..7 {
             // Mix of statuses — claim frequency counts submission behavior,
@@ -751,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn claim_frequency_signal_should_return_zero_when_roster_has_no_claims_for_requested_position(
     ) {
-        let service = test_analysis_service("claim_frequency_scoped").await;
+        let (_, service) = test_analysis_service("claim_frequency_scoped").await;
         let league_id = "1352883872131481600";
         for i in 0..3 {
             seed_waiver(&service.db, &format!("rb{i}"), league_id, "2026", "complete", vec![5], None, "RB")
@@ -775,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn faab_remaining_should_report_verified_confidence_when_full_league_graphql_coverage_recorded(
     ) {
-        let service = test_analysis_service("faab_verified").await;
+        let (_, service) = test_analysis_service("faab_verified").await;
         let league = league_fixture(100);
         let as_of = Utc::now();
         service
@@ -808,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn faab_remaining_should_report_floor_confidence_when_no_full_league_backfill_recorded() {
-        let service = test_analysis_service("faab_floor").await;
+        let (_, service) = test_analysis_service("faab_floor").await;
         let league = league_fixture(100);
         // No `record_sync_run` call at all — no full-league GraphQL backfill.
 
@@ -824,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn bid_projection_should_include_competing_roster_faab_when_other_rosters_have_positional_demand(
     ) {
-        let service = test_analysis_service("competing_roster_faab").await;
+        let (_, service) = test_analysis_service("competing_roster_faab").await;
         let league = league_fixture(100);
 
         // Roster 5 is the target; rosters 9 and 11 have the highest QB pull.
@@ -858,7 +846,7 @@ mod tests {
     // set across several tests that all need the same seeded fixture.
     async fn project_waiver_bid_should_return_non_placeholder_values_for_all_five_signals_when_called_for_known_player_and_roster(
     ) {
-        let service = test_analysis_service("project_waiver_bid_full").await;
+        let (_, service) = test_analysis_service("project_waiver_bid_full").await;
         let league = league_fixture(100);
         for (i, bid) in [12i64, 8, 15, 5, 20].into_iter().enumerate() {
             seed_waiver(&service.db, &format!("h{i}"), &league.league_id, "2026", "complete", vec![9], Some(bid), "QB")
@@ -906,7 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_waiver_bid_should_return_err_when_roster_id_does_not_exist_in_league() {
-        let service = test_analysis_service("project_waiver_bid_unknown_roster").await;
+        let (_, service) = test_analysis_service("project_waiver_bid_unknown_roster").await;
         let league = league_fixture(100);
         let rosters = vec![roster_fixture(5, 1)];
         let all_players = brissett_players();

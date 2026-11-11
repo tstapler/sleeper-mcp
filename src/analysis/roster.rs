@@ -12,6 +12,21 @@ use crate::models::League;
 use super::dynasty::enrich_player;
 use super::AnalysisService;
 
+/// Fix 3 (Phase 6 review): the "ideal roster shape" target counts, shared by
+/// `analyze_roster_needs` below and `bid_projection.rs`'s `league_demand_signal`
+/// — promoted to a single `pub(crate)` constant (the same promotion pattern
+/// this file's own `resolve_side` already used for Epic 2.2.1c) so the two
+/// call sites can't drift. `(position, low, high)`; `bid_projection.rs` only
+/// ever reads the `low` floor.
+pub(crate) const IDEAL_ROSTER_SHAPE: &[(&str, usize, usize)] = &[
+    ("QB", 1, 2),
+    ("RB", 4, 6),
+    ("WR", 4, 6),
+    ("TE", 1, 2),
+    ("K", 0, 1),
+    ("DEF", 0, 1),
+];
+
 /// Epic 2.2 / Task 2.2.1c (architecture review Blocker 1): the REST path's
 /// `{player_id, name, position, roster_id, owner}` enrichment, promoted out
 /// of `sync_transaction_history`'s private closure so the whole-league
@@ -265,17 +280,9 @@ impl AnalysisService {
             }
         }
 
-        let ideal: &[(&str, usize, usize)] = &[
-            ("QB", 1, 2),
-            ("RB", 4, 6),
-            ("WR", 4, 6),
-            ("TE", 1, 2),
-            ("K", 0, 1),
-            ("DEF", 0, 1),
-        ];
         let mut strengths: Vec<String> = Vec::new();
         let mut weaknesses: Vec<String> = Vec::new();
-        for (pos, low, high) in ideal {
+        for (pos, low, high) in IDEAL_ROSTER_SHAPE {
             let count = *pos_counts.get(*pos).unwrap_or(&0);
             if count > *high {
                 strengths.push(format!("{pos}: {count} players (surplus — trade bait)"));

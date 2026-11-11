@@ -198,11 +198,28 @@ pub(crate) async fn run_edit_cancel_claim(
         Err(e) => return Err(launch_failure_error(&e)),
     };
     let outcome = edit_cancel_claim_via_seam(&*session, league_id, transaction_id, action).await;
-    session.close().await?;
-    launched.close().await?;
+    // Fix 1 (Phase 6 review): capture both close results separately and only
+    // surface them once `outcome` is known to be `Ok` — a `close()` error
+    // must never shadow the seam flow's own, more actionable error.
+    let session_close_result = session.close().await;
+    let launched_close_result = launched.close().await;
+    let outcome = match outcome {
+        Ok(o) => {
+            session_close_result?;
+            launched_close_result?;
+            o
+        }
+        Err(e) if e.to_string() == DEAD_SESSION_HINT => return Err(e),
+        Err(e) => {
+            return Err(crate::browser::other(triage_error(
+                &edit_cancel_failed_triage(),
+                &debug_detail(&e.to_string()),
+            )))
+        }
+    };
 
     match outcome {
-        Ok(EditCancelOutcome::Confirmed) => {
+        EditCancelOutcome::Confirmed => {
             // Post-write re-check: `Confirmed` only means the in-page
             // confirmation read looked right — ask the independent source
             // of truth too, before Epic 4.3 is allowed to print success.
@@ -214,16 +231,7 @@ pub(crate) async fn run_edit_cancel_claim(
                 None => Ok(EditCancelRunOutcome::ConfirmedButUnverified),
             }
         }
-        Ok(other_outcome) => Ok(EditCancelRunOutcome::SeamOutcome(other_outcome)),
-        Err(e) if e.to_string() == DEAD_SESSION_HINT => Err(e),
-        // Generic flow failure (no-unique-row-match, selector/DOM-drift,
-        // etc.) — never reached one of `EditCancelOutcome`'s three typed
-        // checkpoints, so it gets the same catch-all triage treatment
-        // `run_claim`'s own generic `Err(e)` arm uses (`actions.rs:98-101`).
-        Err(e) => Err(crate::browser::other(triage_error(
-            &edit_cancel_failed_triage(),
-            &debug_detail(&e.to_string()),
-        ))),
+        other_outcome => Ok(EditCancelRunOutcome::SeamOutcome(other_outcome)),
     }
 }
 
@@ -305,8 +313,8 @@ pub(crate) async fn cmd_waiver_edit_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::SleeperClient;
-    use crate::db::{StatsDb, TransactionRow};
+    use crate::db::TransactionRow;
+    use crate::test_support::test_analysis_service;
 
     fn cached_row(transaction_id: &str, status: Option<&str>, waiver_bid: Option<i64>) -> CachedTransaction {
         CachedTransaction {
@@ -480,21 +488,6 @@ mod tests {
     // (`edit_cancel_claim_via_seam`) is independently proven end-to-end
     // against `FakeSession` in `tests/browser_edit_cancel.rs`.
     // -----------------------------------------------------------------
-
-    async fn test_analysis_service(name: &str) -> (Config, AnalysisService) {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let data_dir = std::env::temp_dir().join(format!(
-            "sleeper_edit_cancel_test_{name}_{}_{nanos}",
-            std::process::id()
-        ));
-        let config = Config { data_dir, ..Config::default() };
-        let client = SleeperClient::new(&config).await.expect("build client (no network at construction)");
-        let db = StatsDb::open(&config.stats_db_path()).await.expect("open test db");
-        (config.clone(), AnalysisService::new(client, db))
-    }
 
     const LEAGUE_ID: &str = "1352883872131481600";
 

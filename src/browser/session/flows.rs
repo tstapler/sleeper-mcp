@@ -177,9 +177,6 @@ pub async fn pending_transactions_via_seam(
         types = ?type_filters
     );
     let _enter = start.enter();
-    if !session.is_logged_in().await.unwrap_or(false) {
-        return Err(other(DEAD_SESSION_HINT));
-    }
 
     let types_json = serde_json::to_string(type_filters).map_err(other)?;
     let query = format!(
@@ -192,6 +189,22 @@ pub async fn pending_transactions_via_seam(
     })
     .to_string();
     let body_json = serde_json::to_string(&body).map_err(other)?;
+    let raw = graphql_post_via_seam(session, &body_json).await?;
+    tracing::info!("pending_transactions fetched");
+    Ok(raw)
+}
+
+/// Fix 4 (Phase 6 review): shared core for every GraphQL POST this module
+/// makes through the seam — the login check, and the `localStorage`
+/// token-read-entirely-in-page-JS `fetch('/graphql', ...)` template (see
+/// [`pending_transactions_via_seam`]'s own doc comment for why the token
+/// never crosses into a Rust value). Parameterized only by the
+/// already-JSON-encoded request body (`operationName`/`variables`/`query`),
+/// the one part that actually varies between callers.
+async fn graphql_post_via_seam(session: &dyn BrowserSession, body_json: &str) -> Result<String> {
+    if !session.is_logged_in().await.unwrap_or(false) {
+        return Err(other(DEAD_SESSION_HINT));
+    }
     let js = format!(
         r#"(function(){{
             let t; try {{ t = JSON.parse(localStorage.getItem('token_data')); }} catch (e) {{ t = null; }}
@@ -203,9 +216,7 @@ pub async fn pending_transactions_via_seam(
             }}).then(r => r.text());
         }})()"#
     );
-    let raw = session.eval_string(&js).await?;
-    tracing::info!("pending_transactions fetched");
-    Ok(raw)
+    session.eval_string(&js).await
 }
 
 /// Epic 2.2 / Task 2.2.1a: default `type_filters` for a whole-league
@@ -249,9 +260,6 @@ pub async fn league_transactions_via_seam(
         rosters = ?roster_id_filters
     );
     let _enter = start.enter();
-    if !session.is_logged_in().await.unwrap_or(false) {
-        return Err(other(DEAD_SESSION_HINT));
-    }
 
     let query = build_league_transactions_query(
         league_id,
@@ -265,18 +273,7 @@ pub async fn league_transactions_via_seam(
     })
     .to_string();
     let body_json = serde_json::to_string(&body).map_err(other)?;
-    let js = format!(
-        r#"(function(){{
-            let t; try {{ t = JSON.parse(localStorage.getItem('token_data')); }} catch (e) {{ t = null; }}
-            const tok = (t && (t.token || t.access_token || t.jwt)) || localStorage.getItem('token');
-            return fetch('/graphql', {{
-                method: 'POST',
-                headers: {{ 'content-type': 'application/json', 'authorization': tok }},
-                body: {body_json}
-            }}).then(r => r.text());
-        }})()"#
-    );
-    let raw = session.eval_string(&js).await?;
+    let raw = graphql_post_via_seam(session, &body_json).await?;
     tracing::info!("league_transactions fetched");
     Ok(raw)
 }
