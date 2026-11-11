@@ -208,6 +208,79 @@ pub async fn pending_transactions_via_seam(
     Ok(raw)
 }
 
+/// Epic 2.2 / Task 2.2.1a: default `type_filters` for a whole-league
+/// backfill — every kind `league_transactions_filtered` can return, unlike
+/// `pending_transactions_via_seam`'s caller-supplied (typically
+/// `["waiver"]`) narrower list.
+const LEAGUE_TRANSACTION_TYPE_FILTERS: &[&str] = &["waiver", "trade", "free_agent"];
+
+/// Pure, no I/O (Task 2.2.1a): builds the `league_transactions_filtered`
+/// GraphQL query string. Extracted out of the `eval_string` call site so
+/// the query shape itself — `roster_id_filters`/`type_filters`/
+/// `status_filters` — is unit-testable without a `BrowserSession` double.
+fn build_league_transactions_query(
+    league_id: &str,
+    roster_id_filters: &[i64],
+    type_filters: &[&str],
+) -> Result<String> {
+    let roster_ids_json = serde_json::to_string(roster_id_filters).map_err(other)?;
+    let types_json = serde_json::to_string(type_filters).map_err(other)?;
+    Ok(format!(
+        r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: "{league_id}", roster_id_filters: {roster_ids_json}, type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
+    ))
+}
+
+/// Epic 2.2 / Task 2.2.1a: generalizes [`pending_transactions_via_seam`] to
+/// a whole-league backfill — drops the single-`roster_id` filter
+/// (`roster_id_filters: &[i64]`, empty = every roster) and widens
+/// `type_filters` to [`LEAGUE_TRANSACTION_TYPE_FILTERS`] and
+/// `status_filters` to `[]` (every status, not just one caller-chosen
+/// subset), so one round-trip covers the whole league instead of twelve
+/// per-roster calls. Same `localStorage`-token-read-entirely-in-page-JS
+/// discipline as `pending_transactions_via_seam` — no new auth surface.
+pub async fn league_transactions_via_seam(
+    session: &dyn BrowserSession,
+    league_id: &str,
+    roster_id_filters: &[i64],
+) -> Result<String> {
+    let start = tracing::info_span!(
+        "league_transactions.start",
+        league = league_id,
+        rosters = ?roster_id_filters
+    );
+    let _enter = start.enter();
+    if !session.is_logged_in().await.unwrap_or(false) {
+        return Err(other(DEAD_SESSION_HINT));
+    }
+
+    let query = build_league_transactions_query(
+        league_id,
+        roster_id_filters,
+        LEAGUE_TRANSACTION_TYPE_FILTERS,
+    )?;
+    let body = serde_json::json!({
+        "operationName": "league_transactions_filtered",
+        "variables": {},
+        "query": query,
+    })
+    .to_string();
+    let body_json = serde_json::to_string(&body).map_err(other)?;
+    let js = format!(
+        r#"(function(){{
+            let t; try {{ t = JSON.parse(localStorage.getItem('token_data')); }} catch (e) {{ t = null; }}
+            const tok = (t && (t.token || t.access_token || t.jwt)) || localStorage.getItem('token');
+            return fetch('/graphql', {{
+                method: 'POST',
+                headers: {{ 'content-type': 'application/json', 'authorization': tok }},
+                body: {body_json}
+            }}).then(r => r.text());
+        }})()"#
+    );
+    let raw = session.eval_string(&js).await?;
+    tracing::info!("league_transactions fetched");
+    Ok(raw)
+}
+
 // --- Epic 1.4 / Story 1.4.1: edit/cancel row-identity disambiguation ---
 // ADR-004: resolved without a new `BrowserSession` trait primitive. See
 // Step 0.5 fork #3 and the Domain Glossary entries for `claim_row_disambiguator`
@@ -517,5 +590,34 @@ mod tests {
         let err = claim_row_disambiguator(&rows, &RowTarget::TransactionId("999".to_string()))
             .expect_err("no match must be Err, never a guessed index");
         assert!(err.to_string().contains("no candidate"));
+    }
+
+    /// Story 2.2.1 AC1, Task 2.2.1a: the whole-league query drops the
+    /// single-roster hardcode and widens type/status filters, unlike
+    /// `pending_transactions_via_seam`'s `roster_id_filters: [roster_id]`.
+    #[test]
+    fn league_transactions_query_should_request_whole_league_scope_when_roster_filter_omitted() {
+        let q = build_league_transactions_query(
+            "1352883872131481600",
+            &[],
+            LEAGUE_TRANSACTION_TYPE_FILTERS,
+        )
+        .expect("query must build");
+        assert!(q.contains("roster_id_filters: []"), "got {q}");
+        assert!(
+            q.contains(r#"type_filters: ["waiver","trade","free_agent"]"#),
+            "got {q}"
+        );
+        assert!(q.contains("status_filters: []"), "got {q}");
+    }
+
+    /// A non-empty `roster_id_filters` still renders correctly (e.g. a
+    /// narrower, non-"all" scope reusing the same query builder).
+    #[test]
+    fn league_transactions_query_should_render_roster_scope_when_roster_filter_present() {
+        let q = build_league_transactions_query("123", &[5], &["waiver"])
+            .expect("query must build");
+        assert!(q.contains("roster_id_filters: [5]"), "got {q}");
+        assert!(q.contains(r#"type_filters: ["waiver"]"#), "got {q}");
     }
 }

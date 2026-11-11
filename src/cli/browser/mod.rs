@@ -13,6 +13,7 @@ mod doctor;
 pub mod login;
 mod pending;
 pub mod status;
+pub mod transactions;
 
 pub(super) async fn cmd_browser(config: &Config, action: BrowserAction) -> Result<()> {
     match action {

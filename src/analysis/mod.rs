@@ -24,6 +24,10 @@ mod trades;
 mod waivers;
 
 pub use players::{PlayerStats, StatsContext};
+// Epic 2.2 / Task 2.2.1c: `resolve_side` lives in the private `roster`
+// submodule but `run_league_transactions_sync` (src/cli/browser/transactions.rs)
+// is outside the `analysis` module tree, so it needs this re-export to reach it.
+pub(crate) use roster::resolve_side;
 
 #[derive(Clone)]
 pub struct AnalysisService {

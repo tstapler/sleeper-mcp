@@ -12,6 +12,34 @@ use crate::models::League;
 use super::dynasty::enrich_player;
 use super::AnalysisService;
 
+/// Epic 2.2 / Task 2.2.1c (architecture review Blocker 1): the REST path's
+/// `{player_id, name, position, roster_id, owner}` enrichment, promoted out
+/// of `sync_transaction_history`'s private closure so the whole-league
+/// GraphQL backfill (`run_league_transactions_sync`) can produce the
+/// identical shape from a different player/roster-id source map, instead of
+/// inventing a second enrichment convention against
+/// `league_transactions_filtered`'s thinner `player_map` (which lacks
+/// `age`/`years_exp`/`search_rank` — not enough to call `enrich_player`
+/// directly).
+pub(crate) fn resolve_side(
+    side: &HashMap<String, i32>,
+    all_players: &HashMap<String, serde_json::Value>,
+    owner_by_roster: &HashMap<i32, String>,
+) -> serde_json::Value {
+    side.iter()
+        .map(|(pid, roster_id)| {
+            let e = enrich_player(pid, all_players);
+            serde_json::json!({
+                "player_id": pid,
+                "name": e["name"],
+                "position": e["position"],
+                "roster_id": roster_id,
+                "owner": owner_by_roster.get(roster_id).cloned().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 impl AnalysisService {
     // -----------------------------------------------------------------------
     // Roster with player names
@@ -177,21 +205,6 @@ impl AnalysisService {
             })
             .collect();
 
-        let resolve_side = |side: &HashMap<String, i32>| -> serde_json::Value {
-            side.iter()
-                .map(|(pid, roster_id)| {
-                    let e = enrich_player(pid, &all_players);
-                    serde_json::json!({
-                        "player_id": pid,
-                        "name": e["name"],
-                        "position": e["position"],
-                        "roster_id": roster_id,
-                        "owner": owner_by_roster.get(roster_id).cloned().unwrap_or_default(),
-                    })
-                })
-                .collect()
-        };
-
         let mut stored = 0usize;
         for &week in weeks {
             let txns = self.client.get_league_transactions(league_id, week).await?;
@@ -207,8 +220,8 @@ impl AnalysisService {
                         kind: &t.kind,
                         status: Some(t.status.as_str()),
                         created: t.created,
-                        adds: &resolve_side(&adds),
-                        drops: &resolve_side(&drops),
+                        adds: &resolve_side(&adds, &all_players, &owner_by_roster),
+                        drops: &resolve_side(&drops, &all_players, &owner_by_roster),
                         roster_ids: &serde_json::json!(t.roster_ids),
                         waiver_bid: None,
                         status_updated: None,
@@ -395,4 +408,42 @@ fn taxi_ineligibility(taxi: &[Value], settings: &HashMap<String, Value>) -> (Vec
         .collect();
 
     (ineligible, messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_side;
+    use std::collections::HashMap;
+
+    /// Story 2.2.1 AC4, Task 2.2.1c: the promoted `resolve_side` enriches a
+    /// raw GraphQL `adds` map with `position` — the same
+    /// `{player_id, name, position, roster_id, owner}` shape the REST path
+    /// already produces, proving the GraphQL/REST paths share one
+    /// enrichment function rather than diverging conventions.
+    #[test]
+    fn resolve_side_should_enrich_raw_adds_map_with_position_when_fed_graphql_entry() {
+        let mut all_players = HashMap::new();
+        all_players.insert(
+            "3257".to_string(),
+            serde_json::json!({
+                "full_name": "Jacoby Brissett",
+                "position": "QB",
+                "team": "IND",
+            }),
+        );
+        let mut owner_by_roster = HashMap::new();
+        owner_by_roster.insert(5, "Tyler".to_string());
+        let mut adds = HashMap::new();
+        adds.insert("3257".to_string(), 5);
+
+        let resolved = resolve_side(&adds, &all_players, &owner_by_roster);
+        let entries = resolved.as_array().expect("resolve_side returns a JSON array");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["player_id"], serde_json::json!("3257"));
+        assert_eq!(entry["position"], serde_json::json!("QB"));
+        assert_eq!(entry["name"], serde_json::json!("Jacoby Brissett"));
+        assert_eq!(entry["roster_id"], serde_json::json!(5));
+        assert_eq!(entry["owner"], serde_json::json!("Tyler"));
+    }
 }
