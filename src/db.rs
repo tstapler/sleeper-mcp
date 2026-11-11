@@ -85,6 +85,11 @@ pub struct CachedTransaction {
 }
 
 impl StatsDb {
+    /// `busy_timeout` exists because the transactions cache now has two
+    /// independent writers (REST sync and browser/GraphQL sync) that can run
+    /// concurrently; without it, the loser of a write race gets `SQLITE_BUSY`
+    /// instead of retry-waiting for the lock (see `rate_limit.rs:121` for the
+    /// same comment-the-concurrency-decision convention).
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -93,7 +98,8 @@ impl StatsDb {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -980,5 +986,74 @@ mod tests {
         // comparing the parsed DateTime (not a string) avoids a flaky
         // format mismatch.
         assert_eq!(coverage, Some(synced_at));
+    }
+
+    // Epic 1.3 / Story 1.3.1: regression guard against the busy_timeout
+    // setting being dropped from the SqliteConnectOptions chain — asserts
+    // the PRAGMA directly rather than only observing its effect.
+    #[tokio::test]
+    async fn statsdb_open_should_set_busy_timeout_via_pragma() {
+        let db = test_db("busy_timeout_pragma").await;
+
+        let (busy_timeout_ms,): (i64,) = sqlx::query_as("PRAGMA busy_timeout")
+            .fetch_one(&db.pool)
+            .await
+            .expect("query busy_timeout pragma");
+
+        assert_eq!(busy_timeout_ms, 5_000);
+    }
+
+    // Epic 1.3 / Story 1.3.1 AC1 (happy path): two StatsDb handles against
+    // the same file, simulating a REST sync and a GraphQL sync racing each
+    // other. One holds the write lock via an open transaction; the other's
+    // upsert_transaction must block and succeed once the lock is released,
+    // rather than returning SQLITE_BUSY. A oneshot channel (not a bare
+    // sleep) gates when the second writer starts, so the test can't flake
+    // by racing the lock-acquisition itself — only the busy_timeout wait is
+    // timed.
+    #[tokio::test]
+    async fn upsert_transaction_should_succeed_under_concurrent_writers_when_busy_timeout_configured(
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sleeper_test_concurrent_writers_{}_{nanos}.db",
+            std::process::id()
+        ));
+        let db_a = StatsDb::open(&path).await.expect("open db_a");
+        let db_b = StatsDb::open(&path).await.expect("open db_b");
+
+        let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel();
+
+        let holder = tokio::spawn(async move {
+            let mut tx = db_a.pool.begin().await.expect("begin lock-holder tx");
+            // BEGIN is deferred in SQLite; a write is what actually takes
+            // the write lock the second handle will contend on.
+            sqlx::query("INSERT INTO leagues (league_id, data, synced_at) VALUES (?, ?, ?)")
+                .bind("lock-holder")
+                .bind("{}")
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await
+                .expect("acquire write lock");
+            lock_held_tx.send(()).expect("signal lock held");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tx.commit().await.expect("commit lock holder");
+        });
+
+        lock_held_rx.await.expect("wait for lock to be held");
+
+        let empty = serde_json::json!({});
+        let roster_ids = serde_json::json!([5]);
+        let row = base_row("concurrent-writer", &empty, &roster_ids);
+        let result = db_b.upsert_transaction(row).await;
+
+        holder.await.expect("join lock-holder task");
+
+        result.expect(
+            "upsert_transaction should block on busy_timeout and succeed, not return SQLITE_BUSY",
+        );
     }
 }
