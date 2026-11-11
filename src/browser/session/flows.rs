@@ -139,8 +139,20 @@ pub async fn claim_player_via_seam(
 /// Epic 4 lineup mechanism spot-check). `out_player_name`/`in_player_name`
 /// are resolved Sleeper display names (callers resolve player_id ->
 /// full_name before crossing the seam, same as the claim flow). There is no
-/// confirm step on the live UI — clicking the bench replacement's row
-/// completes the swap immediately.
+/// confirm step on the live UI — clicking the second row completes the
+/// swap immediately.
+///
+/// Generalizes to IR/Taxi moves too (live-verified 2026-11-11, real
+/// round-trip against this league): clicking *either* row first enters
+/// select mode and marks every row that player could legally swap into as
+/// `.valid` — a bench player eligible for IR marks the IR row(s) valid, and
+/// clicking an IR occupant marks the bench rows it could legally swap with
+/// (an empty slot, or another IR-eligible bench player) valid. The swap is
+/// symmetric: clicking the IR occupant first then the bench mover, or the
+/// bench mover first then the IR occupant, produce the identical result,
+/// since both are just "click row A, then click the valid row B" in either
+/// order. No slot-type branch exists in this function at all — it never
+/// needed one.
 pub async fn lineup_set_via_seam(
     session: &dyn BrowserSession,
     league_id: &str,

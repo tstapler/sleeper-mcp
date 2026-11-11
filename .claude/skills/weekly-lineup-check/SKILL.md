@@ -118,8 +118,14 @@ traps specific to this league worth naming here:
 ## 7. Setting the lineup: execute, then verify against the *live page*, not just the CLI's own message
 
 ```
-sleeper lineup-set --league 1352883872131481600 --out <bench_player_id> --in <starter_player_id>
+sleeper lineup-set --league 1352883872131481600 --out <currently_occupying_player_id> --in <bench_player_id>
 ```
+
+`--out` is whoever currently occupies the target slot (a started player, or an IR/Taxi
+occupant); `--in` is the bench player moving into it. This same command handles IR/Taxi
+moves too (live-verified 2026-11-11, round-tripped a real swap and back) — there's no
+separate tool for it. To activate someone off IR/Taxi back to the bench, just reverse
+which player_id is `--out` and which is `--in`.
 
 **Never trust "lineup saved" alone.** This flow had two real, now-fixed bugs this
 session (wrong name-matching against the live DOM, and closing the browser before the

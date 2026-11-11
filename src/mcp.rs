@@ -265,19 +265,22 @@ struct TransactionHistoryParams {
     max_age_secs: Option<i64>,
 }
 
-/// LIVE WRITE ACTION: swaps a bench player into a started slot against
-/// sleeper.com through the stealth-browser backend (plan.md
-/// undetected-chromedriver-rust, Story 4.1) on the operator's own persisted,
-/// manually-authenticated Chrome profile. Not a simulation — this changes
-/// the live starting lineup immediately with no confirm step. Requires
+/// LIVE WRITE ACTION: swaps two roster slots against sleeper.com through
+/// the stealth-browser backend (plan.md undetected-chromedriver-rust,
+/// Story 4.1) on the operator's own persisted, manually-authenticated
+/// Chrome profile. Not a simulation — this changes the live roster
+/// immediately with no confirm step. Also covers IR/Taxi moves
+/// (live-verified 2026-11-11) — the DOM swap mechanism has no slot-type
+/// restriction: pass the IR/Taxi occupant as `out` and the bench mover as
+/// `in` (or the reverse, to activate someone back to the bench). Requires
 /// `sleeper browser login` to have been completed by hand at least once
 /// beforehand.
 #[derive(Deserialize, JsonSchema)]
 struct LineupSetParams {
     league_id: String,
-    /// Sleeper player_id of the currently-started player to bench.
+    /// Sleeper player_id currently occupying the target slot (starter, IR, or Taxi) to bench.
     out_player_id: String,
-    /// Sleeper player_id of the bench player to start in their place.
+    /// Sleeper player_id of the bench player moving into that slot in their place.
     in_player_id: String,
 }
 
@@ -616,7 +619,7 @@ impl SleeperMcpServer {
         ok(serde_json::json!({ "claim_submitted": true, "league_id": p.league_id, "player_id": p.player_id }))
     }
 
-    #[tool(description = "LIVE WRITE ACTION — swaps a bench player into a started slot against sleeper.com (not a simulation: changes the live starting lineup immediately with no confirm step). Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the session is not logged in, the in-player is not eligible for that slot, or the live UI has changed since the last verification.")]
+    #[tool(description = "LIVE WRITE ACTION — swaps two roster slots against sleeper.com (not a simulation: changes the live roster immediately with no confirm step). Covers starter<->bench swaps AND IR/Taxi moves (live-verified 2026-11-11) — the DOM mechanism has no slot-type restriction. Pass `out` as whoever currently occupies the target slot (a started player, or an IR/Taxi occupant) and `in` as the player moving into it (a bench player, including one moving onto IR/Taxi), or the reverse to activate someone back to the bench. Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the session is not logged in, the in-player is not eligible for that slot, or the live UI has changed since the last verification.")]
     async fn lineup_set(
         &self,
         #[tool(aggr)] p: LineupSetParams,

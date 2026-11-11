@@ -219,16 +219,20 @@ pub enum Commands {
     /// Lineup changes through the browser backend (live-verified selectors,
     /// plan.md Epic 4 lineup mechanism spot-check). `--out`/`--in` take
     /// numeric Sleeper player IDs rather than an abstract slot name: the
-    /// live UI swaps by clicking the currently-started player's row then
-    /// the bench replacement's row, not by an addressable slot.
+    /// live UI swaps by clicking one player's row then the other's, not by
+    /// an addressable slot. This also covers IR/Taxi moves — live-verified
+    /// 2026-11-11 (round-tripped a real IR<->BN swap and back): `--out` the
+    /// player currently in IR/Taxi, `--in` the bench player taking that
+    /// slot (or the reverse, to activate someone off IR/Taxi back to the
+    /// bench) — same generic swap mechanism, no slot-type restriction.
     #[command(name = "lineup-set")]
     LineupSet {
         #[arg(long)]
         league: String,
-        /// Player_id currently in the starting slot to bench.
+        /// Player_id currently occupying the target slot (starter, IR, or Taxi) to bench.
         #[arg(long)]
         out: String,
-        /// Player_id on the bench to start in their place.
+        /// Player_id on the bench to move into that slot in their place.
         #[arg(long = "in")]
         in_: String,
     },
