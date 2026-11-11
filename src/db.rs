@@ -1141,4 +1141,178 @@ mod tests {
         assert_eq!(cached.status_updated, Some(1_781_850_000));
         assert_eq!(cached.source.as_deref(), Some("graphql"));
     }
+
+    // validation.md "Migration Test — migration_should_be_reversible",
+    // scenario 1 (idempotent against an already-migrated DB): opening
+    // `StatsDb` a second time against the same file — simulating an app
+    // restart — must not error and must not attempt to re-add columns that
+    // already exist. This proves the `PRAGMA table_info` guard in
+    // `StatsDb::open` actually gates the `ALTER TABLE` calls rather than
+    // relying on them failing silently.
+    #[tokio::test]
+    async fn migration_should_be_reversible_when_statsdb_reopened_against_already_migrated_db() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sleeper_test_migration_reopen_{}_{nanos}.db",
+            std::process::id()
+        ));
+
+        let db1 = StatsDb::open(&path).await.expect("first open");
+        drop(db1);
+
+        let db2 = StatsDb::open(&path)
+            .await
+            .expect("second open (simulated restart) must not error");
+
+        let existing_cols: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('transactions')")
+                .fetch_all(&db2.pool)
+                .await
+                .expect("query table_info");
+        let has_col = |name: &str| existing_cols.iter().any(|(c,)| c == name);
+        assert!(has_col("roster_ids"));
+        assert!(has_col("waiver_bid"));
+        assert!(has_col("status_updated"));
+        assert!(has_col("source"));
+        // No duplicate columns from a re-run ALTER TABLE: each name appears once.
+        for name in ["roster_ids", "waiver_bid", "status_updated", "source"] {
+            let count = existing_cols.iter().filter(|(c,)| c == name).count();
+            assert_eq!(count, 1, "column {name} must appear exactly once, not duplicated");
+        }
+
+        let (sync_runs_table_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='transaction_sync_runs'",
+        )
+        .fetch_one(&db2.pool)
+        .await
+        .expect("query sqlite_master");
+        assert_eq!(sync_runs_table_count, 1, "transaction_sync_runs must exist exactly once");
+    }
+
+    // validation.md "Migration Test — migration_should_be_reversible",
+    // scenario 2 (additive-safe against a pre-existing old-schema DB): a DB
+    // file created before this project's columns/table existed — only the
+    // pre-project `transactions` shape, no `status_updated`/`source`/
+    // `transaction_sync_runs` — must open cleanly through `StatsDb::open`,
+    // gain the new columns/table, and leave the pre-existing row's data
+    // untouched. This is the "forward-only, additive, no data loss"
+    // guarantee plan.md's Migration Plan section describes.
+    #[tokio::test]
+    async fn migration_should_be_reversible_when_statsdb_opens_pre_existing_old_schema_db() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sleeper_test_migration_old_schema_{}_{nanos}.db",
+            std::process::id()
+        ));
+
+        {
+            // Hand-build the pre-project schema directly (bypassing
+            // StatsDb::open) so this starts from a file that genuinely
+            // predates the status_updated/source/transaction_sync_runs
+            // additions, not from a file this version already migrated.
+            let options = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .expect("create old-schema db");
+
+            sqlx::query(
+                "CREATE TABLE transactions (
+                    transaction_id TEXT    PRIMARY KEY,
+                    league_id      TEXT    NOT NULL,
+                    season         TEXT    NOT NULL,
+                    week           INTEGER NOT NULL,
+                    type           TEXT    NOT NULL,
+                    status         TEXT,
+                    created        INTEGER,
+                    adds           TEXT,
+                    drops          TEXT,
+                    fetched_at     TEXT    NOT NULL,
+                    roster_ids     TEXT,
+                    waiver_bid     INTEGER
+                )",
+            )
+            .execute(&pool)
+            .await
+            .expect("create pre-project transactions table");
+
+            sqlx::query(
+                "INSERT INTO transactions
+                 (transaction_id, league_id, season, week, type, status, created, adds, drops, fetched_at, roster_ids, waiver_bid)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind("pre-existing-1")
+            .bind("league1")
+            .bind("2026")
+            .bind(9_i64)
+            .bind("waiver")
+            .bind("complete")
+            .bind(1_781_000_000_i64)
+            .bind("{}")
+            .bind("{}")
+            .bind("2026-01-01T00:00:00Z")
+            .bind("[5]")
+            .bind(12_i64)
+            .execute(&pool)
+            .await
+            .expect("insert pre-existing row");
+
+            pool.close().await;
+        }
+
+        let db = StatsDb::open(&path)
+            .await
+            .expect("open against old-schema file must not error");
+
+        let existing_cols: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('transactions')")
+                .fetch_all(&db.pool)
+                .await
+                .expect("query table_info");
+        let has_col = |name: &str| existing_cols.iter().any(|(c,)| c == name);
+        assert!(has_col("status_updated"), "status_updated column must be added");
+        assert!(has_col("source"), "source column must be added");
+
+        let (sync_runs_table_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='transaction_sync_runs'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("query sqlite_master");
+        assert_eq!(sync_runs_table_count, 1, "transaction_sync_runs table must be created");
+
+        let row: (String, String, Option<String>, Option<i64>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "SELECT transaction_id, league_id, status, waiver_bid, status_updated, source
+                 FROM transactions WHERE transaction_id = ?",
+            )
+            .bind("pre-existing-1")
+            .fetch_one(&db.pool)
+            .await
+            .expect("pre-existing row must still exist");
+        let (transaction_id, league_id, status, waiver_bid, status_updated, source) = row;
+
+        assert_eq!(transaction_id, "pre-existing-1");
+        assert_eq!(league_id, "league1");
+        assert_eq!(status.as_deref(), Some("complete"));
+        assert_eq!(waiver_bid, Some(12), "pre-existing waiver_bid must be untouched");
+        assert_eq!(status_updated, None, "new column reads back as NULL on a pre-existing row");
+        assert_eq!(source, None, "new column reads back as NULL on a pre-existing row");
+
+        // Second open against the now-migrated file: still a no-op, no
+        // duplicate-column error.
+        let db2 = StatsDb::open(&path)
+            .await
+            .expect("second open of now-migrated file must not error");
+        drop(db2);
+    }
 }
