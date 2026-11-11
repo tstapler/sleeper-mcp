@@ -19,9 +19,7 @@ use super::debug::DEAD_SESSION_HINT;
 mod claim_selectors {
     pub const PLAYER_SEARCH_INPUT: &str = ".player-search input";
     pub const PLAYER_LIST_ITEM: &str = ".player-list-item";
-    pub const ACTION_BUTTON: &str = ".player-list-item a.player-action-button";
-    pub const ON_WAIVERS_PROBE_JS: &str =
-        "!!document.querySelector('.player-list-item a.player-action-button.waiver')";
+    pub const ACTION_BUTTON: &str = "a.player-action-button";
     pub const MODAL_ROOT: &str = ".add-player-panel";
     pub const DROP_ROW: &str = ".add-player-panel a.team-roster-item";
     pub const BID_INPUT: &str = ".add-player-panel .bid-input-container input";
@@ -89,12 +87,119 @@ mod roster_row_display_name_tests {
     }
 }
 
+/// Player-SEARCH list's own display convention (distinct from the roster
+/// page's "F Lastname" — this one adds a period): "Zach Terrell" ->
+/// "Z. Terrell", "KC Concepcion Jr." -> "K. Concepcion Jr.". Live-verified
+/// (2026-11-11) against real search results for three name shapes
+/// (plain, suffixed, already-abbreviated first name) after this needle's
+/// absence caused a real incident: `claim_player_via_seam`'s action-button
+/// click wasn't scoped to the searched player's row at all (see that
+/// function's own doc comment), and silently claimed a different player
+/// whose row happened to render first in the DOM.
+fn player_search_display_name(full_name: &str) -> String {
+    let mut parts = full_name.split_whitespace();
+    let Some(first) = parts.next() else { return full_name.to_string() };
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return full_name.to_string();
+    }
+    let initial = first.chars().next().map(|c| c.to_string()).unwrap_or_default();
+    format!("{initial}. {}", rest.join(" "))
+}
+
+#[cfg(test)]
+mod player_search_display_name_tests {
+    use super::player_search_display_name;
+
+    #[test]
+    fn player_search_display_name_should_abbreviate_first_name_with_a_trailing_period() {
+        assert_eq!(player_search_display_name("Zach Terrell"), "Z. Terrell");
+        assert_eq!(player_search_display_name("Kyle Louis"), "K. Louis");
+    }
+
+    #[test]
+    fn player_search_display_name_should_preserve_suffixes() {
+        assert_eq!(player_search_display_name("KC Concepcion Jr."), "K. Concepcion Jr.");
+        assert_eq!(player_search_display_name("Will Anderson Jr."), "W. Anderson Jr.");
+    }
+
+    #[test]
+    fn player_search_display_name_should_return_unchanged_when_single_token() {
+        assert_eq!(player_search_display_name("BAL"), "BAL");
+    }
+}
+
+/// Pure, no I/O: the probe `wait_for_row_text` polls on.
+fn build_row_text_probe_js(row_selector: &str, needle: &str) -> Result<String> {
+    Ok(format!(
+        "Array.from(document.querySelectorAll({row_sel})).some(e => e.textContent && e.textContent.includes({needle_json}))",
+        row_sel = serde_json::to_string(row_selector).map_err(other)?,
+        needle_json = serde_json::to_string(needle).map_err(other)?,
+    ))
+}
+
+/// Polls (every 150ms, up to `timeout_ms`) until some row matching
+/// `row_selector` has `textContent` containing `needle` — see
+/// `claim_player_via_seam`'s doc comment for why `wait_for_selector`
+/// (which only confirms *a* row exists, not *this* one) isn't enough here.
+async fn wait_for_row_text(
+    session: &dyn BrowserSession,
+    row_selector: &str,
+    needle: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let probe = build_row_text_probe_js(row_selector, needle)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if session.eval_bool(&probe).await? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(other(format!(
+                "no row matching {needle:?} appeared within {timeout_ms}ms — the player search may not have returned this player"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// Builds the row-scoped on-waivers probe: finds the search-list row
+/// matching `search_needle` and checks whether *that* row's own action
+/// button carries the `waiver` class — see `claim_player_via_seam`'s doc
+/// comment for why this must be row-scoped, not document-wide.
+fn build_on_waivers_probe_js(search_needle: &str) -> Result<String> {
+    use claim_selectors::{ACTION_BUTTON, PLAYER_LIST_ITEM};
+    let needle_json = serde_json::to_string(search_needle).map_err(other)?;
+    Ok(format!(
+        r#"(function(){{
+            const needle = {needle_json};
+            const row = Array.from(document.querySelectorAll('{PLAYER_LIST_ITEM}'))
+                .find(e => e.textContent && e.textContent.includes(needle));
+            const btn = row ? row.querySelector('{ACTION_BUTTON}') : null;
+            return !!(btn && btn.classList.contains('waiver'));
+        }})()"#
+    ))
+}
+
 /// Story 3.2 seam-side claim flow, live-verified 2026-09-11 (plan.md Epic 3,
 /// Story 3.1 selector bundle). `player_name`/`drop_player_name` are the
 /// resolved Sleeper display names (callers resolve player_id -> full_name
 /// before crossing the seam — the DOM has no player_id to select on).
 /// `bid_amount` is ignored on the free-agent (non-waiver) path, since that
 /// modal has no bid field.
+///
+/// Root-cause fix (2026-11-11): the action-button click used to be a bare
+/// `click_selector` over `.player-list-item a.player-action-button` —
+/// unscoped to the searched player's row at all, unlike every other click
+/// in this function (drop row, submit button both match by name/text).
+/// Live-reproduced: searching "Kyle Louis" and claiming returned exactly
+/// one result row, yet the unscoped selector still silently claimed an
+/// unrelated player (Terrel Bernard) instead — the search box's own text
+/// doesn't guarantee only the intended row is present or first in the DOM.
+/// Both the on-waivers probe and the action-button click now match the
+/// resolved row via [`player_search_display_name`], the same name/row
+/// scoping discipline `click_in_row` already uses for the drop row and
+/// submit button below.
 pub async fn claim_player_via_seam(
     session: &dyn BrowserSession,
     league_id: &str,
@@ -115,8 +220,17 @@ pub async fn claim_player_via_seam(
     session.type_into_selector(PLAYER_SEARCH_INPUT, player_name).await?;
     session.wait_for_selector(PLAYER_LIST_ITEM, 5_000).await?;
 
-    let on_waivers = session.eval_bool(ON_WAIVERS_PROBE_JS).await?;
-    session.click_selector(ACTION_BUTTON).await?;
+    let search_needle = player_search_display_name(player_name);
+    // Root-cause fix (2026-11-11): `wait_for_selector(PLAYER_LIST_ITEM)`
+    // only proves SOME row exists, not that THIS player's row has finished
+    // rendering — live-reproduced: it can pass while the virtualized list
+    // still shows a stale/placeholder row from the previous query, and the
+    // very next `click_in_row` call then genuinely fails closed with "no
+    // row with matching text found" rather than guessing. Poll for the
+    // specific needle instead of a blind sleep.
+    wait_for_row_text(session, PLAYER_LIST_ITEM, &search_needle, 5_000).await?;
+    let on_waivers = session.eval_bool(&build_on_waivers_probe_js(&search_needle)?).await?;
+    session.click_in_row(PLAYER_LIST_ITEM, &search_needle, ACTION_BUTTON).await?;
     session.wait_for_selector(MODAL_ROOT, 5_000).await?;
 
     if let Some(drop_name) = drop_player_name {
@@ -692,6 +806,27 @@ pub async fn edit_cancel_claim_via_seam(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the 2026-11-11 incident: the probe must embed
+    /// the SPECIFIC searched player's needle, not a document-wide query —
+    /// a document-wide `.waiver` check can't tell which row it matched.
+    /// Regression test for the second 2026-11-11 incident: polling for the
+    /// specific player's row (not just "a row exists") is what the live
+    /// claim flow was missing when it raced a still-rendering virtualized
+    /// list and genuinely failed closed rather than clicking a stale row.
+    #[test]
+    fn build_row_text_probe_js_should_embed_both_the_selector_and_the_needle() {
+        let js = build_row_text_probe_js(".player-list-item", "K. Louis").expect("must build");
+        assert!(js.contains(r#"".player-list-item""#), "got {js}");
+        assert!(js.contains(r#""K. Louis""#), "got {js}");
+    }
+
+    #[test]
+    fn build_on_waivers_probe_js_should_embed_the_exact_search_needle() {
+        let js = build_on_waivers_probe_js("Z. Terrell").expect("must build");
+        assert!(js.contains(r#""Z. Terrell""#), "probe must embed the exact needle, got {js}");
+        assert!(js.contains("querySelectorAll"), "must scope to list rows, not a single document-wide selector");
+    }
 
     fn two_brissett_rows() -> Vec<CandidateRow> {
         vec![
