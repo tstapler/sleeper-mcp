@@ -1,0 +1,7 @@
+# Used as `bazel ... --config=ci` (GitHub Actions: .github/workflows/ci.yml).
+build:ci --color=no
+build:ci --curses=no
+build:ci --show_timestamps
+build:ci --verbose_failures
+build:ci --keep_going
+test:ci --test_output=errors

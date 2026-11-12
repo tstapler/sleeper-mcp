@@ -1,0 +1,82 @@
+# PR/push gate: Bazel builds, lints and tests the Rust crate; a Cargo leg proves the manifests still work.
+# The repository had no workflows before this one, so there is no earlier coverage to preserve.
+# Python (pyproject.toml) is not built here.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # setup-bazel owns the caches and output base here, so scripts/bazel.sh passes arguments through unchanged.
+  SLEEPER_BAZEL_PLAIN: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  bazel:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: 'true'
+          repository-cache: 'true'
+          cache-key: bazel
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: build
+        run: bazel build --config=ci //...
+      - name: test
+        run: bazel test --config=ci //...
+      - name: test logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: testlogs
+          path: bazel-testlogs/**/test.log
+          if-no-files-found: ignore
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: 'true'
+          repository-cache: 'true'
+          cache-key: lint
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: clippy (findings print; -D warnings is lint-strict, not yet clean)
+        run: bazel build --config=ci --config=lint //...
+
+  checks:
+    name: Cargo leg and sync check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.98.1 # rust-toolchain.toml
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: tstapler/gha-actions/setup-bazel@d2b534169ec63d7644d56f5abf2717fdd90b96fa # feat/rust-bazel-publish
+        with:
+          disk-cache: 'true'
+          repository-cache: 'true'
+          cache-key: checks
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: Cargo and Bazel agree
+        run: |
+          scripts/check-bazel-cargo-sync.sh --selftest
+          scripts/check-bazel-cargo-sync.sh
+      - name: Cargo still builds, lints and tests
+        run: |
+          cargo clippy --locked --all-targets
+          cargo test --locked

@@ -1,0 +1,85 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+# Cargo sets these for every crate; the sources use env!("CARGO_PKG_VERSION") (src/mcp.rs).
+# scripts/check-bazel-cargo-sync.sh fails when the version differs from Cargo.toml.
+CARGO_ENV = {"CARGO_PKG_VERSION": "0.1.0"}
+
+LIB_SRCS = glob(
+    ["src/**/*.rs"],
+    exclude = [
+        "src/main.rs",
+        "src/bin/**",
+    ],
+)
+
+rust_library(
+    name = "sleeper",
+    srcs = LIB_SRCS,
+    crate_name = "sleeper",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = CARGO_ENV,
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "sleeper_cli",
+    srcs = ["src/main.rs"],
+    crate_name = "sleeper_cli",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = CARGO_ENV,
+    deps = [":sleeper"] + all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "sleeper-mcp",
+    srcs = ["src/bin/sleeper_mcp.rs"],
+    crate_name = "sleeper_mcp",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = CARGO_ENV,
+    deps = [":sleeper"] + all_crate_deps(normal = True),
+)
+
+# Unit tests (the #[cfg(test)] modules inside the library).
+# flaky: browser::launch::tests::profile_lock_should_acquire_when_free failed once in the first parallel run
+# ("released lock must re-acquire") and passed 20 of 20 reruns, and 6 of 6 under cargo. Likely cause (UNVERIFIED):
+# a sibling test forks a child that briefly holds the flock'd fd until exec. Bazel retries it up to 3 times.
+rust_test(
+    name = "sleeper_unit_test",
+    crate = ":sleeper",
+    flaky = True,
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = CARGO_ENV,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# One test per tests/*.rs, named like the Cargo target + "_test". Operator-gated tests are #[ignore]d in the
+# source and so build but run nothing, exactly as under `cargo test`.
+[
+    rust_test(
+        name = f.removeprefix("tests/").removesuffix(".rs") + "_test",
+        srcs = [f],
+        crate_name = f.removeprefix("tests/").removesuffix(".rs"),
+        # include_str! in tests/browser_transport.rs reads these.
+        compile_data = [
+            "Cargo.toml",
+            "Cargo.lock",
+            "project_plans/undetected-chromedriver-rust/implementation/plan.md",
+        ],
+        edition = "2021",
+        proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
+        rustc_env = CARGO_ENV,
+        deps = [":sleeper"] + all_crate_deps(normal = True) + all_crate_deps(normal_dev = True),
+    )
+    for f in glob(["tests/*.rs"])
+]
