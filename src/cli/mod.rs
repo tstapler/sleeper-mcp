@@ -289,6 +289,17 @@ pub enum LeagueChatAction {
         /// one sync call.
         #[arg(long, default_value_t = 30)]
         pages: usize,
+        /// Keep walking backward past the already-caught-up boundary
+        /// instead of stopping at the first fully-known page. Without this,
+        /// a capped first sync (e.g. `--pages 3` on a long-running league)
+        /// leaves older history permanently unreachable: every later
+        /// `sync` restarts from the newest message and stops as soon as it
+        /// re-treads that already-known frontier, never advancing past it.
+        /// With this flag, only a genuinely empty page (the real start of
+        /// the feed) or `--pages` stops the walk, so a deliberate deep
+        /// backfill can reach messages from before the first sync.
+        #[arg(long)]
+        force_deep: bool,
     },
 
     /// List the league chat from the local cache only, most recent first —

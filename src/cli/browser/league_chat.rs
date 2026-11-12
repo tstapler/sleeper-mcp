@@ -64,6 +64,20 @@ fn chat_failed_triage() -> String {
     "Reading the league chat failed — the live chat GraphQL shape may have changed. Re-run with SLEEPER_BROWSER_DEBUG=1 for detail.".to_string()
 }
 
+/// Whether to stop walking backward through pages. Reaching the feed's real
+/// start always stops. Otherwise, a page with nothing new stops a normal
+/// sync (already caught up) — but not a `force_deep` one, which only stops
+/// at the real start or the `--pages` cap, so a deliberate backfill can walk
+/// past a prior sync's already-known frontier instead of being blocked by
+/// it (see `run_sync`'s doc comment for why that frontier is otherwise a
+/// dead end). The `pages_fetched > 1` guard lets page 1 be fully known
+/// (e.g. an idle re-sync with nothing new posted) without stopping before
+/// a second page is even tried.
+fn should_stop_paging(reached_start: bool, page_has_new: bool, pages_fetched: usize, force_deep: bool) -> bool {
+    let caught_up = !force_deep && !page_has_new && pages_fetched > 1;
+    reached_start || caught_up
+}
+
 /// Outcome of one `sync` run, reported back to the CLI.
 pub(crate) struct SyncOutcome {
     pub(crate) pages_fetched: usize,
@@ -102,11 +116,19 @@ async fn fetch_and_store_page(
 /// case), a page has fewer than `PAGE_SIZE` rows (the feed's real
 /// beginning), or `max_pages` is hit (safety cap on a first-ever sync
 /// against a league with a long history).
+///
+/// `force_deep` disables the already-caught-up stop: a normal sync always
+/// restarts from the newest message, so without this it can never advance
+/// past a prior sync's frontier (every page in that already-known range
+/// looks "fully known" and stops the walk immediately) — leaving anything
+/// older than the first sync's `--pages` cap permanently unreachable. With
+/// `force_deep`, only `reached_start` or `max_pages` stops the walk.
 pub(crate) async fn run_sync(
     config: &Config,
     db: &StatsDb,
     league_id: &str,
     max_pages: usize,
+    force_deep: bool,
 ) -> Result<SyncOutcome> {
     let known_ids = db.league_chat_message_ids(league_id).await?;
 
@@ -136,7 +158,7 @@ pub(crate) async fn run_sync(
         let page_has_new = page.iter().any(|m| !known_ids.contains(&m.message_id));
         let reached_start = page.len() < PAGE_SIZE;
         let Some(oldest) = page.last().map(|m| m.message_id.clone()) else { break };
-        if reached_start || (!page_has_new && pages_fetched > 1) {
+        if should_stop_paging(reached_start, page_has_new, pages_fetched, force_deep) {
             break;
         }
         cursor = Some(oldest);
@@ -156,8 +178,8 @@ pub(crate) async fn run_sync(
 
 pub(crate) async fn cmd_league_chat(config: &Config, db: &StatsDb, action: LeagueChatAction) -> Result<()> {
     match action {
-        LeagueChatAction::Sync { league, pages } => {
-            let outcome = run_sync(config, db, &league, pages).await?;
+        LeagueChatAction::Sync { league, pages, force_deep } => {
+            let outcome = run_sync(config, db, &league, pages, force_deep).await?;
             println!(
                 "synced {} pages, {} messages fetched, {} new",
                 outcome.pages_fetched, outcome.messages_fetched, outcome.new_messages,
@@ -185,6 +207,29 @@ pub(crate) async fn cmd_league_chat(config: &Config, db: &StatsDb, action: Leagu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_stop_paging_should_stop_at_the_real_feed_start_regardless_of_force_deep() {
+        assert!(should_stop_paging(true, true, 5, false));
+        assert!(should_stop_paging(true, true, 5, true));
+    }
+
+    #[test]
+    fn should_stop_paging_should_stop_a_normal_sync_once_a_page_has_nothing_new() {
+        assert!(should_stop_paging(false, false, 2, false));
+    }
+
+    #[test]
+    fn should_stop_paging_should_not_stop_page_one_even_when_fully_known() {
+        // An idle re-sync where the newest page has nothing new shouldn't
+        // stop before a second page is even tried.
+        assert!(!should_stop_paging(false, false, 1, false));
+    }
+
+    #[test]
+    fn should_stop_paging_should_keep_walking_past_a_fully_known_page_when_force_deep() {
+        assert!(!should_stop_paging(false, false, 5, true));
+    }
 
     #[test]
     fn parse_chat_messages_should_parse_a_real_shaped_page() {
@@ -236,7 +281,7 @@ mod tests {
         let config = Config::default();
         let db = crate::db::StatsDb::open(&config.stats_db_path()).await.expect("db must open");
 
-        let outcome = run_sync(&config, &db, "1352883872131481600", 5)
+        let outcome = run_sync(&config, &db, "1352883872131481600", 5, false)
             .await
             .expect("sync must succeed against a live, logged-in session");
         println!(
