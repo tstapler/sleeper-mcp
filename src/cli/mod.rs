@@ -542,7 +542,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::LeagueChat { action } => {
-            browser::league_chat::cmd_league_chat(&config, &*svc.db, action).await?
+            browser::league_chat::cmd_league_chat(&config, &svc.db, action).await?
         }
 
         Commands::Roster { league_id, roster_id, fresh } => {

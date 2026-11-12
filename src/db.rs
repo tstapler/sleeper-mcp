@@ -823,7 +823,8 @@ impl StatsDb {
         league_id: &str,
         limit: i64,
     ) -> Result<Vec<LeagueChatMessage>> {
-        let rows: Vec<(String, Option<String>, Option<String>, String, i64, bool)> = sqlx::query_as(
+        type LeagueChatRow = (String, Option<String>, Option<String>, String, i64, bool);
+        let rows: Vec<LeagueChatRow> = sqlx::query_as(
             "SELECT message_id, author_id, author_name, text, created, pinned
              FROM league_chat_messages WHERE league_id = ?
              ORDER BY created DESC LIMIT ?",
