@@ -112,6 +112,31 @@ pub struct ChatTranscriptFull {
     pub raw_text: String,
 }
 
+/// Params for `StatsDb::upsert_league_chat_messages` — one row from a
+/// `league_chat_via_seam` page, already parsed. `author_id`/`author_name`
+/// are `None` only in the (unobserved but possible) case the GraphQL row
+/// itself omits them — never guessed/defaulted elsewhere.
+pub struct LeagueChatMessageRow<'a> {
+    pub message_id: &'a str,
+    pub author_id: Option<&'a str>,
+    pub author_name: Option<&'a str>,
+    pub text: &'a str,
+    pub created: i64,
+    pub pinned: bool,
+}
+
+/// Row returned by `StatsDb::list_league_chat_messages` — read from the
+/// local cache only, never triggers a browser launch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeagueChatMessage {
+    pub message_id: String,
+    pub author_id: Option<String>,
+    pub author_name: Option<String>,
+    pub text: String,
+    pub created: i64,
+    pub pinned: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedTransaction {
     pub transaction_id: String,
@@ -237,7 +262,20 @@ impl StatsDb {
                 raw_text    TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS chat_transcripts_league_imported
-                ON chat_transcripts (league_id, imported_at DESC);",
+                ON chat_transcripts (league_id, imported_at DESC);
+            CREATE TABLE IF NOT EXISTS league_chat_messages (
+                league_id   TEXT    NOT NULL,
+                message_id  TEXT    NOT NULL,
+                author_id   TEXT,
+                author_name TEXT,
+                text        TEXT    NOT NULL,
+                created     INTEGER NOT NULL,
+                pinned      INTEGER NOT NULL DEFAULT 0,
+                synced_at   TEXT    NOT NULL,
+                PRIMARY KEY (league_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS league_chat_messages_league_created
+                ON league_chat_messages (league_id, created DESC);",
         )
         .execute(&pool)
         .await?;
@@ -728,6 +766,83 @@ impl StatsDb {
             source_path,
             raw_text,
         }))
+    }
+
+    /// The league chat's message_ids already stored, for the sync
+    /// orchestrator to tell new rows apart from re-fetched ones without a
+    /// round trip per message.
+    pub async fn league_chat_message_ids(
+        &self,
+        league_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT message_id FROM league_chat_messages WHERE league_id = ?",
+        )
+        .bind(league_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// `INSERT OR REPLACE`, keyed by `(league_id, message_id)` — re-syncing
+    /// a page (e.g. the inclusive `before` boundary row, or a message that
+    /// was since edited/pinned) overwrites rather than duplicates.
+    pub async fn upsert_league_chat_messages(
+        &self,
+        league_id: &str,
+        messages: &[LeagueChatMessageRow<'_>],
+    ) -> Result<()> {
+        let synced_at = chrono::Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        for m in messages {
+            sqlx::query(
+                "INSERT OR REPLACE INTO league_chat_messages
+                 (league_id, message_id, author_id, author_name, text, created, pinned, synced_at)
+                 VALUES (?,?,?,?,?,?,?,?)",
+            )
+            .bind(league_id)
+            .bind(m.message_id)
+            .bind(m.author_id)
+            .bind(m.author_name)
+            .bind(m.text)
+            .bind(m.created)
+            .bind(m.pinned)
+            .bind(&synced_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read back the league chat from the local cache only, most recent
+    /// first — never triggers a browser launch (see `sleeper league-chat
+    /// sync` for the write path).
+    pub async fn list_league_chat_messages(
+        &self,
+        league_id: &str,
+        limit: i64,
+    ) -> Result<Vec<LeagueChatMessage>> {
+        let rows: Vec<(String, Option<String>, Option<String>, String, i64, bool)> = sqlx::query_as(
+            "SELECT message_id, author_id, author_name, text, created, pinned
+             FROM league_chat_messages WHERE league_id = ?
+             ORDER BY created DESC LIMIT ?",
+        )
+        .bind(league_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(message_id, author_id, author_name, text, created, pinned)| LeagueChatMessage {
+                message_id,
+                author_id,
+                author_name,
+                text,
+                created,
+                pinned,
+            })
+            .collect())
     }
 
     pub async fn upsert_league(&self, league: &League) -> Result<()> {
@@ -1650,5 +1765,66 @@ mod tests {
         let db = test_db("get_transcript_missing").await;
         let result = db.get_chat_transcript("never-imported").await.expect("get transcript");
         assert!(result.is_none());
+    }
+
+    fn chat_row<'a>(message_id: &'a str, author_name: &'a str, text: &'a str, created: i64) -> LeagueChatMessageRow<'a> {
+        LeagueChatMessageRow {
+            message_id,
+            author_id: Some("user1"),
+            author_name: Some(author_name),
+            text,
+            created,
+            pinned: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_league_chat_messages_should_round_trip_through_list_league_chat_messages() {
+        let db = test_db("league_chat_round_trip").await;
+        let rows = [chat_row("m1", "tstapler", "hello league", 1000)];
+        db.upsert_league_chat_messages("league1", &rows).await.expect("upsert");
+
+        let messages = db.list_league_chat_messages("league1", 10).await.expect("list");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "m1");
+        assert_eq!(messages[0].author_name.as_deref(), Some("tstapler"));
+        assert_eq!(messages[0].text, "hello league");
+    }
+
+    #[tokio::test]
+    async fn list_league_chat_messages_should_return_most_recent_first() {
+        let db = test_db("league_chat_order").await;
+        let rows = [chat_row("m1", "a", "first", 1000), chat_row("m2", "b", "second", 2000)];
+        db.upsert_league_chat_messages("league1", &rows).await.expect("upsert");
+
+        let messages = db.list_league_chat_messages("league1", 10).await.expect("list");
+        assert_eq!(messages[0].message_id, "m2", "newest created timestamp must come first");
+        assert_eq!(messages[1].message_id, "m1");
+    }
+
+    #[tokio::test]
+    async fn upsert_league_chat_messages_should_replace_not_duplicate_same_message_id() {
+        let db = test_db("league_chat_idempotent").await;
+        db.upsert_league_chat_messages("league1", &[chat_row("m1", "a", "v1", 1000)])
+            .await
+            .expect("first upsert");
+        db.upsert_league_chat_messages("league1", &[chat_row("m1", "a", "v1 edited", 1000)])
+            .await
+            .expect("re-sync of same message_id (e.g. edited)");
+
+        let messages = db.list_league_chat_messages("league1", 10).await.expect("list");
+        assert_eq!(messages.len(), 1, "same message_id must replace, not duplicate");
+        assert_eq!(messages[0].text, "v1 edited");
+    }
+
+    #[tokio::test]
+    async fn league_chat_message_ids_should_return_only_ids_already_stored_for_that_league() {
+        let db = test_db("league_chat_known_ids").await;
+        db.upsert_league_chat_messages("league1", &[chat_row("m1", "a", "x", 1000)]).await.expect("upsert");
+        db.upsert_league_chat_messages("league2", &[chat_row("m2", "a", "y", 1000)]).await.expect("upsert");
+
+        let ids = db.league_chat_message_ids("league1").await.expect("ids");
+        assert!(ids.contains("m1"));
+        assert!(!ids.contains("m2"), "must not leak another league's message ids");
     }
 }

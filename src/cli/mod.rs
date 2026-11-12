@@ -263,6 +263,42 @@ pub enum Commands {
         #[command(subcommand)]
         action: ChatAction,
     },
+
+    /// The real Sleeper **league chat** (messages your league-mates post to
+    /// each other inside the league itself) — distinct from `chat`, which
+    /// is this CLI's own analysis-note/transcript log. Read-only: this only
+    /// reads the feed, never posts to it.
+    LeagueChat {
+        #[command(subcommand)]
+        action: LeagueChatAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LeagueChatAction {
+    /// Fetch the live league chat via the authenticated browser session and
+    /// store new/changed messages locally. Paginates backward from the
+    /// newest message until a page has no messages this DB doesn't already
+    /// have (already caught up), or `--pages` is hit — first-ever sync on a
+    /// league with a long history may need a larger `--pages` to reach the
+    /// start.
+    Sync {
+        #[arg(long)]
+        league: String,
+        /// Safety cap on how many 50-message pages to walk back through in
+        /// one sync call.
+        #[arg(long, default_value_t = 30)]
+        pages: usize,
+    },
+
+    /// List the league chat from the local cache only, most recent first —
+    /// never launches a browser. Run `sync` first to populate it.
+    List {
+        #[arg(long)]
+        league: String,
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -503,6 +539,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Transactions { league, kind, max_age_secs, force } => {
             browser::transactions::cmd_transactions(&config, &svc, &league, kind.as_deref(), max_age_secs, force)
                 .await?
+        }
+
+        Commands::LeagueChat { action } => {
+            browser::league_chat::cmd_league_chat(&config, &*svc.db, action).await?
         }
 
         Commands::Roster { league_id, roster_id, fresh } => {

@@ -542,6 +542,47 @@ pub async fn league_players_via_seam(session: &dyn BrowserSession, league_id: &s
     Ok(raw)
 }
 
+/// Root-cause discovery (2026-11-11): Sleeper's League Chat has no
+/// league-specific query either. Live GraphQL introspection (schema
+/// introspection is enabled in prod — `query { __schema { query_type { ... } } }`,
+/// note every meta-field is snake_case too, e.g. `query_type`/`of_type`, not
+/// the usual GraphQL-spec camelCase) showed `League` carries
+/// `last_message_id`/`last_message_text` the same shape as the `Channel`/
+/// `Topic` types, which both resolve their feed via a generic
+/// `messages(parent_id: ...)` field. Tried the league_id itself as
+/// `parent_id` directly (no channel/topic indirection) — confirmed live: it
+/// returns the real league chat feed, a mix of human messages and
+/// system-authored transaction/trade-block notices (`author_id` =
+/// `"166666666666666666"`, `author_display_name` = `"sys"` for the latter).
+/// `author_display_name` comes back on the message itself — no second
+/// lookup against `get_league_users` needed, unlike the trade-block read.
+///
+/// Pagination: `before` (a message_id) returns the next older page: live
+/// confirmed the returned page's first row is exactly the prior page's last
+/// row (inclusive boundary) — callers dedupe via message_id, not count.
+/// Page size is a fixed 50 (no `limit` arg exists on this field); a page
+/// with fewer than 50 rows means the feed's beginning has been reached.
+pub async fn league_chat_via_seam(
+    session: &dyn BrowserSession,
+    league_id: &str,
+    before: Option<&str>,
+) -> Result<String> {
+    let start = tracing::info_span!("league_chat.start", league = league_id, before = ?before);
+    let _enter = start.enter();
+
+    let league_id_json = serde_json::to_string(league_id).map_err(other)?;
+    let before_arg = match before {
+        Some(b) => format!(", before: {}", serde_json::to_string(b).map_err(other)?),
+        None => String::new(),
+    };
+    let query = format!(
+        r#"query messages {{ messages(parent_id: {league_id_json}{before_arg}) {{ message_id author_id author_display_name text created edited pinned parent_type }} }}"#
+    );
+    let raw = post_named_query(session, "messages", &query).await?;
+    tracing::info!("league_chat fetched");
+    Ok(raw)
+}
+
 // --- Epic 1.4 / Story 1.4.1: edit/cancel row-identity disambiguation ---
 // ADR-004: resolved without a new `BrowserSession` trait primitive. See
 // Step 0.5 fork #3 and the Domain Glossary entries for `claim_row_disambiguator`

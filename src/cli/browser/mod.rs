@@ -13,6 +13,7 @@ use super::BrowserAction;
 mod actions;
 mod doctor;
 mod edit_cancel;
+pub mod league_chat;
 pub mod login;
 mod pending;
 pub mod status;
