@@ -405,8 +405,10 @@ impl RosterCapacity {
 fn roster_capacity(total_players: usize, taxi_used: usize, reserve_used: usize, league: &League) -> RosterCapacity {
     let active_count = total_players.saturating_sub(taxi_used).saturating_sub(reserve_used);
     let active_cap = league.roster_positions.len();
-    let taxi_slots = league.settings.extra.get("taxi_slots").and_then(Value::as_u64).unwrap_or(0);
-    let reserve_slots = league.settings.extra.get("reserve_slots").and_then(Value::as_u64).unwrap_or(0);
+    // `taxi_slots`/`reserve_slots` moved from `settings.extra` to named typed
+    // fields (sleeper-mcp league-settings expansion) — read the named fields now.
+    let taxi_slots = league.settings.taxi_slots.unwrap_or(0) as u64;
+    let reserve_slots = league.settings.reserve_slots.unwrap_or(0) as u64;
     RosterCapacity {
         active_count,
         active_cap,

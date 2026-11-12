@@ -606,7 +606,7 @@ impl SleeperMcpServer {
         }))
     }
 
-    #[tool(description = "Show locally stored league settings: roster positions, scoring format, superflex status. Requires sync_league to have been run first.")]
+    #[tool(description = "Show locally stored league settings: roster positions, scoring format, superflex status, and the full operational settings (playoffs, trade deadline, waivers/FAAB, taxi/keeper/reserve rules). Requires sync_league to have been run first.")]
     async fn get_league_info(
         &self,
         #[tool(aggr)] p: LeagueIdParams,
@@ -627,6 +627,38 @@ impl SleeperMcpServer {
                 "roster_slot_counts": league.roster_slot_counts(),
                 "draft_rounds": league.settings.draft_rounds,
                 "draft_id": league.draft_id,
+                "playoffs": {
+                    "playoff_teams": league.settings.playoff_teams,
+                    "playoff_week_start": league.settings.playoff_week_start,
+                    "playoff_type": league.settings.playoff_type,
+                    "playoff_round_type": league.settings.playoff_round_type,
+                    "playoff_seed_type": league.settings.playoff_seed_type,
+                },
+                "trades": {
+                    "trade_deadline": league.settings.trade_deadline,
+                    "trade_review_days": league.settings.trade_review_days,
+                    "disable_trades": league.settings.disable_trades,
+                    "pick_trading": league.settings.pick_trading,
+                },
+                "waivers": {
+                    "waiver_type": league.settings.waiver_type,
+                    "waiver_budget": league.settings.waiver_budget,
+                    "waiver_clear_days": league.settings.waiver_clear_days,
+                    "waiver_day_of_week": league.settings.waiver_day_of_week,
+                    "waiver_bid_min": league.settings.waiver_bid_min,
+                    "disable_adds": league.settings.disable_adds,
+                },
+                "taxi_keepers_reserve": {
+                    "taxi_slots": league.settings.taxi_slots,
+                    "taxi_years": league.settings.taxi_years,
+                    "taxi_deadline": league.settings.taxi_deadline,
+                    "taxi_allow_vets": league.settings.taxi_allow_vets,
+                    "reserve_slots": league.settings.reserve_slots,
+                    "max_keepers": league.settings.max_keepers,
+                    "max_subs": league.settings.max_subs,
+                    "veto_votes_needed": league.settings.veto_votes_needed,
+                },
+                "other_settings": league.settings.extra,
             })),
         }
     }

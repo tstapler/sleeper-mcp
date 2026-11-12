@@ -565,8 +565,9 @@ pub(crate) async fn read_through(
 /// Sleeper's documented default (weekly waivers, processed Tuesday) when a
 /// league's settings haven't been synced at all yet.
 pub(crate) fn waiver_window_fields(league: &League) -> (u8, bool) {
-    let waiver_day_of_week =
-        league.settings.extra.get("waiver_day_of_week").and_then(|v| v.as_u64()).unwrap_or(2) as u8;
+    // `waiver_day_of_week` moved from `settings.extra` to a named typed field
+    // (sleeper-mcp league-settings expansion) — read the named field now.
+    let waiver_day_of_week = league.settings.waiver_day_of_week.unwrap_or(2) as u8;
     let daily_waivers = league
         .settings
         .extra

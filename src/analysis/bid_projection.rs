@@ -393,7 +393,7 @@ impl AnalysisService {
         let competing_roster_faab = self.competing_roster_faab(league, &competing_ids).await?;
 
         let waiver_budget =
-            league.settings.extra.get("waiver_budget").and_then(Value::as_i64).unwrap_or(0);
+            league.settings.waiver_budget.unwrap_or(0) as i64;
         let (suggested_bid, suggested_bid_pct_of_remaining) =
             suggest_bid(&perceived_value, &league_demand, &bid_history, &faab_remaining, waiver_budget);
 
@@ -467,15 +467,14 @@ impl AnalysisService {
         })
     }
 
-    /// Task 3.1.3a: `waiver_budget` (from `league.settings.extra` — no typed
-    /// field exists on `LeagueSettings`, models.rs:25-36) minus summed
+    /// Task 3.1.3a: `league.settings.waiver_budget` minus summed
     /// `complete`-status waiver bids for `roster_id`, gated by
     /// `has_full_league_graphql_coverage`. Sums over `list_transactions`'
     /// existing output in Rust rather than a dedicated SQL query — the
     /// plan's own preference for this ~150-200-row, single-season dataset.
     async fn faab_remaining(&self, league: &League, roster_id: i64) -> Result<FaabRemaining> {
         let waiver_budget =
-            league.settings.extra.get("waiver_budget").and_then(Value::as_i64).unwrap_or(0);
+            league.settings.waiver_budget.unwrap_or(0) as i64;
 
         let rows = self.db.list_transactions(&league.league_id, Some("waiver")).await?;
         let spent: i64 = rows
@@ -583,7 +582,7 @@ mod tests {
             status: "in_season".to_string(),
             sport: "nfl".to_string(),
             settings: LeagueSettings {
-                extra: HashMap::from([("waiver_budget".to_string(), Value::from(waiver_budget))]),
+                waiver_budget: Some(waiver_budget as i32),
                 ..Default::default()
             },
             total_rosters: 12,

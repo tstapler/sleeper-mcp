@@ -63,7 +63,85 @@ pub(super) async fn cmd_league_info(db: &StatsDb, league_id: &str) -> Result<()>
     if let Some(rounds) = league.settings.draft_rounds {
         println!("Draft rounds: {rounds}");
     }
+
+    print_settings_groups(&league.settings);
     Ok(())
+}
+
+/// A code → label lookup, for settings whose raw integer is otherwise opaque. Only
+/// covers values this project has independently confirmed the meaning of (Sleeper's
+/// own API docs / long-standing community knowledge) — anything outside 0-2 prints
+/// as a bare number rather than guessing a label.
+fn waiver_type_label(code: i32) -> &'static str {
+    match code {
+        0 => "Rolling waiver priority",
+        1 => "Reverse-standings priority",
+        2 => "FAAB",
+        _ => "unknown",
+    }
+}
+
+fn fmt_opt(label: &str, v: Option<i32>) {
+    match v {
+        Some(n) => println!("  {label:<22} {n}"),
+        None => println!("  {label:<22} {}", style("—").dim()),
+    }
+}
+
+fn fmt_flag(label: &str, v: Option<i32>) {
+    let rendered = match v {
+        Some(0) => "no".to_string(),
+        Some(_) => style("yes").yellow().to_string(),
+        None => style("—").dim().to_string(),
+    };
+    println!("  {label:<22} {rendered}");
+}
+
+/// Groups the operational settings `cmd_league_info`'s earlier fields don't already
+/// cover — playoffs, trades, waivers, taxi/keepers — so a human can scan them instead
+/// of hunting through ~50 flat key:value pairs. Falls back to printing whatever's left
+/// in `settings.extra` (fields this project hasn't named a typed field for yet) so
+/// nothing synced is ever invisible here, even before the next field gets named.
+fn print_settings_groups(settings: &crate::models::LeagueSettings) {
+    println!("\n{}", style("Playoffs").bold());
+    fmt_opt("Playoff teams:", settings.playoff_teams);
+    fmt_opt("Playoff week start:", settings.playoff_week_start);
+    fmt_opt("Playoff type:", settings.playoff_type);
+    fmt_opt("Playoff round type:", settings.playoff_round_type);
+    fmt_opt("Playoff seed type:", settings.playoff_seed_type);
+
+    println!("\n{}", style("Trades").bold());
+    fmt_opt("Trade deadline (week):", settings.trade_deadline);
+    fmt_opt("Trade review days:", settings.trade_review_days);
+    fmt_flag("Trades disabled:", settings.disable_trades);
+    fmt_flag("Pick trading:", settings.pick_trading);
+
+    println!("\n{}", style("Waivers").bold());
+    println!("  {:<22} {}", "Waiver type:", waiver_type_label(settings.waiver_type));
+    fmt_opt("Waiver budget (FAAB):", settings.waiver_budget);
+    fmt_opt("Waiver clear days:", settings.waiver_clear_days);
+    fmt_opt("Waiver day of week:", settings.waiver_day_of_week);
+    fmt_opt("Waiver min bid:", settings.waiver_bid_min);
+    fmt_flag("Adds disabled:", settings.disable_adds);
+
+    println!("\n{}", style("Taxi / Keepers / Reserve").bold());
+    fmt_opt("Taxi slots:", settings.taxi_slots);
+    fmt_opt("Taxi years:", settings.taxi_years);
+    fmt_opt("Taxi deadline (week):", settings.taxi_deadline);
+    fmt_flag("Taxi allows vets:", settings.taxi_allow_vets);
+    fmt_opt("Reserve/IR slots:", settings.reserve_slots);
+    fmt_opt("Max keepers:", settings.max_keepers);
+    fmt_opt("Max in-season subs:", settings.max_subs);
+    fmt_opt("Veto votes needed:", settings.veto_votes_needed);
+
+    if !settings.extra.is_empty() {
+        println!("\n{}", style("Other (not yet individually labeled)").bold().dim());
+        let mut keys: Vec<_> = settings.extra.keys().collect();
+        keys.sort();
+        for k in keys {
+            println!("  {k:<22} {}", settings.extra[k]);
+        }
+    }
 }
 
 /// At-a-glance league view: one row per roster with skill vs. IDP position
@@ -326,4 +404,21 @@ pub(super) async fn resolve_player_name(client: &SleeperClient, player_id: &str)
         .ok_or_else(|| crate::error::Error::NotFound(format!(
             "No player found for id '{player_id}'. Run `sleeper search <name>` to find the right id."
         )))
+}
+
+#[cfg(test)]
+mod league_settings_display_tests {
+    use super::waiver_type_label;
+
+    #[test]
+    fn waiver_type_label_should_name_each_known_code() {
+        assert_eq!(waiver_type_label(0), "Rolling waiver priority");
+        assert_eq!(waiver_type_label(1), "Reverse-standings priority");
+        assert_eq!(waiver_type_label(2), "FAAB");
+    }
+
+    #[test]
+    fn waiver_type_label_should_not_fabricate_a_label_for_an_unrecognized_code() {
+        assert_eq!(waiver_type_label(99), "unknown");
+    }
 }
