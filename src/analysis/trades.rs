@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::models::Roster;
 
 use super::dynasty::{enrich_player, enrich_player_full};
+use super::picks::{self, PickDescriptor, PickValuationContext};
 use super::{best_cached_season, AnalysisService};
 
 /// Median FantasyCalc value within each `dynasty_tier` bucket (1-4), computed
@@ -32,6 +33,126 @@ fn tier_value_medians(all_values: &[Value], all_players: &HashMap<String, Value>
             (tier, values[values.len() / 2])
         })
         .collect()
+}
+
+/// How many times more real-production value one side of a `find_win_win_trades`
+/// proposal can receive than it gives, in ppg, before the proposal is dropped as
+/// unrealistic. 2.5x comfortably allows a real "sell declining value for a better
+/// starter" swap (e.g. ~1.5x in the Kittle/Kelce-for-Diggs/Deebo case) while
+/// rejecting a near-total giveaway (observed ratios on the two rejected trades
+/// were ~8x and effectively infinite — see `ppg_imbalance_ratio`'s doc comment).
+const PPG_IMBALANCE_THRESHOLD: f64 = 2.5;
+
+/// A position already has enough total roster depth that acquiring more there
+/// has no practical benefit, regardless of tier-1/2 "keeper" count — e.g. a
+/// roster with 5 TEs has nowhere to put a 6th and 7th no matter how aging
+/// those 5 are. Root-cause fix, 2026-11-11: a real proposal offered a partner
+/// more TEs/QBs they had no use for, since they were "needy" by keeper-tier
+/// count alone while already 5 deep at TE and 3 deep at QB in total spots.
+fn position_has_redundant_depth(total_rostered: usize, league_avg_total: f64) -> bool {
+    const REDUNDANCY_FACTOR: f64 = 1.25;
+    (total_rostered as f64) >= league_avg_total * REDUNDANCY_FACTOR
+}
+
+/// Whether the real-production (ppg) value changing hands is too lopsided for
+/// either side to plausibly accept, independent of `dynasty_tier` — a tier
+/// label spans both "declining ex-stud still a weekly starter" (e.g. Courtland
+/// Sutton, Travis Kelce) and "has no real role" (e.g. a QB4 with zero games
+/// played) in the same bucket, so tier arithmetic alone can't tell a fair swap
+/// from a one-sided giveaway. `give`/`receive` are each side's summed recent
+/// ppg across the players changing hands. Returns `None` when reasonably
+/// balanced, `Some(ratio)` (always >= 1, whichever side has more) when one
+/// side's real value is at least `threshold`x the other's — including the
+/// degenerate case of giving away real production for a player with ~0 ppg,
+/// which is maximally lopsided regardless of the raw ratio.
+fn ppg_imbalance_ratio(give: f64, receive: f64, threshold: f64) -> Option<f64> {
+    let (lo, hi) = if give <= receive { (give, receive) } else { (receive, give) };
+    if lo <= 0.01 {
+        return if hi > 0.01 { Some(f64::INFINITY) } else { None };
+    }
+    let ratio = hi / lo;
+    if ratio >= threshold { Some(ratio) } else { None }
+}
+
+/// Short human-readable injury notes for any player (on either side of a
+/// proposal) carrying a non-null `injury_status` — surfaced directly on the
+/// proposal rather than left buried in each player's full JSON, so a
+/// specifically-injured piece (e.g. a WR out weeks on a hamstring, still
+/// unconfirmed to return) isn't missed on a quick read. This doesn't replace
+/// grounding a real trade in a live injury-report search (this project's own
+/// recommendation-discipline policy still applies) — it just makes sure the
+/// signal this tool already has isn't silently dropped.
+fn injury_risk_notes<'a>(players: impl Iterator<Item = &'a serde_json::Value>) -> Vec<String> {
+    players
+        .filter_map(|p| {
+            let status = p["injury_status"].as_str()?;
+            let name = p["name"].as_str().unwrap_or("?");
+            Some(format!("{name} — {status}"))
+        })
+        .collect()
+}
+
+/// How many wins back of the playoff cutoff a team can be and still count as
+/// "contending" rather than "rebuilding" in [`competitive_posture`]. 1 win
+/// back still leaves a real path with games to play — this matches this
+/// league's own live standings, 2026-11-11: roster_id 5 sat exactly 1 win
+/// back of the 6th playoff spot with 5 games left and was correctly judged
+/// still squarely in the hunt, not a team that should be selling.
+const CONTENDING_GAMES_BACK: i32 = 1;
+
+/// The win total of the worst team still inside a playoff spot — the
+/// reference point [`competitive_posture`] measures games-back against.
+/// `playoff_teams` is the league's own setting (`playoff_teams` on
+/// `LeagueSettings`), never a hardcoded team count, since that varies by
+/// league. Ties within a win count don't change which win total sits at the
+/// cutoff index, so this doesn't need `AnalysisService::standings`'s
+/// points-based tiebreak — just the win totals, sorted.
+fn playoff_cutoff_wins(rosters: &[Roster], playoff_teams: usize) -> i32 {
+    let mut wins: Vec<i32> = rosters.iter().map(|r| r.settings.wins).collect();
+    wins.sort_by(|a, b| b.cmp(a));
+    let idx = playoff_teams.saturating_sub(1).min(wins.len().saturating_sub(1));
+    wins.get(idx).copied().unwrap_or(0)
+}
+
+/// "contending" (in a playoff spot, or within [`CONTENDING_GAMES_BACK`] wins
+/// of the cutoff) vs "rebuilding" (meaningfully behind) — informational
+/// signal only (see `find_win_win_trades`'s use of it): a rebuilding team may
+/// prefer youth/picks over more aging veterans, but that's a judgment call
+/// for a human to weigh, not grounds to silently drop a proposal.
+fn competitive_posture(wins: i32, cutoff_wins: i32) -> &'static str {
+    if cutoff_wins - wins <= CONTENDING_GAMES_BACK {
+        "contending"
+    } else {
+        "rebuilding"
+    }
+}
+
+/// Whether a player is already in the age-decline band for their position —
+/// mirrors `dynasty_tier_for_pos`'s own aging-curve thresholds in
+/// `src/analysis/dynasty.rs` (QB 34+, RB 28+, WR/TE/IDP 30+, generic 31+)
+/// rather than inventing a second set of numbers for the same concept. Not
+/// callable directly (that fn is private to `dynasty.rs` and takes raw
+/// age/years_exp/team, not an enriched player `Value`), so the thresholds
+/// are mirrored here instead of shared.
+fn is_declining_age(player: &serde_json::Value) -> bool {
+    let age = player["age"].as_i64().unwrap_or(0);
+    match player["position"].as_str().unwrap_or("") {
+        "QB" => age >= 34,
+        "RB" => age >= 28,
+        "WR" | "TE" | "DL" | "LB" | "DB" => age >= 30,
+        _ => age >= 31,
+    }
+}
+
+/// Whether a majority of the players being offered are already in their
+/// position's age-decline band — the "offering more of what a rebuilding
+/// team doesn't need" signal for `find_win_win_trades`'s posture note.
+fn offering_is_mostly_aging_vets(given: &[&serde_json::Value]) -> bool {
+    if given.is_empty() {
+        return false;
+    }
+    let aging = given.iter().filter(|p| is_declining_age(p)).count();
+    aging * 2 > given.len()
 }
 
 /// Nearest tier (searching outward, cheaper first) that actually has a
@@ -87,6 +208,36 @@ fn summarize_trade_value(
 }
 
 impl AnalysisService {
+    /// Resolves and values every requested pick, extracted out of
+    /// `trade_value_check` so that function stays focused on the
+    /// player-pricing path it already had.
+    async fn resolve_pick_values(
+        &self,
+        league_id: &str,
+        playoff_teams: Option<i32>,
+        all_values: &[Value],
+        by_sleeper_id: &HashMap<&str, &Value>,
+        picks_requested: &[PickDescriptor],
+    ) -> Result<Vec<Value>> {
+        if picks_requested.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (rosters, _users) = self.fetch_rosters_and_users(league_id).await?;
+        let traded_picks = self.client.get_traded_picks(league_id).await?;
+        let state = self.client.get_nfl_state().await?;
+        let draft_order = picks::project_draft_order(&rosters);
+        let tercile_year = picks::tercile_year(all_values);
+        let ctx = PickValuationContext {
+            traded_picks: &traded_picks,
+            draft_order: &draft_order,
+            by_sleeper_id,
+            tercile_year: tercile_year.as_deref(),
+            playoff_teams,
+            standings_snapshot_week: state.week,
+        };
+        Ok(picks_requested.iter().map(|pd| picks::summarize_pick_value(pd, &ctx)).collect())
+    }
+
     // -----------------------------------------------------------------------
     // Trade analysis
     // -----------------------------------------------------------------------
@@ -153,8 +304,8 @@ impl AnalysisService {
     }
 
     /// Look up real dynasty trade values (FantasyCalc, sleeperId-keyed) for a specific list of
-    /// players. Auto-derives numQbs/ppr from the league's actual settings so values match its
-    /// format (e.g. superflex leagues value QBs much higher than 1-QB leagues).
+    /// players and/or draft picks. Auto-derives numQbs/ppr from the league's actual settings so
+    /// values match its format (e.g. superflex leagues value QBs much higher than 1-QB leagues).
     ///
     /// No major dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut — all checked
     /// directly) prices IDP players at all; there is no market-consensus number to fall back
@@ -163,10 +314,18 @@ impl AnalysisService {
     /// offensive players sharing that player's `dynasty_tier`, computed live from the same
     /// fetch rather than hardcoded. `found: false` still means "not in FantasyCalc's own
     /// dataset" — `value_source` distinguishes a real market price from this estimate.
+    ///
+    /// Picks get the analogous treatment: FantasyCalc prices a generic "2027 2nd (Mid)" slot,
+    /// not a specific team's pick, so `picks.rs` resolves current ownership (trades already
+    /// made) and projects which third of the round the owning roster will likely land in from
+    /// this league's own current standings — only for the one upcoming draft year FantasyCalc
+    /// splits into Early/Mid/Late at all; further-out years get the plain generic value instead.
+    /// Rosters/traded-picks/NFL-state are only fetched when `picks` is non-empty.
     pub async fn trade_value_check(
         &self,
         league_id: &str,
         player_ids: &[String],
+        picks_requested: &[PickDescriptor],
     ) -> Result<serde_json::Value> {
         let league = self.client.get_league(league_id).await?;
         let num_qbs: u32 = if league.is_superflex() { 2 } else { 1 };
@@ -191,6 +350,16 @@ impl AnalysisService {
             })
             .collect();
 
+        let pick_rows = self
+            .resolve_pick_values(
+                league_id,
+                league.settings.playoff_teams,
+                &all_values,
+                &by_sleeper_id,
+                picks_requested,
+            )
+            .await?;
+
         Ok(serde_json::json!({
             "source": "fantasycalc.com",
             "is_dynasty": true,
@@ -198,8 +367,12 @@ impl AnalysisService {
             "ppr": ppr,
             "note": "value_source \"fantasycalc\" is a real market price; \"heuristic_tier_median\" \
                      is this project's own estimate (no dynasty value source prices IDP at all) — \
-                     treat it as a rough same-tier comparison, not a market consensus",
+                     treat it as a rough same-tier comparison, not a market consensus. For picks, \
+                     \"pick_slot_projection\" is this league's own standings-based slot estimate (will \
+                     move as standings change), \"pick_slot_generic\" is a year+round value too far out \
+                     to project a slot for, and \"unpriced\" is outside FantasyCalc's coverage entirely.",
             "players": players,
+            "picks": pick_rows,
         }))
     }
 
@@ -211,10 +384,23 @@ impl AnalysisService {
     ///
     /// Logic:
     ///   - Build a positional need/surplus profile for every team.
-    ///   - "Need" = fewer than ideal keepers (tier ≤2) at a position.
+    ///   - "Need" = fewer than ideal keepers (tier ≤2) at a position, UNLESS the
+    ///     roster already carries above-average total depth there (see
+    ///     [`position_has_redundant_depth`]) — a team can be "keeper-thin" at a
+    ///     position while already holding 5 bench bodies at it, and more of that
+    ///     position helps them not at all.
     ///   - "Can offer" = tier 3/4 players at positions they don't need depth.
     ///   - Win-win pair: I have what they need AND they have what I need.
-    ///   - Score = sum of dynasty tier improvement on each side.
+    ///   - Score = sum of dynasty tier improvement on each side, but a proposal
+    ///     is dropped entirely if the real-production (ppg) value changing
+    ///     hands is too lopsided for either side to plausibly accept — see
+    ///     [`ppg_imbalance_ratio`]. Root-cause fix, 2026-11-11: three
+    ///     algorithmically-generated proposals turned out to be unrealistic on
+    ///     manual review (a partner flagged "needy" at a position they already
+    ///     had 5 deep, and two trades that gave away a real weekly starter for
+    ///     a roster-filler scrap) — `dynasty_tier` alone can't distinguish
+    ///     "declining ex-stud still a starter" from "no real role," so it was
+    ///     scoring both the same.
     pub async fn find_win_win_trades(
         &self,
         league_id: &str,
@@ -225,20 +411,29 @@ impl AnalysisService {
             self.fetch_rosters_users_players_state(league_id).await?;
         let (_eval_season, stats_ctx) = self.eval_season_stats(&nfl_state.season).await;
 
+        // Falls back to half the league when the commissioner hasn't set
+        // `playoff_teams` explicitly (Sleeper allows this) — a reasonable
+        // default, not load-bearing for the hard filters above, only for the
+        // informational posture note below.
+        let league = self.client.get_league(league_id).await?;
+        let playoff_teams =
+            league.settings.playoff_teams.unwrap_or((rosters.len() / 2) as i32).max(1) as usize;
+        let cutoff_wins = playoff_cutoff_wins(&rosters, playoff_teams);
+
         let user_map: HashMap<_, _> = users
             .iter()
             .map(|u| (u.user_id.clone(), u.display_name.clone()))
             .collect();
 
-        let count_keepers = |roster: &Roster| -> HashMap<String, usize> {
-            let mut keepers_by_pos: HashMap<String, usize> = HashMap::new();
+        let count_by_pos = |roster: &Roster, min_tier: i64| -> HashMap<String, usize> {
+            let mut by_pos: HashMap<String, usize> = HashMap::new();
             for pid in &roster.players {
                 let p = enrich_player_full(pid, &all_players, &stats_ctx);
-                if p["dynasty_tier"].as_i64().unwrap_or(4) <= 2 {
-                    *keepers_by_pos.entry(p["position"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+                if p["dynasty_tier"].as_i64().unwrap_or(4) <= min_tier {
+                    *by_pos.entry(p["position"].as_str().unwrap_or("?").to_string()).or_default() += 1;
                 }
             }
-            keepers_by_pos
+            by_pos
         };
 
         // League-average tier-1/2 depth per position, used as the "need" baseline instead
@@ -248,7 +443,7 @@ impl AnalysisService {
         // leagues) or always triggers (shallow ones).
         const NEED_POSITIONS: &[&str] = &["QB", "RB", "WR", "TE"];
         let all_keeper_counts: Vec<HashMap<String, usize>> =
-            rosters.iter().map(&count_keepers).collect();
+            rosters.iter().map(|r| count_by_pos(r, 2)).collect();
         let league_avg: HashMap<&str, f64> = NEED_POSITIONS
             .iter()
             .map(|pos| {
@@ -257,17 +452,38 @@ impl AnalysisService {
             })
             .collect();
 
+        // League-average TOTAL (any tier) depth per position — the redundancy check
+        // below needs this separately from `league_avg`, since a roster can be
+        // keeper-thin and roster-spot-full at the same position simultaneously (the
+        // galphonse case: tier<=2 "keeper" count low at TE, but 5 TEs rostered total).
+        let all_total_counts: Vec<HashMap<String, usize>> =
+            rosters.iter().map(|r| count_by_pos(r, 4)).collect();
+        let league_avg_total: HashMap<&str, f64> = NEED_POSITIONS
+            .iter()
+            .map(|pos| {
+                let total: usize = all_total_counts.iter().map(|m| m.get(*pos).copied().unwrap_or(0)).sum();
+                (*pos, total as f64 / rosters.len().max(1) as f64)
+            })
+            .collect();
+
         // For each roster, build:
-        //   needs:    positions meaningfully below the league-average keeper depth
+        //   needs:    positions meaningfully below the league-average keeper depth,
+        //             and not already redundantly deep in total roster spots
         //   offerables: tier 3/4 players (this roster's own trade bait)
         let profile_roster = |roster: &Roster| -> (Vec<String>, Vec<serde_json::Value>) {
-            let keepers_by_pos = count_keepers(roster);
+            let keepers_by_pos = count_by_pos(roster, 2);
+            let total_by_pos = count_by_pos(roster, 4);
             let needs: Vec<String> = NEED_POSITIONS
                 .iter()
                 .filter_map(|pos| {
                     let have = keepers_by_pos.get(*pos).copied().unwrap_or(0);
                     let threshold = (league_avg[pos] * 0.75).floor().max(1.0) as usize;
-                    if have < threshold { Some(pos.to_string()) } else { None }
+                    let total = total_by_pos.get(*pos).copied().unwrap_or(0);
+                    if have < threshold && !position_has_redundant_depth(total, league_avg_total[pos]) {
+                        Some(pos.to_string())
+                    } else {
+                        None
+                    }
                 })
                 .collect();
 
@@ -421,6 +637,17 @@ impl AnalysisService {
             let they_give_top: Vec<_> = they_give_sorted.into_iter().take(3).collect();
             let i_give_top: Vec<_> = i_give_sorted.into_iter().take(3).collect();
 
+            // Real-production value check, independent of dynasty_tier (root-cause
+            // fix, 2026-11-11 — see this fn's doc comment): drop any proposal where
+            // one side's actual recent ppg given away dwarfs the other's. Tier alone
+            // called a Tyrod-Taylor-for-Courtland-Sutton swap and a
+            // Kamara/Pollard/Hill-for-two-non-contributors swap both "win-win."
+            let give_ppg: f64 = i_give_top.iter().map(|p| p["ppg"].as_f64().unwrap_or(0.0)).sum();
+            let receive_ppg: f64 = they_give_top.iter().map(|p| p["ppg"].as_f64().unwrap_or(0.0)).sum();
+            if ppg_imbalance_ratio(give_ppg, receive_ppg, PPG_IMBALANCE_THRESHOLD).is_some() {
+                continue;
+            }
+
             let my_needs_filled: Vec<_> = they_give_top
                 .iter()
                 .map(|p| p["position"].as_str().unwrap_or("?"))
@@ -429,6 +656,25 @@ impl AnalysisService {
                 .iter()
                 .map(|p| p["position"].as_str().unwrap_or("?"))
                 .collect();
+
+            let risk_notes =
+                injury_risk_notes(i_give_top.iter().copied().chain(they_give_top.iter().copied()));
+
+            // Informational only — never drops a proposal (unlike the two hard
+            // filters above), since a rebuilding team lateral-trading veteran
+            // value isn't necessarily a bad idea, just a closer call a human
+            // should weigh with real context (see this fn's doc comment).
+            let partner_posture = competitive_posture(other.settings.wins, cutoff_wins);
+            let posture_note = (partner_posture == "rebuilding"
+                && offering_is_mostly_aging_vets(&i_give_top))
+            .then(|| {
+                format!(
+                    "{partner_name} is well out of playoff contention ({}-{}) — may prefer \
+                     youth/draft picks over more aging veterans; confirm before assuming \
+                     they'd want this.",
+                    other.settings.wins, other.settings.losses,
+                )
+            });
 
             proposals.push(serde_json::json!({
                 "kind": "need_match",
@@ -439,6 +685,11 @@ impl AnalysisService {
                 "their_needs": their_needs,
                 "you_give": i_give_top,
                 "you_receive": they_give_top,
+                "ppg_given": give_ppg,
+                "ppg_received": receive_ppg,
+                "risk_notes": risk_notes,
+                "partner_posture": partner_posture,
+                "posture_note": posture_note,
                 "summary": format!(
                     "Give {} {} → fills their {:?} need. Receive {} {} → fills your {:?} need.",
                     i_give_top.first().and_then(|p| p["name"].as_str()).unwrap_or("?"),
@@ -549,5 +800,130 @@ mod idp_heuristic_value_tests {
         assert_eq!(row["found"], true);
         assert_eq!(row["value_source"], "fantasycalc");
         assert_eq!(row["value"], 777.0, "a found player's value must be FantasyCalc's own number, not the heuristic");
+    }
+}
+
+#[cfg(test)]
+mod win_win_trade_guard_tests {
+    use super::{injury_risk_notes, position_has_redundant_depth, ppg_imbalance_ratio};
+
+    #[test]
+    fn position_has_redundant_depth_should_be_false_when_total_rostered_is_at_league_average() {
+        assert!(!position_has_redundant_depth(4, 4.0));
+    }
+
+    #[test]
+    fn position_has_redundant_depth_should_be_true_when_total_rostered_is_well_above_average() {
+        // galphonse's real TE count (5) vs. a modest league average (3.5) — the
+        // exact shape of the bug this guards against.
+        assert!(position_has_redundant_depth(5, 3.5));
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_return_none_when_reasonably_balanced() {
+        // The Kittle+Kelce+Taylor-for-Deebo+Diggs case: ~1.47x, inside the 2.5x bar.
+        assert_eq!(ppg_imbalance_ratio(19.4, 28.6, 2.5), None);
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_flag_a_near_total_giveaway() {
+        // The Taylor-for-Sutton case: give away 0 ppg, receive a real producer.
+        assert_eq!(ppg_imbalance_ratio(0.0, 10.55, 2.5), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_flag_a_lopsided_real_production_gap() {
+        // The Kamara+Pollard+Hill-for-Raymond+Hollins case: ~8x, well past the bar.
+        let ratio = ppg_imbalance_ratio(21.05, 2.6, 2.5).expect("must flag as lopsided");
+        assert!((ratio - 8.096).abs() < 0.01);
+    }
+
+    #[test]
+    fn ppg_imbalance_ratio_should_return_none_when_both_sides_are_zero() {
+        assert_eq!(ppg_imbalance_ratio(0.0, 0.0, 2.5), None);
+    }
+
+    #[test]
+    fn injury_risk_notes_should_include_only_players_with_a_non_null_injury_status() {
+        let healthy = serde_json::json!({"name": "Healthy Guy", "injury_status": null});
+        let hurt = serde_json::json!({"name": "Deebo Samuel Sr.", "injury_status": "Questionable"});
+        let notes = injury_risk_notes([&healthy, &hurt].into_iter());
+        assert_eq!(notes, vec!["Deebo Samuel Sr. — Questionable".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod competitive_posture_tests {
+    use super::{
+        competitive_posture, is_declining_age, offering_is_mostly_aging_vets, playoff_cutoff_wins,
+    };
+    use crate::models::{Roster, RosterSettings};
+
+    fn roster_with_wins(roster_id: i32, wins: i32) -> Roster {
+        Roster {
+            roster_id,
+            owner_id: None,
+            league_id: "league1".to_string(),
+            players: Vec::new(),
+            starters: Vec::new(),
+            reserve: Vec::new(),
+            taxi: None,
+            settings: RosterSettings { wins, losses: 9 - wins, ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn playoff_cutoff_wins_should_return_the_win_total_at_the_cutoff_rank() {
+        // Mirrors the real league checked live, 2026-11-11: 12 teams, 6 playoff
+        // spots, 6th seed at 5 wins.
+        let rosters: Vec<Roster> =
+            [8, 7, 7, 6, 5, 5, 4, 3, 3, 2, 2, 2].iter().enumerate().map(|(i, &w)| roster_with_wins(i as i32, w)).collect();
+        assert_eq!(playoff_cutoff_wins(&rosters, 6), 5);
+    }
+
+    #[test]
+    fn playoff_cutoff_wins_should_clamp_when_playoff_teams_exceeds_roster_count() {
+        let rosters = vec![roster_with_wins(1, 8), roster_with_wins(2, 3)];
+        assert_eq!(playoff_cutoff_wins(&rosters, 6), 3, "must not panic/overflow — clamps to the worst team");
+    }
+
+    #[test]
+    fn competitive_posture_should_be_contending_when_in_a_playoff_spot() {
+        assert_eq!(competitive_posture(5, 5), "contending");
+    }
+
+    #[test]
+    fn competitive_posture_should_be_contending_when_one_win_back_of_the_cutoff() {
+        // The real case this threshold was calibrated against: roster_id 5 at
+        // 4 wins, cutoff at 5 — still squarely in the hunt.
+        assert_eq!(competitive_posture(4, 5), "contending");
+    }
+
+    #[test]
+    fn competitive_posture_should_be_rebuilding_when_two_or_more_wins_back() {
+        // galphonse's real record: 3 wins against a 5-win cutoff.
+        assert_eq!(competitive_posture(3, 5), "rebuilding");
+    }
+
+    #[test]
+    fn is_declining_age_should_use_each_positions_own_aging_curve() {
+        assert!(!is_declining_age(&serde_json::json!({"position": "WR", "age": 29})));
+        assert!(is_declining_age(&serde_json::json!({"position": "WR", "age": 33})));
+        assert!(!is_declining_age(&serde_json::json!({"position": "RB", "age": 27})));
+        assert!(is_declining_age(&serde_json::json!({"position": "RB", "age": 29})));
+    }
+
+    #[test]
+    fn offering_is_mostly_aging_vets_should_require_a_strict_majority() {
+        let young = serde_json::json!({"position": "WR", "age": 24});
+        let old_te = serde_json::json!({"position": "TE", "age": 33});
+        let old_qb = serde_json::json!({"position": "QB", "age": 37});
+        assert!(!offering_is_mostly_aging_vets(&[&young, &old_te]), "a tie must not count as 'mostly'");
+        assert!(offering_is_mostly_aging_vets(&[&young, &old_te, &old_qb]));
+    }
+
+    #[test]
+    fn offering_is_mostly_aging_vets_should_be_false_for_an_empty_offer() {
+        assert!(!offering_is_mostly_aging_vets(&[]));
     }
 }

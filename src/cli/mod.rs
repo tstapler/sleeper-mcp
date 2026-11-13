@@ -8,6 +8,7 @@ use crate::client::SleeperClient;
 use crate::error::Result;
 
 pub mod browser;
+mod chat_cmds;
 mod dynasty_cmds;
 mod roster_cmds;
 mod sync;
@@ -119,6 +120,11 @@ pub enum Commands {
         /// Roster ID, username, or display name
         #[arg(short, long)]
         roster_id: String,
+        /// Bypass this process's own cache and ask Sleeper to skip its own caching too —
+        /// for checking a write (lineup/waiver) right after making it, since Sleeper's own
+        /// API can lag several minutes on an unforced read.
+        #[arg(long)]
+        fresh: bool,
     },
 
     /// Analyze roster needs and strengths
@@ -219,16 +225,20 @@ pub enum Commands {
     /// Lineup changes through the browser backend (live-verified selectors,
     /// plan.md Epic 4 lineup mechanism spot-check). `--out`/`--in` take
     /// numeric Sleeper player IDs rather than an abstract slot name: the
-    /// live UI swaps by clicking the currently-started player's row then
-    /// the bench replacement's row, not by an addressable slot.
+    /// live UI swaps by clicking one player's row then the other's, not by
+    /// an addressable slot. This also covers IR/Taxi moves — live-verified
+    /// 2026-11-11 (round-tripped a real IR<->BN swap and back): `--out` the
+    /// player currently in IR/Taxi, `--in` the bench player taking that
+    /// slot (or the reverse, to activate someone off IR/Taxi back to the
+    /// bench) — same generic swap mechanism, no slot-type restriction.
     #[command(name = "lineup-set")]
     LineupSet {
         #[arg(long)]
         league: String,
-        /// Player_id currently in the starting slot to bench.
+        /// Player_id currently occupying the target slot (starter, IR, or Taxi) to bench.
         #[arg(long)]
         out: String,
-        /// Player_id on the bench to start in their place.
+        /// Player_id on the bench to move into that slot in their place.
         #[arg(long = "in")]
         in_: String,
     },
@@ -244,6 +254,101 @@ pub enum Commands {
         give: String,
         #[arg(long)]
         get: String,
+    },
+
+    /// Durable analysis log + chat-transcript import — so a session's
+    /// findings (standings reviews, trade scans) survive past the session
+    /// itself, in the local stats DB rather than only in chat scrollback.
+    Chat {
+        #[command(subcommand)]
+        action: ChatAction,
+    },
+
+    /// The real Sleeper **league chat** (messages your league-mates post to
+    /// each other inside the league itself) — distinct from `chat`, which
+    /// is this CLI's own analysis-note/transcript log. Read-only: this only
+    /// reads the feed, never posts to it.
+    LeagueChat {
+        #[command(subcommand)]
+        action: LeagueChatAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LeagueChatAction {
+    /// Fetch the live league chat via the authenticated browser session and
+    /// store new/changed messages locally. Paginates backward from the
+    /// newest message until a page has no messages this DB doesn't already
+    /// have (already caught up), or `--pages` is hit — first-ever sync on a
+    /// league with a long history may need a larger `--pages` to reach the
+    /// start.
+    Sync {
+        #[arg(long)]
+        league: String,
+        /// Safety cap on how many 50-message pages to walk back through in
+        /// one sync call.
+        #[arg(long, default_value_t = 30)]
+        pages: usize,
+        /// Keep walking backward past the already-caught-up boundary
+        /// instead of stopping at the first fully-known page. Without this,
+        /// a capped first sync (e.g. `--pages 3` on a long-running league)
+        /// leaves older history permanently unreachable: every later
+        /// `sync` restarts from the newest message and stops as soon as it
+        /// re-treads that already-known frontier, never advancing past it.
+        /// With this flag, only a genuinely empty page (the real start of
+        /// the feed) or `--pages` stops the walk, so a deliberate deep
+        /// backfill can reach messages from before the first sync.
+        #[arg(long)]
+        force_deep: bool,
+    },
+
+    /// List the league chat from the local cache only, most recent first —
+    /// never launches a browser. Run `sync` first to populate it.
+    List {
+        #[arg(long)]
+        league: String,
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ChatAction {
+    /// Persist a dated analysis finding.
+    Log {
+        #[arg(long)]
+        league: String,
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        detail: Option<String>,
+    },
+
+    /// List logged analysis findings, most recent first.
+    List {
+        #[arg(long)]
+        league: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+
+    /// Import a chat session transcript file (e.g. a Claude Code session
+    /// JSONL) verbatim, keyed by filename so re-importing an
+    /// actively-growing session file updates rather than duplicates.
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        league: Option<String>,
+    },
+
+    /// List imported transcripts (metadata only), most recent first.
+    Transcripts {
+        #[arg(long)]
+        league: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
     },
 }
 
@@ -447,9 +552,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .await?
         }
 
-        Commands::Roster { league_id, roster_id } => {
+        Commands::LeagueChat { action } => {
+            browser::league_chat::cmd_league_chat(&config, &svc.db, action).await?
+        }
+
+        Commands::Roster { league_id, roster_id, fresh } => {
             let rid = resolve_rid(&svc.db, &league_id, &roster_id).await?;
-            roster_cmds::cmd_roster(&svc, &league_id, rid).await?
+            roster_cmds::cmd_roster(&svc, &league_id, rid, fresh).await?
         }
 
         Commands::Analyze { league_id, roster_id } => {
@@ -542,6 +651,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::TradePropose { league, give, get } => {
             browser::cmd_trade_propose(&config, &league, &give, &get).await?
         }
+
+        Commands::Chat { action } => chat_cmds::cmd_chat(&*svc.db, action).await?,
     }
     Ok(())
 }

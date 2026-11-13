@@ -1,0 +1,6 @@
+.venv
+.idea
+cache
+uploads
+target
+node_modules

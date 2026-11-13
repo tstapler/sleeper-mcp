@@ -12,6 +12,7 @@ use console::style;
 use crate::client::SleeperClient;
 use crate::config::Config;
 use crate::error::Result;
+use crate::models::Roster;
 
 use super::super::WaiverAction;
 use super::login::{
@@ -100,13 +101,64 @@ pub(crate) async fn run_claim(
     session.close().await?;
     launched.close().await?;
     match outcome {
-        Ok(()) => Ok(()),
+        Ok(on_waivers) => {
+            // A pending waiver claim hasn't moved anyone yet — nothing to
+            // patch (and the pending-claims view is read live via the
+            // browser seam each time anyway, so it's never cache-stale in
+            // the first place). Only an instant free-agent add/drop is a
+            // confirmed roster mutation worth reflecting early.
+            if !on_waivers {
+                apply_instant_add_patch(client, req.league, req.player_id, req.drop_id).await;
+            }
+            Ok(())
+        }
         Err(e) if e.to_string() == DEAD_SESSION_HINT => Err(e),
         Err(e) => Err(crate::browser::other(triage_error(
             &claim_failed_triage(),
             &debug_detail(&e.to_string()),
         ))),
     }
+}
+
+/// Optimistic roster-cache patch for an instant (non-waiver) free-agent
+/// add/drop. Anchors on `drop_id` — the one player we can be certain is
+/// already in the cached roster data — to find which roster is "mine"
+/// without needing a roster_id param this call site never had. A pure add
+/// with no drop has no such anchor (the added player isn't on any cached
+/// roster yet), so that case intentionally no-ops rather than guess which
+/// of 12 rosters is the right one; it falls back to the existing
+/// force-fresh/TTL-expiry path like before this feature existed.
+async fn apply_instant_add_patch(
+    client: &SleeperClient,
+    league: &str,
+    player_id: &str,
+    drop_id: Option<&str>,
+) {
+    let Some(drop_id) = drop_id else { return };
+    let player_id = player_id.to_string();
+    let drop_id = drop_id.to_string();
+    let result = client
+        .patch_cached_rosters(league, move |rosters| apply_drop_add(rosters, &player_id, &drop_id))
+        .await;
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "optimistic_roster_patch_failed");
+    }
+}
+
+/// Pure mutation for [`apply_instant_add_patch`]: finds the roster carrying
+/// `drop_id` and moves it out, `player_id` in. No-ops if `drop_id` isn't on
+/// any cached roster (the anchor this patch depends on is missing).
+fn apply_drop_add(rosters: &mut [Roster], player_id: &str, drop_id: &str) {
+    let Some(roster) = rosters.iter_mut().find(|r| r.players.iter().any(|p| p == drop_id)) else {
+        return;
+    };
+    roster.players.retain(|p| p != drop_id);
+    roster.starters.retain(|p| p != drop_id);
+    roster.reserve.retain(|p| p != drop_id);
+    if let Some(taxi) = roster.taxi.as_mut() {
+        taxi.retain(|p| p != drop_id);
+    }
+    roster.players.push(player_id.to_string());
 }
 
 /// CLI wrapper: prints `claim submitted` on success; dead sessions get the
@@ -144,13 +196,50 @@ pub(crate) async fn run_lineup_set(
     session.close().await?;
     launched.close().await?;
     match outcome {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            apply_lineup_swap_patch(client, league, out_player_id, in_player_id).await;
+            Ok(())
+        }
         Err(e) if e.to_string() == DEAD_SESSION_HINT => Err(e),
         Err(e) => Err(crate::browser::other(triage_error(
             &lineup_failed_triage(),
             &debug_detail(&e.to_string()),
         ))),
     }
+}
+
+/// Optimistic roster-cache patch for a confirmed starter<->bench swap:
+/// `lineup_set_via_seam` already live-verified `in_player_id` landed in a
+/// real (non-bench) slot before returning `Ok`, so swapping the two ids at
+/// `out_player_id`'s existing `starters` index is exact, not a guess.
+///
+/// Deliberately doesn't attempt IR/Taxi moves: those swap a player into
+/// `reserve`/`taxi`, not `starters`, and this function has no reliable way
+/// to tell which one without re-deriving the live DOM slot label — if
+/// `out_player_id` isn't found in any roster's `starters` (the IR/Taxi
+/// case), the mutation below is a no-op and the existing cache-TTL/
+/// force-fresh behavior applies, same as before this feature existed.
+async fn apply_lineup_swap_patch(client: &SleeperClient, league: &str, out_id: &str, in_id: &str) {
+    let out_id = out_id.to_string();
+    let in_id = in_id.to_string();
+    let result = client
+        .patch_cached_rosters(league, move |rosters| apply_starter_swap(rosters, &out_id, &in_id))
+        .await;
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "optimistic_roster_patch_failed");
+    }
+}
+
+/// Pure mutation for [`apply_lineup_swap_patch`]: replaces `out_id` with
+/// `in_id` at its existing index in whichever roster's `starters` carries
+/// it. No-ops if `out_id` isn't in any roster's `starters` — the IR/Taxi
+/// case this patch deliberately doesn't attempt (see that fn's doc comment).
+fn apply_starter_swap(rosters: &mut [Roster], out_id: &str, in_id: &str) {
+    let Some(roster) = rosters.iter_mut().find(|r| r.starters.iter().any(|p| p == out_id)) else {
+        return;
+    };
+    let idx = roster.starters.iter().position(|p| p == out_id).expect("just matched");
+    roster.starters[idx] = in_id.to_string();
 }
 
 /// CLI wrapper: prints `lineup saved` on success; dead sessions get the
@@ -197,5 +286,64 @@ pub(crate) async fn cmd_trade_propose(
             eprintln!("{}", style(trade_disabled_triage()).red());
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_roster(roster_id: i32, players: &[&str], starters: &[&str]) -> Roster {
+        Roster {
+            roster_id,
+            owner_id: None,
+            league_id: "league1".to_string(),
+            players: players.iter().map(|s| s.to_string()).collect(),
+            starters: starters.iter().map(|s| s.to_string()).collect(),
+            reserve: Vec::new(),
+            taxi: None,
+            settings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn apply_drop_add_should_move_drop_id_out_and_player_id_in_when_drop_id_is_rostered() {
+        let mut rosters = vec![
+            fixture_roster(1, &["100", "200"], &["100"]),
+            fixture_roster(2, &["300"], &["300"]),
+        ];
+        apply_drop_add(&mut rosters, "900", "200");
+        assert_eq!(rosters[0].players, vec!["100".to_string(), "900".to_string()]);
+        assert_eq!(rosters[0].starters, vec!["100".to_string()]);
+        assert_eq!(rosters[1].players, vec!["300".to_string()]);
+    }
+
+    #[test]
+    fn apply_drop_add_should_remove_drop_id_from_starters_when_it_was_starting() {
+        let mut rosters = vec![fixture_roster(1, &["100"], &["100"])];
+        apply_drop_add(&mut rosters, "900", "100");
+        assert!(rosters[0].starters.is_empty());
+        assert_eq!(rosters[0].players, vec!["900".to_string()]);
+    }
+
+    #[test]
+    fn apply_drop_add_should_no_op_when_drop_id_is_not_on_any_cached_roster() {
+        let mut rosters = vec![fixture_roster(1, &["100"], &["100"])];
+        apply_drop_add(&mut rosters, "900", "999");
+        assert_eq!(rosters[0].players, vec!["100".to_string()]);
+    }
+
+    #[test]
+    fn apply_starter_swap_should_replace_out_id_at_its_existing_index_when_out_id_is_starting() {
+        let mut rosters = vec![fixture_roster(1, &["100", "200"], &["100", "200"])];
+        apply_starter_swap(&mut rosters, "200", "300");
+        assert_eq!(rosters[0].starters, vec!["100".to_string(), "300".to_string()]);
+    }
+
+    #[test]
+    fn apply_starter_swap_should_no_op_when_out_id_is_not_a_starter_the_ir_taxi_case() {
+        let mut rosters = vec![fixture_roster(1, &["100", "200"], &["100"])];
+        apply_starter_swap(&mut rosters, "200", "300");
+        assert_eq!(rosters[0].starters, vec!["100".to_string()]);
     }
 }

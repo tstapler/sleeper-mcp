@@ -14,6 +14,14 @@ use super::login::{
     LaunchOptions,
 };
 
+/// Shared across every GraphQL-response parser in `cli::browser` (pending
+/// transactions, league-wide backfill, trade block): a top-level `errors`
+/// array (auth failure, bad query, etc.) names its first message here
+/// instead of each parser re-deriving the same `serde_json` chain.
+pub(super) fn graphql_error_message(v: &serde_json::Value) -> Option<&str> {
+    v.get("errors")?.as_array()?.first()?.get("message")?.as_str()
+}
+
 /// One pending (or otherwise non-`complete`) transaction, already resolved
 /// to display names via the GraphQL response's own `player_map` — no
 /// separate name-lookup call needed (unlike `claim`/`lineup_set`, which
@@ -59,13 +67,7 @@ fn describe_player(player_map: &serde_json::Value, player_id: &str) -> String {
 /// `Err` naming the first message rather than silently returning nothing.
 pub(crate) fn parse_pending_transactions(raw: &str) -> Result<Vec<PendingTransaction>> {
     let v: serde_json::Value = serde_json::from_str(raw).map_err(crate::browser::other)?;
-    if let Some(msg) = v
-        .get("errors")
-        .and_then(|e| e.as_array())
-        .and_then(|a| a.first())
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-    {
+    if let Some(msg) = graphql_error_message(&v) {
         return Err(crate::browser::other(format!("pending-transactions query failed: {msg}")));
     }
     let entries = v
@@ -188,13 +190,7 @@ fn parse_league_transaction_entry(entry: &serde_json::Value) -> LeagueTransactio
 /// `Ok(vec![])`.
 pub(crate) fn parse_league_transactions(raw: &str) -> Result<Vec<LeagueTransaction>> {
     let v: serde_json::Value = serde_json::from_str(raw).map_err(crate::browser::other)?;
-    if let Some(msg) = v
-        .get("errors")
-        .and_then(|e| e.as_array())
-        .and_then(|a| a.first())
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-    {
+    if let Some(msg) = graphql_error_message(&v) {
         return Err(crate::browser::other(format!("league-transactions query failed: {msg}")));
     }
     let data = v

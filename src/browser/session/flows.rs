@@ -19,9 +19,7 @@ use super::debug::DEAD_SESSION_HINT;
 mod claim_selectors {
     pub const PLAYER_SEARCH_INPUT: &str = ".player-search input";
     pub const PLAYER_LIST_ITEM: &str = ".player-list-item";
-    pub const ACTION_BUTTON: &str = ".player-list-item a.player-action-button";
-    pub const ON_WAIVERS_PROBE_JS: &str =
-        "!!document.querySelector('.player-list-item a.player-action-button.waiver')";
+    pub const ACTION_BUTTON: &str = "a.player-action-button";
     pub const MODAL_ROOT: &str = ".add-player-panel";
     pub const DROP_ROW: &str = ".add-player-panel a.team-roster-item";
     pub const BID_INPUT: &str = ".add-player-panel .bid-input-container input";
@@ -89,19 +87,131 @@ mod roster_row_display_name_tests {
     }
 }
 
+/// Player-SEARCH list's own display convention (distinct from the roster
+/// page's "F Lastname" — this one adds a period): "Zach Terrell" ->
+/// "Z. Terrell", "KC Concepcion Jr." -> "K. Concepcion Jr.". Live-verified
+/// (2026-11-11) against real search results for three name shapes
+/// (plain, suffixed, already-abbreviated first name) after this needle's
+/// absence caused a real incident: `claim_player_via_seam`'s action-button
+/// click wasn't scoped to the searched player's row at all (see that
+/// function's own doc comment), and silently claimed a different player
+/// whose row happened to render first in the DOM.
+fn player_search_display_name(full_name: &str) -> String {
+    let mut parts = full_name.split_whitespace();
+    let Some(first) = parts.next() else { return full_name.to_string() };
+    let rest: Vec<&str> = parts.collect();
+    if rest.is_empty() {
+        return full_name.to_string();
+    }
+    let initial = first.chars().next().map(|c| c.to_string()).unwrap_or_default();
+    format!("{initial}. {}", rest.join(" "))
+}
+
+#[cfg(test)]
+mod player_search_display_name_tests {
+    use super::player_search_display_name;
+
+    #[test]
+    fn player_search_display_name_should_abbreviate_first_name_with_a_trailing_period() {
+        assert_eq!(player_search_display_name("Zach Terrell"), "Z. Terrell");
+        assert_eq!(player_search_display_name("Kyle Louis"), "K. Louis");
+    }
+
+    #[test]
+    fn player_search_display_name_should_preserve_suffixes() {
+        assert_eq!(player_search_display_name("KC Concepcion Jr."), "K. Concepcion Jr.");
+        assert_eq!(player_search_display_name("Will Anderson Jr."), "W. Anderson Jr.");
+    }
+
+    #[test]
+    fn player_search_display_name_should_return_unchanged_when_single_token() {
+        assert_eq!(player_search_display_name("BAL"), "BAL");
+    }
+}
+
+/// Pure, no I/O: the probe `wait_for_row_text` polls on.
+fn build_row_text_probe_js(row_selector: &str, needle: &str) -> Result<String> {
+    Ok(format!(
+        "Array.from(document.querySelectorAll({row_sel})).some(e => e.textContent && e.textContent.includes({needle_json}))",
+        row_sel = serde_json::to_string(row_selector).map_err(other)?,
+        needle_json = serde_json::to_string(needle).map_err(other)?,
+    ))
+}
+
+/// Polls (every 150ms, up to `timeout_ms`) until some row matching
+/// `row_selector` has `textContent` containing `needle` — see
+/// `claim_player_via_seam`'s doc comment for why `wait_for_selector`
+/// (which only confirms *a* row exists, not *this* one) isn't enough here.
+async fn wait_for_row_text(
+    session: &dyn BrowserSession,
+    row_selector: &str,
+    needle: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let probe = build_row_text_probe_js(row_selector, needle)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if session.eval_bool(&probe).await? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(other(format!(
+                "no row matching {needle:?} appeared within {timeout_ms}ms — the player search may not have returned this player"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// Builds the row-scoped on-waivers probe: finds the search-list row
+/// matching `search_needle` and checks whether *that* row's own action
+/// button carries the `waiver` class — see `claim_player_via_seam`'s doc
+/// comment for why this must be row-scoped, not document-wide.
+fn build_on_waivers_probe_js(search_needle: &str) -> Result<String> {
+    use claim_selectors::{ACTION_BUTTON, PLAYER_LIST_ITEM};
+    let needle_json = serde_json::to_string(search_needle).map_err(other)?;
+    Ok(format!(
+        r#"(function(){{
+            const needle = {needle_json};
+            const row = Array.from(document.querySelectorAll('{PLAYER_LIST_ITEM}'))
+                .find(e => e.textContent && e.textContent.includes(needle));
+            const btn = row ? row.querySelector('{ACTION_BUTTON}') : null;
+            return !!(btn && btn.classList.contains('waiver'));
+        }})()"#
+    ))
+}
+
 /// Story 3.2 seam-side claim flow, live-verified 2026-09-11 (plan.md Epic 3,
 /// Story 3.1 selector bundle). `player_name`/`drop_player_name` are the
 /// resolved Sleeper display names (callers resolve player_id -> full_name
 /// before crossing the seam — the DOM has no player_id to select on).
 /// `bid_amount` is ignored on the free-agent (non-waiver) path, since that
 /// modal has no bid field.
+///
+/// Root-cause fix (2026-11-11): the action-button click used to be a bare
+/// `click_selector` over `.player-list-item a.player-action-button` —
+/// unscoped to the searched player's row at all, unlike every other click
+/// in this function (drop row, submit button both match by name/text).
+/// Live-reproduced: searching "Kyle Louis" and claiming returned exactly
+/// one result row, yet the unscoped selector still silently claimed an
+/// unrelated player (Terrel Bernard) instead — the search box's own text
+/// doesn't guarantee only the intended row is present or first in the DOM.
+/// Both the on-waivers probe and the action-button click now match the
+/// resolved row via [`player_search_display_name`], the same name/row
+/// scoping discipline `click_in_row` already uses for the drop row and
+/// submit button below.
+/// Returns `on_waivers`: `true` means this submitted a *pending* waiver
+/// claim (the add has not happened yet), `false` means the player was a
+/// free agent and the add/drop is already instant/final — callers use this
+/// to decide whether an optimistic roster-cache patch is even valid (see
+/// `src/cli/browser/actions.rs`'s `apply_instant_add_patch`).
 pub async fn claim_player_via_seam(
     session: &dyn BrowserSession,
     league_id: &str,
     player_name: &str,
     bid_amount: u32,
     drop_player_name: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     use claim_selectors::*;
 
     let start = tracing::info_span!("claim.start", league = league_id, player = player_name);
@@ -115,8 +225,17 @@ pub async fn claim_player_via_seam(
     session.type_into_selector(PLAYER_SEARCH_INPUT, player_name).await?;
     session.wait_for_selector(PLAYER_LIST_ITEM, 5_000).await?;
 
-    let on_waivers = session.eval_bool(ON_WAIVERS_PROBE_JS).await?;
-    session.click_selector(ACTION_BUTTON).await?;
+    let search_needle = player_search_display_name(player_name);
+    // Root-cause fix (2026-11-11): `wait_for_selector(PLAYER_LIST_ITEM)`
+    // only proves SOME row exists, not that THIS player's row has finished
+    // rendering — live-reproduced: it can pass while the virtualized list
+    // still shows a stale/placeholder row from the previous query, and the
+    // very next `click_in_row` call then genuinely fails closed with "no
+    // row with matching text found" rather than guessing. Poll for the
+    // specific needle instead of a blind sleep.
+    wait_for_row_text(session, PLAYER_LIST_ITEM, &search_needle, 5_000).await?;
+    let on_waivers = session.eval_bool(&build_on_waivers_probe_js(&search_needle)?).await?;
+    session.click_in_row(PLAYER_LIST_ITEM, &search_needle, ACTION_BUTTON).await?;
     session.wait_for_selector(MODAL_ROOT, 5_000).await?;
 
     if let Some(drop_name) = drop_player_name {
@@ -132,15 +251,27 @@ pub async fn claim_player_via_seam(
         session.click_in_row(SUBMIT_BUTTON, SUBMIT_ADD_TEXT, "").await?;
     }
     tracing::info!("claim submitted");
-    Ok(())
+    Ok(on_waivers)
 }
 
 /// Story 4.1 seam-side lineup-swap flow, live-verified 2026-09-11 (plan.md
 /// Epic 4 lineup mechanism spot-check). `out_player_name`/`in_player_name`
 /// are resolved Sleeper display names (callers resolve player_id ->
 /// full_name before crossing the seam, same as the claim flow). There is no
-/// confirm step on the live UI — clicking the bench replacement's row
-/// completes the swap immediately.
+/// confirm step on the live UI — clicking the second row completes the
+/// swap immediately.
+///
+/// Generalizes to IR/Taxi moves too (live-verified 2026-11-11, real
+/// round-trip against this league): clicking *either* row first enters
+/// select mode and marks every row that player could legally swap into as
+/// `.valid` — a bench player eligible for IR marks the IR row(s) valid, and
+/// clicking an IR occupant marks the bench rows it could legally swap with
+/// (an empty slot, or another IR-eligible bench player) valid. The swap is
+/// symmetric: clicking the IR occupant first then the bench mover, or the
+/// bench mover first then the IR occupant, produce the identical result,
+/// since both are just "click row A, then click the valid row B" in either
+/// order. No slot-type branch exists in this function at all — it never
+/// needed one.
 pub async fn lineup_set_via_seam(
     session: &dyn BrowserSession,
     league_id: &str,
@@ -279,14 +410,7 @@ pub async fn pending_transactions_via_seam(
     let query = format!(
         r#"query league_transactions_filtered {{ league_transactions_filtered(league_id: {league_id_json}, roster_id_filters: [{roster_id}], type_filters: {types_json}, leg_filters: [], status_filters: []) {{ adds drops created league_id leg metadata roster_ids settings status status_updated transaction_id type player_map waiver_budget }} }}"#
     );
-    let body = serde_json::json!({
-        "operationName": "league_transactions_filtered",
-        "variables": {},
-        "query": query,
-    })
-    .to_string();
-    let body_json = serde_json::to_string(&body).map_err(other)?;
-    let raw = graphql_post_via_seam(session, &body_json).await?;
+    let raw = post_named_query(session, "league_transactions_filtered", &query).await?;
     tracing::info!("pending_transactions fetched");
     Ok(raw)
 }
@@ -314,6 +438,21 @@ async fn graphql_post_via_seam(session: &dyn BrowserSession, body_json: &str) ->
         }})()"#
     );
     session.eval_string(&js).await
+}
+
+/// Builds the `{operationName, variables: {}, query}` envelope every
+/// caller in this file sends and posts it via [`graphql_post_via_seam`] —
+/// extracted (2026-11-11) once a third caller ([`league_players_via_seam`])
+/// would have repeated the same four lines a third time.
+async fn post_named_query(session: &dyn BrowserSession, operation_name: &str, query: &str) -> Result<String> {
+    let body = serde_json::json!({
+        "operationName": operation_name,
+        "variables": {},
+        "query": query,
+    })
+    .to_string();
+    let body_json = serde_json::to_string(&body).map_err(other)?;
+    graphql_post_via_seam(session, &body_json).await
 }
 
 /// Epic 2.2 / Task 2.2.1a: default `type_filters` for a whole-league
@@ -367,15 +506,80 @@ pub async fn league_transactions_via_seam(
         roster_id_filters,
         LEAGUE_TRANSACTION_TYPE_FILTERS,
     )?;
-    let body = serde_json::json!({
-        "operationName": "league_transactions_filtered",
-        "variables": {},
-        "query": query,
-    })
-    .to_string();
-    let body_json = serde_json::to_string(&body).map_err(other)?;
-    let raw = graphql_post_via_seam(session, &body_json).await?;
+    let raw = post_named_query(session, "league_transactions_filtered", &query).await?;
     tracing::info!("league_transactions fetched");
+    Ok(raw)
+}
+
+/// Root-cause discovery (2026-11-11): Sleeper's in-app Trade Block has no
+/// dedicated query at all. Captured the real GraphQL traffic the `/trades`
+/// page fires on a cold load (an injected `window.fetch`/`XMLHttpRequest`
+/// interceptor installed via `evaluate_on_new_document` so it survives the
+/// navigation) and found the block is just `settings.otb` /
+/// `settings.otb_added_at` on this existing `league_players` query — `otb`
+/// is the roster_id that flagged the player, `otb_added_at` an epoch-ms
+/// timestamp. Same `localStorage`-token-read-entirely-in-page-JS auth path
+/// as every other GraphQL flow in this file — no new auth surface.
+///
+/// Live-verified against this exact league: 21 rows carry an `otb` flag,
+/// but the real `/trades` page only displays 17 of them — the other 4 are
+/// stale (the player has since been traded or dropped) and Sleeper's own
+/// API does **not** filter them out. The caller must cross-reference each
+/// row's `otb` roster_id against that player's actual current roster_id
+/// (from `get_league_rosters`, a public REST call — no second authenticated
+/// fetch needed) to reproduce what the live UI shows, exactly as confirmed
+/// by checking all 21 rows against this league's real current rosters.
+pub async fn league_players_via_seam(session: &dyn BrowserSession, league_id: &str) -> Result<String> {
+    let start = tracing::info_span!("league_players.start", league = league_id);
+    let _enter = start.enter();
+
+    let league_id_json = serde_json::to_string(league_id).map_err(other)?;
+    let query = format!(
+        r#"query league_players {{ league_players(league_id: {league_id_json}) {{ player_id settings }} }}"#
+    );
+    let raw = post_named_query(session, "league_players", &query).await?;
+    tracing::info!("league_players fetched");
+    Ok(raw)
+}
+
+/// Root-cause discovery (2026-11-11): Sleeper's League Chat has no
+/// league-specific query either. Live GraphQL introspection (schema
+/// introspection is enabled in prod — `query { __schema { query_type { ... } } }`,
+/// note every meta-field is snake_case too, e.g. `query_type`/`of_type`, not
+/// the usual GraphQL-spec camelCase) showed `League` carries
+/// `last_message_id`/`last_message_text` the same shape as the `Channel`/
+/// `Topic` types, which both resolve their feed via a generic
+/// `messages(parent_id: ...)` field. Tried the league_id itself as
+/// `parent_id` directly (no channel/topic indirection) — confirmed live: it
+/// returns the real league chat feed, a mix of human messages and
+/// system-authored transaction/trade-block notices (`author_id` =
+/// `"166666666666666666"`, `author_display_name` = `"sys"` for the latter).
+/// `author_display_name` comes back on the message itself — no second
+/// lookup against `get_league_users` needed, unlike the trade-block read.
+///
+/// Pagination: `before` (a message_id) returns the next older page: live
+/// confirmed the returned page's first row is exactly the prior page's last
+/// row (inclusive boundary) — callers dedupe via message_id, not count.
+/// Page size is a fixed 50 (no `limit` arg exists on this field); a page
+/// with fewer than 50 rows means the feed's beginning has been reached.
+pub async fn league_chat_via_seam(
+    session: &dyn BrowserSession,
+    league_id: &str,
+    before: Option<&str>,
+) -> Result<String> {
+    let start = tracing::info_span!("league_chat.start", league = league_id, before = ?before);
+    let _enter = start.enter();
+
+    let league_id_json = serde_json::to_string(league_id).map_err(other)?;
+    let before_arg = match before {
+        Some(b) => format!(", before: {}", serde_json::to_string(b).map_err(other)?),
+        None => String::new(),
+    };
+    let query = format!(
+        r#"query messages {{ messages(parent_id: {league_id_json}{before_arg}) {{ message_id author_id author_display_name text created edited pinned parent_type }} }}"#
+    );
+    let raw = post_named_query(session, "messages", &query).await?;
+    tracing::info!("league_chat fetched");
     Ok(raw)
 }
 
@@ -648,6 +852,27 @@ pub async fn edit_cancel_claim_via_seam(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the 2026-11-11 incident: the probe must embed
+    /// the SPECIFIC searched player's needle, not a document-wide query —
+    /// a document-wide `.waiver` check can't tell which row it matched.
+    /// Regression test for the second 2026-11-11 incident: polling for the
+    /// specific player's row (not just "a row exists") is what the live
+    /// claim flow was missing when it raced a still-rendering virtualized
+    /// list and genuinely failed closed rather than clicking a stale row.
+    #[test]
+    fn build_row_text_probe_js_should_embed_both_the_selector_and_the_needle() {
+        let js = build_row_text_probe_js(".player-list-item", "K. Louis").expect("must build");
+        assert!(js.contains(r#"".player-list-item""#), "got {js}");
+        assert!(js.contains(r#""K. Louis""#), "got {js}");
+    }
+
+    #[test]
+    fn build_on_waivers_probe_js_should_embed_the_exact_search_needle() {
+        let js = build_on_waivers_probe_js("Z. Terrell").expect("must build");
+        assert!(js.contains(r#""Z. Terrell""#), "probe must embed the exact needle, got {js}");
+        assert!(js.contains("querySelectorAll"), "must scope to list rows, not a single document-wide selector");
+    }
 
     fn two_brissett_rows() -> Vec<CandidateRow> {
         vec![

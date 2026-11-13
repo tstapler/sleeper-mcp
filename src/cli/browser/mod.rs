@@ -13,9 +13,11 @@ use super::BrowserAction;
 mod actions;
 mod doctor;
 mod edit_cancel;
+pub mod league_chat;
 pub mod login;
 mod pending;
 pub mod status;
+mod trade_block;
 pub mod transactions;
 
 pub(super) async fn cmd_browser(config: &Config, action: BrowserAction) -> Result<()> {
@@ -53,3 +55,4 @@ pub(crate) use edit_cancel::{
     cmd_waiver_edit_cancel, render_edit_cancel_outcome, run_edit_cancel_claim, EditCancelRunOutcome,
 };
 pub(crate) use pending::run_pending_transactions;
+pub(crate) use trade_block::run_trade_block;

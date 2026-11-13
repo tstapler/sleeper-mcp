@@ -31,6 +31,31 @@ pub struct LeagueSettings {
     pub waiver_type: i32,
     pub playoff_teams: Option<i32>,
     pub draft_rounds: Option<i32>,
+    // Named out of `extra` purely for ergonomic access (`league.settings.trade_deadline`
+    // instead of `.extra.get("trade_deadline")`) — `extra`'s `#[serde(flatten)]` already
+    // captured every one of these before this change, so nothing was ever actually lost
+    // on sync; this just stops the common ones from requiring an untyped JSON lookup.
+    pub playoff_week_start: Option<i32>,
+    pub playoff_type: Option<i32>,
+    pub playoff_round_type: Option<i32>,
+    pub playoff_seed_type: Option<i32>,
+    pub trade_deadline: Option<i32>,
+    pub trade_review_days: Option<i32>,
+    pub disable_trades: Option<i32>,
+    pub pick_trading: Option<i32>,
+    pub waiver_budget: Option<i32>,
+    pub waiver_clear_days: Option<i32>,
+    pub waiver_day_of_week: Option<i32>,
+    pub waiver_bid_min: Option<i32>,
+    pub taxi_slots: Option<i32>,
+    pub taxi_years: Option<i32>,
+    pub taxi_deadline: Option<i32>,
+    pub taxi_allow_vets: Option<i32>,
+    pub reserve_slots: Option<i32>,
+    pub max_keepers: Option<i32>,
+    pub max_subs: Option<i32>,
+    pub disable_adds: Option<i32>,
+    pub veto_votes_needed: Option<i32>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -229,6 +254,22 @@ pub struct DraftPick {
     pub pick_no: i32,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+/// One future-pick ownership record, as returned by
+/// `/league/{id}/traded_picks` — live-verified (2026-11-11) to already
+/// collapse a pick's full trade chain into its current holder: `roster_id`
+/// is the pick's *original* owner (what identifies which pick this is),
+/// `owner_id` is who holds it now, `previous_owner_id` is whoever last held
+/// it (not necessarily the original owner). Only picks that have moved at
+/// least once appear here at all — an untraded pick has no row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradedPick {
+    pub season: String,
+    pub round: i32,
+    pub roster_id: i32,
+    pub previous_owner_id: i32,
+    pub owner_id: i32,
 }
 
 // ---------------------------------------------------------------------------

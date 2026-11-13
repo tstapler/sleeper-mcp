@@ -24,10 +24,13 @@ use crate::models::*;
 pub(crate) mod bid_projection;
 mod dynasty;
 mod lineup;
+mod picks;
 mod players;
 mod roster;
 mod trades;
 mod waivers;
+
+pub use picks::PickDescriptor;
 
 pub use bid_projection::BidProjection;
 pub use players::{PlayerStats, StatsContext};

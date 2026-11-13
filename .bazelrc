@@ -1,0 +1,29 @@
+# Layering (lowest to highest): this file < .bazelrc.ci (--config=ci) < user.bazelrc (git-ignored) < ~/.bazelrc < command line.
+# Bazel 9 (.bazelversion), bzlmod only. Do NOT set --disk_cache here: the shared, size-capped cache is configured in the
+# user's ~/.bazelrc (CI: setup-bazel owns it).
+common --enable_bzlmod
+
+build --incompatible_strict_action_env
+build --nostamp
+
+test --test_output=errors
+test --test_env=PATH
+
+# --- lint ---------------------------------------------------------------------------------------------------------------
+# `bazel build --config=lint //...`: clippy with its default levels (findings print, only errors fail), because the
+# existing code has 47 clippy errors under -D warnings and is not rustfmt-clean (counted 2026-11-12). The strict gate
+# for new work is `--config=lint-strict` (rustfmt + clippy -D warnings); promote it to CI once the debt is paid.
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:lint --output_groups=+clippy_checks
+build:lint --@rules_rust//rust/settings:clippy_flags=-W,warnings
+build:lint --keep_going
+build:lint-strict --config=lint
+build:lint-strict --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint-strict --output_groups=+rustfmt_checks
+build:lint-strict --@rules_rust//rust/settings:clippy_flags=-D,warnings
+
+# --- release profile: Cargo [profile.release] equivalent ----------------------------------------------------------------
+build:release --compilation_mode=opt
+
+import %workspace%/.bazelrc.ci
+try-import %workspace%/user.bazelrc

@@ -114,6 +114,12 @@ struct RosterParams {
     league_id: String,
     /// Roster ID (number), username, or display name
     roster_id: String,
+    /// Bypass this process's own cache and ask Sleeper to skip its own caching too. Use
+    /// this right after a lineup/waiver write to confirm it actually landed — Sleeper's own
+    /// API can otherwise lag several minutes behind a real change. Leave false for normal
+    /// reads; forcing on every call defeats the point of caching.
+    #[serde(default)]
+    force_refresh: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -189,10 +195,25 @@ fn default_26() -> u32 { 26 }
 fn default_30_usize() -> usize { 30 }
 
 #[derive(Deserialize, JsonSchema)]
+struct PickParam {
+    /// e.g. "2027"
+    season: String,
+    /// 1-indexed (round 1 = first round)
+    round: i32,
+    /// The roster_id this pick originally belonged to — NOT the current owner;
+    /// ownership (after any trades) is resolved internally via `traded_picks`.
+    original_roster_id: i32,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct TradeValueParams {
     league_id: String,
     /// Sleeper player IDs to look up (mix both sides of a proposed trade in one call)
+    #[serde(default)]
     player_ids: Vec<String>,
+    /// Draft picks to look up alongside (or instead of) players
+    #[serde(default)]
+    picks: Vec<PickParam>,
 }
 
 /// LIVE WRITE ACTION: submits a real waiver claim/free-agent add against
@@ -227,6 +248,15 @@ struct PendingWaiversParams {
     roster_id: i64,
 }
 
+/// Read-only: the league's real Trade Block. Discovery (2026-11-11):
+/// Sleeper has no dedicated trade-block query — it's `settings.otb` on the
+/// existing `league_players` GraphQL query, same auth path as pending
+/// waivers above. Not a write action.
+#[derive(Deserialize, JsonSchema)]
+struct TradeBlockParams {
+    league_id: String,
+}
+
 /// Read-only: transaction history served from the unified cache
 /// (Epic 2.1/2.2's `read_through`), refreshing live only when a row's
 /// status/age genuinely warrants it — never on a fixed interval. Not a
@@ -241,19 +271,22 @@ struct TransactionHistoryParams {
     max_age_secs: Option<i64>,
 }
 
-/// LIVE WRITE ACTION: swaps a bench player into a started slot against
-/// sleeper.com through the stealth-browser backend (plan.md
-/// undetected-chromedriver-rust, Story 4.1) on the operator's own persisted,
-/// manually-authenticated Chrome profile. Not a simulation — this changes
-/// the live starting lineup immediately with no confirm step. Requires
+/// LIVE WRITE ACTION: swaps two roster slots against sleeper.com through
+/// the stealth-browser backend (plan.md undetected-chromedriver-rust,
+/// Story 4.1) on the operator's own persisted, manually-authenticated
+/// Chrome profile. Not a simulation — this changes the live roster
+/// immediately with no confirm step. Also covers IR/Taxi moves
+/// (live-verified 2026-11-11) — the DOM swap mechanism has no slot-type
+/// restriction: pass the IR/Taxi occupant as `out` and the bench mover as
+/// `in` (or the reverse, to activate someone back to the bench). Requires
 /// `sleeper browser login` to have been completed by hand at least once
 /// beforehand.
 #[derive(Deserialize, JsonSchema)]
 struct LineupSetParams {
     league_id: String,
-    /// Sleeper player_id of the currently-started player to bench.
+    /// Sleeper player_id currently occupying the target slot (starter, IR, or Taxi) to bench.
     out_player_id: String,
-    /// Sleeper player_id of the bench player to start in their place.
+    /// Sleeper player_id of the bench player moving into that slot in their place.
     in_player_id: String,
 }
 
@@ -300,6 +333,29 @@ struct PlayerReportParams {
     season: Option<String>,
 }
 
+/// Persist a dated analysis finding (e.g. a standings/trade-scan review) to
+/// the local stats DB so it survives past this chat session. Not a Sleeper
+/// write action — this never touches the live league.
+#[derive(Deserialize, JsonSchema)]
+struct LogAnalysisNoteParams {
+    league_id: String,
+    /// Short category label, e.g. "standings_review", "trade_scan".
+    topic: String,
+    summary: String,
+    /// Optional longer supporting detail.
+    detail: Option<String>,
+}
+
+/// Read back previously logged analysis notes, most recent first.
+#[derive(Deserialize, JsonSchema)]
+struct GetAnalysisNotesParams {
+    /// Omit to return notes across every league.
+    league_id: Option<String>,
+    #[serde(default = "default_20")]
+    limit: i64,
+}
+
+fn default_20() -> i64 { 20 }
 fn default_nfl() -> String { "nfl".to_string() }
 fn default_add() -> String { "add".to_string() }
 fn default_48() -> i32 { 48 }
@@ -446,13 +502,13 @@ impl SleeperMcpServer {
         ok(self.svc.client.get_draft_picks(&p.draft_id).await.map_err(err)?)
     }
 
-    #[tool(description = "Get roster details with player names, positions, and injury status")]
+    #[tool(description = "Get roster details with player names, positions, and injury status. Set force_refresh:true right after a lineup/waiver write to confirm it actually landed — the normal cached read can otherwise show Sleeper's own stale server-side state for several minutes.")]
     async fn get_roster_with_names(
         &self,
         #[tool(aggr)] p: RosterParams,
     ) -> Result<CallToolResult, McpError> {
         let rid = resolve(&self.svc.db, &p.league_id, &p.roster_id).await?;
-        ok(self.svc.roster_with_names(&p.league_id, rid).await.map_err(err)?)
+        ok(self.svc.roster_with_names(&p.league_id, rid, p.force_refresh).await.map_err(err)?)
     }
 
     #[tool(description = "Analyze roster needs: positional strengths, weaknesses, injury risks, and priorities")]
@@ -461,7 +517,7 @@ impl SleeperMcpServer {
         #[tool(aggr)] p: RosterParams,
     ) -> Result<CallToolResult, McpError> {
         let rid = resolve(&self.svc.db, &p.league_id, &p.roster_id).await?;
-        ok(self.svc.analyze_roster_needs(&p.league_id, rid).await.map_err(err)?)
+        ok(self.svc.analyze_roster_needs(&p.league_id, rid, p.force_refresh).await.map_err(err)?)
     }
 
     #[tool(description = "Get unrostered players ranked by season fantasy points — useful for waivers and draft prep")]
@@ -499,12 +555,21 @@ impl SleeperMcpServer {
         ).await.map_err(err)?)
     }
 
-    #[tool(description = "Look up real dynasty trade values (FantasyCalc, market-consensus) for a list of Sleeper player IDs — pass both sides of a proposed trade in one call to compare. Values auto-adjust for the league's actual superflex/PPR settings. No dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut) prices IDP players — for a player not in FantasyCalc's own dataset (found:false), value is instead this project's own heuristic (value_source:heuristic_tier_median): the median FantasyCalc value of offensive players sharing that player's dynasty_tier. Check value_source per player — a heuristic estimate, not a market price.")]
+    #[tool(description = "Look up real dynasty trade values (FantasyCalc, market-consensus) for Sleeper player IDs and/or draft picks — pass both sides of a proposed trade in one call to compare. Values auto-adjust for the league's actual superflex/PPR settings. Players: no dynasty value source (FantasyCalc, DynastyProcess, KeepTradeCut) prices IDP players — for a player not in FantasyCalc's own dataset (found:false), value is instead this project's own heuristic (value_source:heuristic_tier_median): the median FantasyCalc value of offensive players sharing that player's dynasty_tier. Picks: identify by season/round/original_roster_id (the pick's original owner, NOT necessarily who holds it now — ownership after trades is resolved internally). FantasyCalc only prices a generic year+round slot, not a specific team's pick, so for the one upcoming draft year it splits into Early/Mid/Late terciles, value_source:pick_slot_projection means this project projected which tercile the current owner's pick lands in from this league's own current standings (a projection that will move as standings change, and carries extra caveats if that roster is still playoff-eligible — read the `note` field); value_source:pick_slot_generic means it's too far out to project a slot, just the plain year+round value; value_source:unpriced means outside FantasyCalc's coverage entirely. Check value_source on every row — never assume a market price.")]
     async fn get_trade_value(
         &self,
         #[tool(aggr)] p: TradeValueParams,
     ) -> Result<CallToolResult, McpError> {
-        ok(self.svc.trade_value_check(&p.league_id, &p.player_ids).await.map_err(err)?)
+        let picks: Vec<crate::analysis::PickDescriptor> = p
+            .picks
+            .into_iter()
+            .map(|pp| crate::analysis::PickDescriptor {
+                season: pp.season,
+                round: pp.round,
+                original_roster_id: pp.original_roster_id,
+            })
+            .collect();
+        ok(self.svc.trade_value_check(&p.league_id, &p.player_ids, &picks).await.map_err(err)?)
     }
 
     #[tool(description = "Full report for specific players: current Sleeper status/injury/practice-participation fields, aggregated recent news (RotoWire + ESPN), dynasty tier, and season production trend (PPG, games played, trend arrow). League-agnostic. Use search_players first if you only have a name, not a player_id.")]
@@ -541,7 +606,7 @@ impl SleeperMcpServer {
         }))
     }
 
-    #[tool(description = "Show locally stored league settings: roster positions, scoring format, superflex status. Requires sync_league to have been run first.")]
+    #[tool(description = "Show locally stored league settings: roster positions, scoring format, superflex status, and the full operational settings (playoffs, trade deadline, waivers/FAAB, taxi/keeper/reserve rules). Requires sync_league to have been run first.")]
     async fn get_league_info(
         &self,
         #[tool(aggr)] p: LeagueIdParams,
@@ -562,6 +627,38 @@ impl SleeperMcpServer {
                 "roster_slot_counts": league.roster_slot_counts(),
                 "draft_rounds": league.settings.draft_rounds,
                 "draft_id": league.draft_id,
+                "playoffs": {
+                    "playoff_teams": league.settings.playoff_teams,
+                    "playoff_week_start": league.settings.playoff_week_start,
+                    "playoff_type": league.settings.playoff_type,
+                    "playoff_round_type": league.settings.playoff_round_type,
+                    "playoff_seed_type": league.settings.playoff_seed_type,
+                },
+                "trades": {
+                    "trade_deadline": league.settings.trade_deadline,
+                    "trade_review_days": league.settings.trade_review_days,
+                    "disable_trades": league.settings.disable_trades,
+                    "pick_trading": league.settings.pick_trading,
+                },
+                "waivers": {
+                    "waiver_type": league.settings.waiver_type,
+                    "waiver_budget": league.settings.waiver_budget,
+                    "waiver_clear_days": league.settings.waiver_clear_days,
+                    "waiver_day_of_week": league.settings.waiver_day_of_week,
+                    "waiver_bid_min": league.settings.waiver_bid_min,
+                    "disable_adds": league.settings.disable_adds,
+                },
+                "taxi_keepers_reserve": {
+                    "taxi_slots": league.settings.taxi_slots,
+                    "taxi_years": league.settings.taxi_years,
+                    "taxi_deadline": league.settings.taxi_deadline,
+                    "taxi_allow_vets": league.settings.taxi_allow_vets,
+                    "reserve_slots": league.settings.reserve_slots,
+                    "max_keepers": league.settings.max_keepers,
+                    "max_subs": league.settings.max_subs,
+                    "veto_votes_needed": league.settings.veto_votes_needed,
+                },
+                "other_settings": league.settings.extra,
             })),
         }
     }
@@ -583,7 +680,7 @@ impl SleeperMcpServer {
         ok(serde_json::json!({ "claim_submitted": true, "league_id": p.league_id, "player_id": p.player_id }))
     }
 
-    #[tool(description = "LIVE WRITE ACTION — swaps a bench player into a started slot against sleeper.com (not a simulation: changes the live starting lineup immediately with no confirm step). Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the session is not logged in, the in-player is not eligible for that slot, or the live UI has changed since the last verification.")]
+    #[tool(description = "LIVE WRITE ACTION — swaps two roster slots against sleeper.com (not a simulation: changes the live roster immediately with no confirm step). Covers starter<->bench swaps AND IR/Taxi moves (live-verified 2026-11-11) — the DOM mechanism has no slot-type restriction. Pass `out` as whoever currently occupies the target slot (a started player, or an IR/Taxi occupant) and `in` as the player moving into it (a bench player, including one moving onto IR/Taxi), or the reverse to activate someone back to the bench. Launches a headless Chrome using the operator's already-authenticated profile; requires `sleeper browser login` to have been run by hand at least once first. Returns an error (never a false success) if the session is not logged in, the in-player is not eligible for that slot, or the live UI has changed since the last verification.")]
     async fn lineup_set(
         &self,
         #[tool(aggr)] p: LineupSetParams,
@@ -615,6 +712,47 @@ impl SleeperMcpServer {
                 .await
                 .map_err(err)?;
         ok(serde_json::json!({ "league_id": p.league_id, "roster_id": p.roster_id, "pending_waivers": txns }))
+    }
+
+    #[tool(description = "Read-only: every player currently on another manager's Trade Block in this league (player, position, team, which roster flagged them, when). The public REST API exposes no trade-block data at all — this reads through the operator's authenticated browser session, same mechanism as get_pending_waivers. Requires `sleeper browser login` to have been run by hand at least once first. Not a write action — does not propose or accept any trade.")]
+    async fn get_trade_block(
+        &self,
+        #[tool(aggr)] p: TradeBlockParams,
+    ) -> Result<CallToolResult, McpError> {
+        let players = crate::cli::browser::run_trade_block(&self.config, &self.svc, &p.league_id)
+            .await
+            .map_err(err)?;
+        ok(serde_json::json!({ "league_id": p.league_id, "trade_block": players }))
+    }
+
+    #[tool(description = "Persist a dated analysis finding (e.g. a standings check or trade-scan review) to the local stats DB so it survives past this chat session, for a future session to read back with get_analysis_notes. Not a Sleeper write action.")]
+    async fn log_analysis_note(
+        &self,
+        #[tool(aggr)] p: LogAnalysisNoteParams,
+    ) -> Result<CallToolResult, McpError> {
+        let id = self
+            .svc
+            .db
+            .log_analysis_note(&p.league_id, &p.topic, &p.summary, p.detail.as_deref())
+            .await
+            .map_err(err)?;
+        ok(serde_json::json!({ "id": id }))
+    }
+
+    #[tool(description = "Read back previously logged analysis notes (see log_analysis_note), most recent first. Omit league_id to return notes across every league.")]
+    async fn get_analysis_notes(
+        &self,
+        #[tool(aggr)] p: GetAnalysisNotesParams,
+    ) -> Result<CallToolResult, McpError> {
+        let notes = self.svc.db.list_analysis_notes(p.league_id.as_deref(), p.limit).await.map_err(err)?;
+        ok(serde_json::json!({ "notes": notes.iter().map(|n| serde_json::json!({
+            "id": n.id,
+            "league_id": n.league_id,
+            "created_at": n.created_at,
+            "topic": n.topic,
+            "summary": n.summary,
+            "detail": n.detail,
+        })).collect::<Vec<_>>() }))
     }
 
     #[tool(description = "Read-only: transaction history for a league (waiver claims, trades, free-agent adds) served from the local unified cache, refreshing live only when a row's status/age genuinely warrants it (a pending claim inside the league's Tuesday waiver-processing window, or a never-synced league) rather than on a fixed interval. Returns structured JSON per row, including `source` (\"rest\" or \"graphql\") and `fetched_at` (when this tool's own cache last wrote the row) — never a formatted sentence. Omit `max_age_secs` to use this per-row default; pass `max_age_secs: 0` to force a live refresh.")]
